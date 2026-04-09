@@ -1,0 +1,114 @@
+# TradingAgents
+
+Multi-agent LLM trading framework using LangGraph. Specialized AI agents (analysts, researchers, traders, risk managers) collaborate to make trading decisions.
+
+## Architecture
+
+```
+Scheduler → Orchestrator → AI Analysis (LangGraph) → Signal → Sizing → Risk Check → Alpaca Order
+```
+
+### Core Workflow (per symbol)
+1. **4 Analysts** (market/social/news/fundamentals) → reports
+2. **Bull & Bear Researchers** → debate (configurable rounds)
+3. **Research Manager** (judge) → investment decision
+4. **Trader** → BUY/SELL/HOLD proposal
+5. **Risk Debaters** (aggressive/neutral/conservative) → risk discussion
+6. **Risk Manager** → approve/reject
+7. **Signal Processor** → structured JSON signal
+8. **Position Sizer + Risk Engine** → hard risk gates → Alpaca bracket order
+
+### Key Directories
+- `tradingagents/agents/` — All agent definitions (analysts, researchers, trader, managers)
+- `tradingagents/automation/` — Scheduler, orchestrator, config
+- `tradingagents/broker/` — Alpaca integration (paper + live)
+- `tradingagents/dataflows/` — Data sources (yfinance, Alpha Vantage, Alpaca)
+- `tradingagents/graph/` — LangGraph workflow, signal processing, reflection
+- `tradingagents/llm_clients/` — Multi-provider LLM support (OpenAI, Anthropic, Google, xAI, Ollama)
+- `tradingagents/risk/` — Hard risk gates (position limits, drawdown, daily loss)
+- `tradingagents/portfolio/` — Position sizing, portfolio tracking
+- `tradingagents/storage/` — SQLite database for trades, signals, memories
+
+## LLM Configuration
+
+Default config in `tradingagents/default_config.py`. Automation overrides in `tradingagents/automation/config.py`.
+
+| Context | deep_think_llm | quick_think_llm | Provider |
+|---------|---------------|-----------------|----------|
+| Research/Manual | gpt-5.2 | gpt-5-mini | openai |
+| Automation | gpt-4o-mini | gpt-4o-mini | openai |
+
+Supports: OpenAI, Anthropic, Google, xAI, OpenRouter, Ollama. Change via `llm_provider` config key.
+
+## Data Sources
+
+Configured via `data_vendors` dict in config. Default: all yfinance.
+- **Stock OHLCV**: yfinance / Alpaca
+- **Technical indicators**: stockstats (computed locally, no API)
+- **Fundamentals**: yfinance / Alpha Vantage
+- **News/Sentiment**: yfinance / Alpha Vantage
+- **Real-time prices**: Alpaca (`get_alpaca_latest_price()`)
+
+## Entry Points
+
+```bash
+python run_trading.py run          # Run analysis now
+python run_trading.py schedule     # Start automated scheduler
+python run_trading.py status       # Account status
+python run_trading.py close-all    # Emergency close
+python run_trading.py trades       # Recent trades
+```
+
+Or programmatically:
+```python
+from tradingagents.graph.trading_graph import TradingAgentsGraph
+ta = TradingAgentsGraph(debug=True)
+state, decision = ta.propagate("NVDA", "2026-01-15")
+```
+
+## Environment Variables
+
+```
+OPENAI_API_KEY=       # Required if using OpenAI
+ANTHROPIC_API_KEY=    # Required if using Anthropic
+GOOGLE_API_KEY=       # Required if using Google
+ALPACA_API_KEY=       # Required for trading
+ALPACA_SECRET_KEY=    # Required for trading
+```
+
+## Risk Controls (hard gates, not overridable by AI)
+
+- Max single position: 10% equity
+- Max total exposure: 80% equity
+- Max daily loss: 3%
+- Max drawdown: 10%
+- Min cash reserve: 20%
+- Max open positions: 10
+- Default SL: 5%, TP: 15%
+
+## LLM API Call Map (per symbol analysis)
+
+Each `propagate()` call triggers ~10-15 LLM invocations:
+1. Market Analyst (tool-calling chain)
+2. Social Media Analyst (tool-calling chain)
+3. News Analyst (tool-calling chain)
+4. Fundamentals Analyst (tool-calling chain)
+5. Bull Researcher
+6. Bear Researcher
+7. Research Manager/Judge (deep_think)
+8. Trader
+9. Aggressive Risk Debater
+10. Conservative Risk Debater
+11. Neutral Risk Debater
+12. Risk Manager (deep_think)
+13. Signal Processor (structured extraction)
+14. Reflection (5 calls, post-trade only)
+
+With 7 watchlist stocks: ~70-105 LLM calls per daily analysis cycle.
+
+## Commands
+
+```bash
+pip install -e .              # Install in dev mode
+python -m pytest tests/       # Run tests
+```
