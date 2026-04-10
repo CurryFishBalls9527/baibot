@@ -24,6 +24,7 @@ class PositionSizer:
         current_price: float,
         current_position: Optional[Position] = None,
         total_position_value: float = 0.0,
+        atr: float = None,
     ) -> Optional[OrderRequest]:
         """
         Calculate order based on signal and account state.
@@ -48,7 +49,7 @@ class PositionSizer:
         if action == "BUY":
             return self._size_buy(
                 symbol, confidence, account, current_price,
-                current_position, total_position_value, signal
+                current_position, total_position_value, signal, atr
             )
 
         if action == "SELL":
@@ -60,7 +61,7 @@ class PositionSizer:
     def _size_buy(
         self, symbol: str, confidence: float, account: Account,
         current_price: float, current_position: Optional[Position],
-        total_position_value: float, signal: dict
+        total_position_value: float, signal: dict, atr: float = None,
     ) -> Optional[OrderRequest]:
 
         if current_position and current_position.qty > 0:
@@ -76,9 +77,16 @@ class PositionSizer:
             logger.info(f"No available capital for {symbol}")
             return None
 
+        # Determine risk per share from stop-loss, ATR, or fallback to confidence
         stop_loss = signal.get("stop_loss")
         if stop_loss and stop_loss > 0 and stop_loss < current_price:
             risk_per_share = current_price - stop_loss
+        elif atr and atr > 0:
+            risk_per_share = atr * 2.0  # 2x ATR as default risk
+        else:
+            risk_per_share = None
+
+        if risk_per_share and risk_per_share > 0:
             max_risk_amount = equity * self.risk_per_trade
             qty_by_risk = math.floor(max_risk_amount / risk_per_share)
             qty_by_capital = math.floor(available / current_price)

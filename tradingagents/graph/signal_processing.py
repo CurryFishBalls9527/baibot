@@ -92,3 +92,43 @@ class SignalProcessor:
             "take_profit_pct": parsed.get("take_profit_pct"),
             "timeframe": parsed.get("timeframe", "swing"),
         }
+
+    def process_signal_with_screener(
+        self, full_signal: str, symbol: str, screener_data: dict
+    ) -> dict:
+        """Extract signal, then override SL/TP/confidence with screener-computed values.
+
+        Uses the base LLM extraction for action and reasoning, but replaces
+        guessed numbers with quantitative values from the Minervini screener.
+        """
+        base_signal = self.process_signal_structured(full_signal, symbol)
+
+        if not screener_data:
+            return base_signal
+
+        current_price = screener_data.get("current_price", 0)
+
+        # Override stop-loss from screener buy-point calculation
+        initial_stop = screener_data.get("initial_stop_price")
+        if initial_stop and current_price and float(initial_stop) < float(current_price):
+            sl_pct = round(
+                (float(current_price) - float(initial_stop)) / float(current_price), 4
+            )
+            base_signal["stop_loss_pct"] = sl_pct
+            base_signal["stop_loss"] = float(initial_stop)
+        elif screener_data.get("initial_stop_pct"):
+            base_signal["stop_loss_pct"] = float(screener_data["initial_stop_pct"])
+
+        # Take profit: at least 3:1 R:R
+        sl_pct = base_signal.get("stop_loss_pct") or 0.05
+        base_signal["take_profit_pct"] = max(0.15, round(float(sl_pct) * 3, 4))
+
+        # Confidence from screener metrics
+        template_score = float(screener_data.get("template_score", 0) or 0)
+        rs_percentile = float(screener_data.get("rs_percentile", 0) or 0)
+        computed_confidence = min(
+            0.55 + template_score / 25.0 + rs_percentile / 250.0, 0.95
+        )
+        base_signal["confidence"] = computed_confidence
+
+        return base_signal

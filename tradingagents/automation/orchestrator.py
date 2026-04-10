@@ -16,6 +16,7 @@ from tradingagents.broker.alpaca_broker import AlpacaBroker
 from tradingagents.broker.models import Account, Position
 from tradingagents.risk.risk_engine import RiskEngine
 from tradingagents.portfolio.position_sizer import PositionSizer
+from tradingagents.portfolio.exit_manager import ExitManager
 from tradingagents.portfolio.portfolio_tracker import PortfolioTracker
 from tradingagents.automation.prescreener import MinerviniPreScreener
 from tradingagents.broker.models import OrderRequest
@@ -529,14 +530,117 @@ class Orchestrator:
         stock_positions = self._stock_positions(positions)
         results = {}
 
-        # First check existing positions for SELL signals
-        for pos in stock_positions:
-            try:
-                result = self._analyze_and_trade(pos.symbol, account, stock_positions)
-                results[pos.symbol] = result
-            except Exception as e:
-                logger.error(f"Error analyzing {pos.symbol}: {e}")
-                results[pos.symbol] = {"error": str(e)}
+        # First check existing positions using exit manager + sell-side rules
+        exit_manager_enabled = self.config.get("exit_manager_enabled", True)
+        if exit_manager_enabled:
+            exit_mgr = ExitManager(self.config)
+            for pos in stock_positions:
+                try:
+                    # Step 1: Run exit manager rules
+                    pos_state = self.db.get_position_state(pos.symbol)
+                    if pos_state is None:
+                        pos_state = {
+                            "entry_price": float(pos.avg_entry_price),
+                            "entry_date": date.today().isoformat(),
+                            "highest_close": float(pos.current_price),
+                            "current_stop": float(pos.avg_entry_price) * 0.92,
+                            "partial_taken": False,
+                        }
+                    features = self._get_latest_features(pos.symbol)
+                    decision = exit_mgr.check_position(pos, features, pos_state)
+
+                    if decision.action == "SELL":
+                        result = self._execute_structured_signal(
+                            symbol=pos.symbol,
+                            structured={
+                                "symbol": pos.symbol, "action": "SELL",
+                                "confidence": 0.9,
+                                "reasoning": f"Exit rule: {decision.reason}",
+                                "source": "exit_manager",
+                            },
+                            account=account, positions=stock_positions,
+                        )
+                        self.db.delete_position_state(pos.symbol)
+                        # Log trade outcome
+                        self._log_trade_outcome(pos, pos_state, decision.reason)
+                        results[pos.symbol] = result
+                        continue
+                    elif decision.action == "PARTIAL_SELL":
+                        partial_signal = {
+                            "symbol": pos.symbol, "action": "SELL",
+                            "confidence": 0.85,
+                            "reasoning": f"Partial profit: {decision.reason}",
+                            "source": "exit_manager",
+                        }
+                        # Submit partial sell via broker directly
+                        partial_order = OrderRequest(
+                            symbol=pos.symbol, side="sell", qty=float(decision.qty)
+                        )
+                        risk_result = self.risk_engine.check_order(
+                            partial_order, account, stock_positions,
+                            float(pos.current_price),
+                        )
+                        if risk_result.passed:
+                            order_result = self.broker.submit_order(partial_order)
+                            self.db.log_trade(
+                                symbol=pos.symbol, side="sell",
+                                qty=float(decision.qty), order_type="market",
+                                status=order_result.status,
+                                filled_qty=order_result.filled_qty,
+                                filled_price=order_result.filled_avg_price,
+                                order_id=order_result.order_id,
+                                reasoning=f"Partial profit: {decision.reason}",
+                            )
+                            logger.info(
+                                f"{pos.symbol}: Partial sell {decision.qty} shares "
+                                f"({decision.reason})"
+                            )
+                        if decision.updated_state:
+                            self.db.upsert_position_state(pos.symbol, decision.updated_state)
+                        results[pos.symbol] = {
+                            "symbol": pos.symbol, "action": "PARTIAL_SELL",
+                            "traded": True,
+                        }
+                        continue
+
+                    # Step 2: Check warning signs (skip AI if position is clearly fine)
+                    warnings = []
+                    if features.get("rs_percentile") and features["rs_percentile"] < 50:
+                        warnings.append(
+                            f"RS dropped to {features['rs_percentile']:.0f}th pctl"
+                        )
+                    if features.get("sma_50") and float(pos.current_price) < features["sma_50"] * 1.02:
+                        warnings.append("Price near 50 DMA")
+                    if features.get("adx_14") and features["adx_14"] < 15:
+                        warnings.append(f"Weak trend (ADX={features['adx_14']:.1f})")
+
+                    if not warnings:
+                        # Position is fine — just update state
+                        if decision.updated_state:
+                            self.db.upsert_position_state(pos.symbol, decision.updated_state)
+                        results[pos.symbol] = {
+                            "symbol": pos.symbol, "action": "HOLD", "traded": False,
+                        }
+                        continue
+
+                    # Step 3: Ambiguous — run AI only when needed
+                    logger.info(f"{pos.symbol}: Warnings: {warnings}. Running AI.")
+                    result = self._analyze_and_trade(pos.symbol, account, stock_positions)
+                    if decision.updated_state:
+                        self.db.upsert_position_state(pos.symbol, decision.updated_state)
+                    results[pos.symbol] = result
+
+                except Exception as e:
+                    logger.error(f"Error managing {pos.symbol}: {e}")
+                    results[pos.symbol] = {"error": str(e)}
+        else:
+            for pos in stock_positions:
+                try:
+                    result = self._analyze_and_trade(pos.symbol, account, stock_positions)
+                    results[pos.symbol] = result
+                except Exception as e:
+                    logger.error(f"Error analyzing {pos.symbol}: {e}")
+                    results[pos.symbol] = {"error": str(e)}
 
         # Then analyze watchlist for new BUY opportunities
         candidate_symbols = list(analysis_universe)
@@ -632,16 +736,75 @@ class Orchestrator:
 
         logger.info(f"--- Analyzing {symbol} ---")
 
-        # 1. Run AI analysis
+        # 1. Run AI analysis with screener context (Phase 3)
         ta = self._get_ai_engine()
         today = date.today().isoformat()
-        state, simple_signal = ta.propagate(symbol, today)
+
+        screener_context = ""
+        screener_row = {}
+        if self._latest_minervini_preflight and self._latest_minervini_preflight.screen_df is not None:
+            row_match = self._latest_minervini_preflight.screen_df[
+                self._latest_minervini_preflight.screen_df["symbol"] == symbol
+            ]
+            if not row_match.empty:
+                row = row_match.iloc[0]
+                screener_row = row.to_dict()
+                screener_context = (
+                    f"Symbol: {symbol}\n"
+                    f"Base pattern: {row.get('base_label', 'none')}\n"
+                    f"Stage: {row.get('stage_number', 'n/a')}\n"
+                    f"RS percentile: {row.get('rs_percentile', 'n/a')}\n"
+                    f"Buy point: {row.get('buy_point', 'n/a')}\n"
+                    f"Buy limit: {row.get('buy_limit_price', 'n/a')}\n"
+                    f"Initial stop: {row.get('initial_stop_price', 'n/a')}\n"
+                    f"Candidate status: {row.get('candidate_status', 'n/a')}\n"
+                    f"Market regime: {row.get('market_regime', 'n/a')}"
+                )
+
+        # Phase 7: Feed historical pattern stats into trader
+        pattern_summary = ""
+        try:
+            pattern_stats = self.db.get_pattern_stats()
+            if pattern_stats:
+                lines = []
+                for ps in pattern_stats:
+                    lines.append(
+                        f"  {ps['base_pattern'] or 'unknown'} in "
+                        f"{ps['regime_at_entry'] or 'unknown'}: "
+                        f"{ps['trades']} trades, "
+                        f"win rate {ps['win_rate']:.0%}, "
+                        f"avg return {ps['avg_return']:.1%}"
+                    )
+                pattern_summary = "\n".join(lines)
+        except Exception as e:
+            logger.debug(f"Could not load pattern stats: {e}")
+
+        state, simple_signal = ta.propagate(
+            symbol, today,
+            screener_context=screener_context,
+            pattern_summary=pattern_summary,
+        )
         self._latest_analysis_states[symbol] = state
 
-        # 2. Extract structured signal
-        structured = ta.signal_processor.process_signal_structured(
-            state["final_trade_decision"], symbol=symbol
-        )
+        # 2. Extract structured signal — use screener data when available (Phase 4)
+        if screener_row:
+            screener_row["current_price"] = self.broker.get_latest_price(symbol)
+            structured = ta.signal_processor.process_signal_with_screener(
+                state["final_trade_decision"], symbol=symbol, screener_data=screener_row
+            )
+        else:
+            structured = ta.signal_processor.process_signal_structured(
+                state["final_trade_decision"], symbol=symbol
+            )
+        # Stash ATR in structured signal for position sizer
+        if screener_row:
+            atr_val = screener_row.get("atr_14")
+            if not atr_val and screener_row.get("atr_pct_14"):
+                price = self.broker.get_latest_price(symbol)
+                atr_val = float(screener_row["atr_pct_14"]) * price
+            if atr_val:
+                structured["_atr"] = float(atr_val)
+
         logger.info(
             f"{symbol}: action={structured['action']} "
             f"confidence={structured['confidence']:.2f} "
@@ -686,12 +849,21 @@ class Orchestrator:
         if structured.get("stop_loss") is None and structured.get("stop_loss_pct"):
             structured["stop_loss"] = current_price * (1 - structured["stop_loss_pct"])
 
+        # Phase 5: Pass ATR for volatility-aware sizing
+        atr_value = structured.get("_atr")
+        if not atr_value:
+            features = self._get_latest_features(symbol)
+            atr_value = features.get("atr_14")
+            if not atr_value and features.get("atr_pct_14"):
+                atr_value = float(features["atr_pct_14"]) * current_price
+
         order_request = self.sizer.calculate(
             signal=structured,
             account=account,
             current_price=current_price,
             current_position=current_position,
             total_position_value=total_pos_value,
+            atr=atr_value,
         )
 
         if order_request is None:
@@ -752,6 +924,16 @@ class Orchestrator:
             reasoning=structured["reasoning"],
         )
         self.db.mark_signal_executed(signal_id)
+
+        # Persist position state on BUY fill for exit manager tracking
+        if order_request.side == "buy" and "fill" in str(order_result.status).lower():
+            self.db.upsert_position_state(symbol, {
+                "entry_price": order_result.filled_avg_price or current_price,
+                "entry_date": date.today().isoformat(),
+                "highest_close": order_result.filled_avg_price or current_price,
+                "current_stop": sl_price,
+                "partial_taken": False,
+            })
 
         logger.info(
             f"{symbol}: Order {order_result.status} — "
@@ -1527,6 +1709,89 @@ class Orchestrator:
         }
 
     # ── Helpers ──────────────────────────────────────────────────────
+
+    def _log_trade_outcome(self, position, pos_state: Dict, exit_reason: str):
+        """Log a structured trade outcome for reflection analysis (Phase 7)."""
+        try:
+            from dateutil.parser import parse as parse_date
+            entry_price = float(pos_state.get("entry_price", position.avg_entry_price))
+            exit_price = float(position.current_price)
+            return_pct = (exit_price - entry_price) / entry_price if entry_price > 0 else 0
+            try:
+                entry_date = parse_date(pos_state.get("entry_date", "")).date()
+                hold_days = (date.today() - entry_date).days
+            except Exception:
+                hold_days = 0
+
+            # Try to get screener context
+            base_pattern = None
+            stage_at_entry = None
+            rs_at_entry = None
+            regime_at_entry = None
+            if self._latest_minervini_preflight and self._latest_minervini_preflight.screen_df is not None:
+                match = self._latest_minervini_preflight.screen_df[
+                    self._latest_minervini_preflight.screen_df["symbol"] == position.symbol
+                ]
+                if not match.empty:
+                    row = match.iloc[0]
+                    base_pattern = row.get("base_label")
+                    stage_at_entry = row.get("stage_number")
+                    rs_at_entry = row.get("rs_percentile")
+                    regime_at_entry = row.get("market_regime")
+
+            self.db.log_trade_outcome({
+                "symbol": position.symbol,
+                "entry_date": pos_state.get("entry_date"),
+                "exit_date": date.today().isoformat(),
+                "entry_price": entry_price,
+                "exit_price": exit_price,
+                "return_pct": round(return_pct, 4),
+                "hold_days": hold_days,
+                "exit_reason": exit_reason,
+                "base_pattern": base_pattern,
+                "stage_at_entry": stage_at_entry,
+                "rs_at_entry": rs_at_entry,
+                "regime_at_entry": regime_at_entry,
+            })
+        except Exception as e:
+            logger.debug(f"Could not log trade outcome for {position.symbol}: {e}")
+
+    def _get_latest_features(self, symbol: str) -> Dict:
+        """Get latest technical features for a symbol from the screener data or yfinance.
+
+        Returns dict with optional keys: sma_50, rs_percentile, adx_14, etc.
+        """
+        features: Dict = {}
+
+        # Try to get from cached Minervini preflight data
+        if self._latest_minervini_preflight and self._latest_minervini_preflight.screen_df is not None:
+            match = self._latest_minervini_preflight.screen_df[
+                self._latest_minervini_preflight.screen_df["symbol"] == symbol
+            ]
+            if not match.empty:
+                row = match.iloc[0]
+                for key in ("sma_50", "rs_percentile", "adx_14", "atr_14", "atr_pct_14"):
+                    val = row.get(key)
+                    if val is not None:
+                        try:
+                            features[key] = float(val)
+                        except (ValueError, TypeError):
+                            pass
+                return features
+
+        # Fallback: fetch SMA 50 from yfinance
+        try:
+            import yfinance as yf
+            ticker = yf.Ticker(symbol)
+            hist = ticker.history(period="3mo")
+            if not hist.empty:
+                sma_50 = hist["Close"].rolling(50).mean().iloc[-1]
+                if sma_50 == sma_50:  # not NaN
+                    features["sma_50"] = float(sma_50)
+        except Exception as e:
+            logger.debug(f"Could not fetch features for {symbol}: {e}")
+
+        return features
 
     @staticmethod
     def _find_position(positions: List[Position], symbol: str) -> Optional[Position]:

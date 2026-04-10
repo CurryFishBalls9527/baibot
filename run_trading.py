@@ -450,6 +450,87 @@ def cmd_notify_test(args):
         print("Test notification failed. Check your topic/server settings and logs.")
 
 
+def cmd_experiment(args):
+    """Manage A/B experiments."""
+    from tradingagents.testing.ab_config import load_experiment, save_experiment
+    from tradingagents.testing.ab_reporter import ABReporter
+    from tradingagents.storage.database import TradingDatabase
+
+    config = build_config()
+
+    if args.exp_command == "create":
+        exp = load_experiment(args.config)
+        db = TradingDatabase(config["db_path"])
+        import yaml
+        with open(args.config) as f:
+            config_yaml = f.read()
+        db.save_experiment(exp.experiment_id, config_yaml, exp.start_date,
+                           exp.primary_metric, exp.min_trades, exp.min_days)
+        print(f"Experiment '{exp.experiment_id}' created with {len(exp.variants)} variants.")
+
+    elif args.exp_command == "status":
+        db = TradingDatabase(config["db_path"])
+        exp_row = db.get_experiment(args.experiment_id)
+        if not exp_row:
+            print(f"Experiment '{args.experiment_id}' not found.")
+            return
+        print(f"\nExperiment: {exp_row['experiment_id']}")
+        print(f"  Status:    {exp_row['status']}")
+        print(f"  Started:   {exp_row['start_date']}")
+        print(f"  Metric:    {exp_row['primary_metric']}")
+        print(f"  Min trades:{exp_row['min_trades']}")
+        print(f"  Min days:  {exp_row['min_days']}")
+
+    elif args.exp_command == "report":
+        db = TradingDatabase(config["db_path"])
+        exp_row = db.get_experiment(args.experiment_id)
+        if not exp_row:
+            print(f"Experiment '{args.experiment_id}' not found.")
+            return
+        import yaml
+        exp = load_experiment_from_yaml_str(exp_row["config_yaml"])
+        reporter = ABReporter(exp)
+        print(f"\n{reporter.summary_table()}")
+        ready, reason = reporter.is_promotion_ready()
+        print(f"\nPromotion ready: {ready}")
+        print(f"  {reason}\n")
+
+    elif args.exp_command == "promote":
+        db = TradingDatabase(config["db_path"])
+        exp_row = db.get_experiment(args.experiment_id)
+        if not exp_row:
+            print(f"Experiment '{args.experiment_id}' not found.")
+            return
+        db.update_experiment_status(args.experiment_id, "promoted")
+        print(f"Experiment '{args.experiment_id}' status set to 'promoted'.")
+
+    else:
+        print("Unknown experiment command. Use: create, status, report, promote")
+
+
+def load_experiment_from_yaml_str(yaml_str: str):
+    """Load experiment from a YAML string (stored in DB)."""
+    import yaml
+    from tradingagents.testing.ab_models import Experiment, ExperimentVariant
+    data = yaml.safe_load(yaml_str)
+    variants = []
+    for v in data.get("variants", []):
+        variants.append(ExperimentVariant(
+            name=v["name"], description=v.get("description", ""),
+            config_overrides=v.get("config_overrides", {}),
+            alpaca_api_key=v.get("alpaca_api_key", ""),
+            alpaca_secret_key=v.get("alpaca_secret_key", ""),
+            db_path=v.get("db_path", ""),
+        ))
+    return Experiment(
+        experiment_id=data["experiment_id"], start_date=data.get("start_date", ""),
+        variants=variants, min_trades=data.get("min_trades", 30),
+        min_days=data.get("min_days", 20),
+        primary_metric=data.get("primary_metric", "sharpe_ratio"),
+        status=data.get("status", "running"),
+    )
+
+
 def cmd_social_check(args):
     """Poll configured X RSS feeds once."""
     config = build_config()
@@ -577,6 +658,18 @@ def main():
         help="ntfy priority: min, low, default, high, max, urgent",
     )
 
+    # experiment
+    p_exp = sub.add_parser("experiment", help="Manage A/B experiments")
+    exp_sub = p_exp.add_subparsers(dest="exp_command")
+    p_exp_create = exp_sub.add_parser("create", help="Create experiment from YAML")
+    p_exp_create.add_argument("--config", required=True, help="Path to experiment YAML")
+    p_exp_status = exp_sub.add_parser("status", help="Show experiment status")
+    p_exp_status.add_argument("experiment_id", help="Experiment ID")
+    p_exp_report = exp_sub.add_parser("report", help="Compare variant performance")
+    p_exp_report.add_argument("experiment_id", help="Experiment ID")
+    p_exp_promote = exp_sub.add_parser("promote", help="Promote winning variant")
+    p_exp_promote.add_argument("experiment_id", help="Experiment ID")
+
     p_social_check = sub.add_parser(
         "social-check",
         help="Poll the configured X RSS sources once",
@@ -607,6 +700,7 @@ def main():
         "remove-service": cmd_remove_service,
         "dashboard": cmd_dashboard,
         "notify-test": cmd_notify_test,
+        "experiment": cmd_experiment,
         "social-check": cmd_social_check,
         "social-test": cmd_social_test,
     }

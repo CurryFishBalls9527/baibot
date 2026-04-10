@@ -126,6 +126,61 @@ class TradingDatabase:
             CREATE INDEX IF NOT EXISTS idx_agent_memories_name ON agent_memories(memory_name);
             CREATE INDEX IF NOT EXISTS idx_setup_candidates_date ON setup_candidates(screen_date);
             CREATE INDEX IF NOT EXISTS idx_setup_candidates_symbol ON setup_candidates(symbol);
+
+            CREATE TABLE IF NOT EXISTS experiments (
+                experiment_id TEXT PRIMARY KEY,
+                config_yaml   TEXT NOT NULL,
+                start_date    TEXT NOT NULL,
+                status        TEXT NOT NULL DEFAULT 'running',
+                primary_metric TEXT DEFAULT 'sharpe_ratio',
+                min_trades    INTEGER DEFAULT 30,
+                min_days      INTEGER DEFAULT 20,
+                created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS experiment_snapshots (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                experiment_id TEXT NOT NULL REFERENCES experiments(experiment_id),
+                variant_name  TEXT NOT NULL,
+                date          TEXT NOT NULL,
+                equity        REAL,
+                daily_return  REAL,
+                total_return  REAL,
+                sharpe_ratio  REAL,
+                max_drawdown  REAL,
+                total_trades  INTEGER,
+                win_rate      REAL,
+                UNIQUE(experiment_id, variant_name, date)
+            );
+
+            CREATE TABLE IF NOT EXISTS position_states (
+                symbol          TEXT PRIMARY KEY,
+                entry_price     REAL NOT NULL,
+                entry_date      TEXT NOT NULL,
+                highest_close   REAL NOT NULL,
+                current_stop    REAL NOT NULL,
+                partial_taken   INTEGER DEFAULT 0,
+                stop_type       TEXT DEFAULT 'initial',
+                updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS trade_outcomes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL,
+                entry_date TEXT,
+                exit_date TEXT,
+                entry_price REAL,
+                exit_price REAL,
+                return_pct REAL,
+                hold_days INTEGER,
+                exit_reason TEXT,
+                base_pattern TEXT,
+                stage_at_entry REAL,
+                rs_at_entry REAL,
+                regime_at_entry TEXT,
+                max_favorable_excursion REAL,
+                max_adverse_excursion REAL
+            );
         """)
         self._ensure_columns(
             "setup_candidates",
@@ -460,6 +515,127 @@ class TradingDatabase:
         if not rows:
             return {"total_trades": 0, "wins": 0, "losses": 0, "win_rate": 0.0}
         return {"total_trades": len(rows), "note": "detailed P&L requires position pairing"}
+
+    # ── Position States (Exit Manager) ─────────────────────────────
+
+    def get_position_state(self, symbol: str) -> Optional[Dict]:
+        row = self.conn.execute(
+            "SELECT * FROM position_states WHERE symbol = ?", (symbol,)
+        ).fetchone()
+        if row is None:
+            return None
+        state = dict(row)
+        state["partial_taken"] = bool(state.get("partial_taken", 0))
+        return state
+
+    def upsert_position_state(self, symbol: str, state: Dict):
+        self.conn.execute(
+            """INSERT OR REPLACE INTO position_states
+               (symbol, entry_price, entry_date, highest_close, current_stop,
+                partial_taken, stop_type, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))""",
+            (
+                symbol,
+                state["entry_price"],
+                state["entry_date"],
+                state["highest_close"],
+                state["current_stop"],
+                1 if state.get("partial_taken") else 0,
+                state.get("stop_type", "initial"),
+            ),
+        )
+        self.conn.commit()
+
+    def delete_position_state(self, symbol: str):
+        self.conn.execute("DELETE FROM position_states WHERE symbol = ?", (symbol,))
+        self.conn.commit()
+
+    # ── Experiments ──────────────────────────────────────────────────
+
+    def save_experiment(self, experiment_id: str, config_yaml: str,
+                        start_date: str, primary_metric: str = "sharpe_ratio",
+                        min_trades: int = 30, min_days: int = 20):
+        self.conn.execute(
+            """INSERT OR REPLACE INTO experiments
+               (experiment_id, config_yaml, start_date, primary_metric,
+                min_trades, min_days)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (experiment_id, config_yaml, start_date, primary_metric,
+             min_trades, min_days),
+        )
+        self.conn.commit()
+
+    def get_experiment(self, experiment_id: str) -> Optional[Dict]:
+        row = self.conn.execute(
+            "SELECT * FROM experiments WHERE experiment_id = ?", (experiment_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def update_experiment_status(self, experiment_id: str, status: str):
+        self.conn.execute(
+            "UPDATE experiments SET status = ? WHERE experiment_id = ?",
+            (status, experiment_id),
+        )
+        self.conn.commit()
+
+    def save_experiment_snapshot(self, experiment_id: str, variant_name: str,
+                                snapshot_date: str, metrics: Dict):
+        self.conn.execute(
+            """INSERT OR REPLACE INTO experiment_snapshots
+               (experiment_id, variant_name, date, equity, daily_return,
+                total_return, sharpe_ratio, max_drawdown, total_trades, win_rate)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                experiment_id, variant_name, snapshot_date,
+                metrics.get("equity"), metrics.get("daily_return"),
+                metrics.get("total_return"), metrics.get("sharpe_ratio"),
+                metrics.get("max_drawdown"), metrics.get("total_trades"),
+                metrics.get("win_rate"),
+            ),
+        )
+        self.conn.commit()
+
+    # ── Trade Outcomes (Reflection) ──────────────────────────────────
+
+    def log_trade_outcome(self, outcome: Dict) -> int:
+        cur = self.conn.execute(
+            """INSERT INTO trade_outcomes
+               (symbol, entry_date, exit_date, entry_price, exit_price,
+                return_pct, hold_days, exit_reason, base_pattern,
+                stage_at_entry, rs_at_entry, regime_at_entry,
+                max_favorable_excursion, max_adverse_excursion)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                outcome.get("symbol"),
+                outcome.get("entry_date"),
+                outcome.get("exit_date"),
+                outcome.get("entry_price"),
+                outcome.get("exit_price"),
+                outcome.get("return_pct"),
+                outcome.get("hold_days"),
+                outcome.get("exit_reason"),
+                outcome.get("base_pattern"),
+                outcome.get("stage_at_entry"),
+                outcome.get("rs_at_entry"),
+                outcome.get("regime_at_entry"),
+                outcome.get("max_favorable_excursion"),
+                outcome.get("max_adverse_excursion"),
+            ),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def get_pattern_stats(self) -> List[Dict]:
+        rows = self.conn.execute("""
+            SELECT base_pattern, regime_at_entry,
+                   COUNT(*) as trades,
+                   AVG(CASE WHEN return_pct > 0 THEN 1.0 ELSE 0.0 END) as win_rate,
+                   AVG(return_pct) as avg_return
+            FROM trade_outcomes
+            GROUP BY base_pattern, regime_at_entry
+            HAVING trades >= 3
+        """).fetchall()
+        return [dict(r) for r in rows]
 
     def close(self):
         self.conn.close()

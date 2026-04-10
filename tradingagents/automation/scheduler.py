@@ -19,7 +19,16 @@ class TradingScheduler:
 
     def __init__(self, config: dict):
         self.config = config
-        self.orchestrator = Orchestrator(config)
+        self.experiment = None
+        self.ab_runner = None
+        if config.get("experiment_config_path"):
+            from tradingagents.testing.ab_config import load_experiment
+            from tradingagents.testing.ab_runner import ABRunner
+            self.experiment = load_experiment(config["experiment_config_path"])
+            self.ab_runner = ABRunner(self.experiment, config)
+            self.orchestrator = None
+        else:
+            self.orchestrator = Orchestrator(config)
         self.social_monitor = SocialFeedMonitor(config)
         self.scheduler = BlockingScheduler(timezone="US/Eastern")
         self._setup_jobs()
@@ -28,11 +37,27 @@ class TradingScheduler:
     def _setup_jobs(self):
         mode = self.config.get("trading_mode", "swing")
 
+        snapshot_func = (
+            self.ab_runner.take_market_snapshot
+            if self.ab_runner
+            else self.orchestrator.take_market_snapshot
+        )
+        analysis_func = (
+            self.ab_runner.run_daily_analysis
+            if self.ab_runner
+            else self.orchestrator.run_daily_analysis
+        )
+        reflection_func = (
+            self.ab_runner.run_daily_reflection
+            if self.ab_runner
+            else self.orchestrator.run_daily_reflection
+        )
+
         open_snapshot_time = self.config.get("market_open_snapshot_time", "09:25")
         hour, minute = open_snapshot_time.split(":")
         self.scheduler.add_job(
             self._run_with_logging,
-            args=[self.orchestrator.take_market_snapshot, "Market Open Snapshot"],
+            args=[snapshot_func, "Market Open Snapshot"],
             trigger=CronTrigger(
                 day_of_week="mon-fri",
                 hour=int(hour),
@@ -54,7 +79,7 @@ class TradingScheduler:
             hour, minute = swing_time.split(":")
             self.scheduler.add_job(
                 self._run_with_logging,
-                args=[self.orchestrator.run_daily_analysis, "Daily Swing Analysis"],
+                args=[analysis_func, "Daily Swing Analysis"],
                 trigger=CronTrigger(
                     day_of_week="mon-fri",
                     hour=int(hour),
@@ -72,7 +97,7 @@ class TradingScheduler:
             interval = self.config.get("intraday_interval_minutes", 60)
             self.scheduler.add_job(
                 self._run_with_logging,
-                args=[self.orchestrator.run_daily_analysis, "Intraday Scan"],
+                args=[analysis_func, "Intraday Scan"],
                 trigger=CronTrigger(
                     day_of_week="mon-fri",
                     hour="10-15",
@@ -90,7 +115,7 @@ class TradingScheduler:
         hour, minute = reflection_time.split(":")
         self.scheduler.add_job(
             self._run_with_logging,
-            args=[self.orchestrator.run_daily_reflection, "Daily Reflection & Report"],
+            args=[reflection_func, "Daily Reflection & Report"],
             trigger=CronTrigger(
                 day_of_week="mon-fri",
                 hour=int(hour),
@@ -132,7 +157,12 @@ class TradingScheduler:
             logger.info(f"JOB DONE: {label} — {result}")
         except Exception as e:
             logger.error(f"JOB FAILED: {label} — {e}", exc_info=True)
-            self.orchestrator.notifier.send(
+            notifier = (
+                self.orchestrator.notifier
+                if self.orchestrator
+                else list(self.ab_runner.orchestrators.values())[0].notifier
+            )
+            notifier.send(
                 "TradingAgents Job Failed",
                 f"{label}\n{type(e).__name__}: {e}",
                 priority="high",
@@ -161,7 +191,11 @@ class TradingScheduler:
 
         # Take initial snapshot
         try:
-            self.orchestrator.tracker.take_daily_snapshot()
+            if self.orchestrator:
+                self.orchestrator.tracker.take_daily_snapshot()
+            elif self.ab_runner:
+                for orch in self.ab_runner.orchestrators.values():
+                    orch.tracker.take_daily_snapshot()
         except Exception as e:
             logger.warning(f"Could not take initial snapshot: {e}")
 
@@ -179,4 +213,6 @@ class TradingScheduler:
     def run_now(self):
         """Immediately run analysis (for manual/testing use)."""
         logger.info("Manual trigger: running analysis NOW")
+        if self.ab_runner:
+            return self.ab_runner.run_daily_analysis()
         return self.orchestrator.run_daily_analysis()

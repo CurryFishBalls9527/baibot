@@ -213,6 +213,16 @@ def build_config(overrides: dict = None) -> dict:
         "default_stop_loss_pct": 0.08,
         "default_take_profit_pct": 0.15,
 
+        # Exit manager (Phase 2)
+        "exit_manager_enabled": True,
+        "trail_stop_pct": 0.10,
+        "breakeven_trigger_pct": 0.05,
+        "partial_profit_trigger_pct": 0.12,
+        "partial_profit_fraction": 0.33,
+        "max_hold_days": 60,
+        "use_50dma_exit": True,
+        "use_ema21_exit": False,
+
         # Storage
         "db_path": os.path.join(
             os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),

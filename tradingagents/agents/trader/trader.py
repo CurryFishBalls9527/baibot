@@ -22,9 +22,25 @@ def create_trader(llm, memory):
         else:
             past_memory_str = "No past memories found."
 
+        # Phase 3: Inject screener context
+        screener_context = state.get("screener_context", "")
+        screener_section = ""
+        if screener_context:
+            screener_section = (
+                f"\n\nMinervini Screener Data (use these computed values for "
+                f"stop-loss and buy-point — do NOT guess your own numbers):\n"
+                f"{screener_context}"
+            )
+
+        # Phase 7: Inject pattern performance stats
+        pattern_summary = state.get("pattern_summary", "")
+        pattern_section = ""
+        if pattern_summary:
+            pattern_section = f"\n\nHistorical pattern performance:\n{pattern_summary}"
+
         context = {
             "role": "user",
-            "content": f"Based on a comprehensive analysis by a team of analysts, here is an investment plan tailored for {company_name}. This plan incorporates insights from current technical market trends, macroeconomic indicators, and social media sentiment. Use this plan as a foundation for evaluating your next trading decision.\n\nProposed Investment Plan: {investment_plan}\n\nLeverage these insights to make an informed and strategic decision.",
+            "content": f"Based on a comprehensive analysis by a team of analysts, here is an investment plan tailored for {company_name}. This plan incorporates insights from current technical market trends, macroeconomic indicators, and social media sentiment. Use this plan as a foundation for evaluating your next trading decision.\n\nProposed Investment Plan: {investment_plan}{screener_section}{pattern_section}\n\nLeverage these insights to make an informed and strategic decision.",
         }
 
         messages = [

@@ -74,3 +74,7 @@ class AgentState(MessagesState):
         RiskDebateState, "Current state of the debate on evaluating risk"
     ]
     final_trade_decision: Annotated[str, "Final decision made by the Risk Analysts"]
+
+    # Screener context (Phase 3: Bridge Screener + AI)
+    screener_context: Annotated[str, "Structured data from Minervini screener"] = ""
+    pattern_summary: Annotated[str, "Historical pattern performance stats"] = ""
