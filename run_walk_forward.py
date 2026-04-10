@@ -1,0 +1,236 @@
+#!/usr/bin/env python3
+"""Walk-forward backtest with dynamic stock screening.
+
+Eliminates survivorship bias by screening stocks at each rebalance point
+using only data available on that date.
+
+Usage:
+    python run_walk_forward.py --start 2023-01-01 --end 2025-12-31 --rebalance weekly
+    python run_walk_forward.py --universe research_data/seed_universe.json --rebalance monthly
+    python run_walk_forward.py --start 2023-06-01 --end 2025-12-31 --max-positions 8
+"""
+
+import argparse
+import json
+import logging
+import sys
+from datetime import datetime
+from pathlib import Path
+
+from tradingagents.research.backtester import BacktestConfig
+from tradingagents.research.minervini import MinerviniConfig
+from tradingagents.research.seed_universe import build_seed_universe, load_seed_universe
+from tradingagents.research.walk_forward import WalkForwardBacktester, WalkForwardConfig
+from tradingagents.research.warehouse import MarketDataWarehouse
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Walk-forward backtest with dynamic Minervini screening"
+    )
+    parser.add_argument(
+        "--start", type=str, default="2023-01-01",
+        help="Data start date including warmup (YYYY-MM-DD)",
+    )
+    parser.add_argument(
+        "--end", type=str, default=datetime.now().strftime("%Y-%m-%d"),
+        help="Backtest end date (YYYY-MM-DD)",
+    )
+    parser.add_argument(
+        "--trade-start", type=str, default=None,
+        help="Trading start date (default: start + 1yr warmup)",
+    )
+    parser.add_argument(
+        "--rebalance", type=str, default="weekly",
+        choices=["weekly", "monthly"],
+        help="How often to re-screen the universe",
+    )
+    parser.add_argument(
+        "--db", type=str, default="research_data/market_data.duckdb",
+        help="Path to DuckDB warehouse",
+    )
+    parser.add_argument(
+        "--universe", type=str, default=None,
+        help="Path to seed universe JSON (builds default if not provided)",
+    )
+    parser.add_argument(
+        "--benchmark", type=str, default="SPY",
+        help="Benchmark symbol",
+    )
+    parser.add_argument(
+        "--initial-cash", type=float, default=100_000,
+        help="Starting capital",
+    )
+    parser.add_argument(
+        "--max-positions", type=int, default=6,
+        help="Maximum concurrent positions",
+    )
+    parser.add_argument(
+        "--max-position-pct", type=float, default=0.10,
+        help="Max single position as fraction of equity",
+    )
+    parser.add_argument(
+        "--min-rs", type=float, default=70.0,
+        help="Minimum RS percentile for screening",
+    )
+    parser.add_argument(
+        "--min-template-score", type=int, default=6,
+        help="Minimum Minervini template score for screening",
+    )
+    parser.add_argument(
+        "--max-candidates", type=int, default=50,
+        help="Max candidates per rebalance screen",
+    )
+    parser.add_argument(
+        "--results-dir", type=str, default="results/walk_forward",
+        help="Directory for output files",
+    )
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    logging.getLogger("yfinance").setLevel(logging.WARNING)
+
+    # Load or build seed universe
+    if args.universe:
+        seed_symbols = load_seed_universe(args.universe)
+    else:
+        seed_symbols = build_seed_universe()
+
+    print(f"\n{'=' * 70}")
+    print(f"  WALK-FORWARD BACKTEST (Survivorship-Bias-Free)")
+    print(f"{'=' * 70}")
+    print(f"  Seed universe:    {len(seed_symbols)} symbols")
+    print(f"  Period:           {args.start} to {args.end}")
+    print(f"  Rebalance:        {args.rebalance}")
+    print(f"  Benchmark:        {args.benchmark}")
+    print(f"  Capital:          ${args.initial_cash:,.0f}")
+    print(f"  Max positions:    {args.max_positions}")
+    print(f"  Min RS percentile: {args.min_rs}%")
+    print(f"  Min template score: {args.min_template_score}")
+    print(f"{'=' * 70}\n")
+
+    # Initialize
+    warehouse = MarketDataWarehouse(db_path=args.db, read_only=True)
+
+    wf_config = WalkForwardConfig(
+        rebalance_frequency=args.rebalance,
+        min_template_score=args.min_template_score,
+        min_rs_percentile=args.min_rs,
+        max_screen_candidates=args.max_candidates,
+        benchmark=args.benchmark,
+    )
+
+    backtest_config = BacktestConfig(
+        initial_cash=args.initial_cash,
+        max_positions=args.max_positions,
+        max_position_pct=args.max_position_pct,
+        # Relax entry conditions since the walk-forward screener
+        # already pre-filters the candidate universe
+        min_template_score=5,
+        require_volume_surge=False,
+        require_base_pattern=False,
+        require_market_regime=False,
+    )
+
+    screener_config = MinerviniConfig(
+        require_fundamentals=False,
+        require_market_uptrend=False,
+    )
+
+    # Run
+    backtester = WalkForwardBacktester(
+        warehouse=warehouse,
+        wf_config=wf_config,
+        backtest_config=backtest_config,
+        screener_config=screener_config,
+    )
+
+    result = backtester.run(
+        seed_symbols=seed_symbols,
+        start_date=args.start,
+        end_date=args.end,
+        trade_start_date=args.trade_start,
+    )
+
+    warehouse.close()
+
+    # Print summary
+    summary = result.portfolio_result.summary
+    if not summary:
+        print("  No trades executed. Check if data is available in the warehouse.")
+        print("  Run: python scripts/download_broad_universe.py --start 2022-01-01")
+        return
+
+    print(f"\n{'=' * 70}")
+    print(f"  RESULTS")
+    print(f"{'=' * 70}")
+    print(f"  Starting capital:    ${summary.get('start_value', 0):>12,.2f}")
+    print(f"  Ending capital:      ${summary.get('end_value', 0):>12,.2f}")
+    print(f"  Strategy return:     {summary.get('total_return', 0):>12.2%}")
+    print(f"  Benchmark return:    {summary.get('benchmark_return', 0):>12.2%}")
+    beats = summary.get('total_return', 0) > summary.get('benchmark_return', 0)
+    print(f"  Beats benchmark:     {'YES' if beats else 'NO':>12}")
+    print(f"  Max drawdown:        {summary.get('max_drawdown', 0):>12.2%}")
+    print(f"  Total trades:        {summary.get('total_trades', 0):>12}")
+    print(f"  Win rate:            {summary.get('trade_win_rate', 0):>12.2%}")
+    print(f"  Avg trade return:    {summary.get('avg_trade_return', 0):>12.2%}")
+    print(f"  Symbols traded:      {summary.get('symbols_with_trades', 0):>12}")
+
+    # Rebalance stats
+    log = result.rebalance_log
+    print(f"\n  Rebalance points:    {len(log)}")
+    print(f"  Avg approved/screen: {log['approved_count'].mean():>12.1f}")
+    print(f"  Max approved:        {log['approved_count'].max():>12}")
+    print(f"  Min approved:        {log['approved_count'].min():>12}")
+
+    # Save results
+    results_dir = Path(args.results_dir)
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    # Equity curve
+    eq = result.portfolio_result.equity_curve
+    if not eq.empty:
+        eq.to_csv(results_dir / "equity_curve.csv", index=False)
+
+    # Trades
+    trades = result.portfolio_result.trades
+    if not trades.empty:
+        trades.to_csv(results_dir / "trades.csv", index=False)
+
+    # Rebalance log
+    log.to_csv(results_dir / "rebalance_log.csv", index=False)
+
+    # Summary JSON
+    summary_out = {
+        **summary,
+        "config": {
+            "start_date": args.start,
+            "end_date": args.end,
+            "rebalance": args.rebalance,
+            "seed_universe_size": len(seed_symbols),
+            "initial_cash": args.initial_cash,
+            "max_positions": args.max_positions,
+            "min_rs_percentile": args.min_rs,
+            "min_template_score": args.min_template_score,
+        },
+        "rebalance_stats": {
+            "total_rebalances": len(log),
+            "avg_approved": float(log["approved_count"].mean()),
+        },
+    }
+    (results_dir / "summary.json").write_text(json.dumps(summary_out, indent=2, default=str))
+
+    print(f"\n  Results saved to: {results_dir}/")
+    print()
+
+
+if __name__ == "__main__":
+    main()

@@ -525,5 +525,59 @@ class MarketDataWarehouse:
         query += " ORDER BY symbol, fiscal_date"
         return self.conn.execute(query, params).fetchdf()
 
+    def get_daily_bars_bulk(
+        self,
+        symbols: list[str],
+        start_date: str | None = None,
+        end_date: str | None = None,
+    ) -> dict[str, pd.DataFrame]:
+        """Fetch daily bars for multiple symbols in one query, split by symbol.
+
+        Much faster than calling get_daily_bars() in a loop (single SQL query).
+        """
+        if not symbols:
+            return {}
+        placeholders = ", ".join(["?"] * len(symbols))
+        query = f"""
+            SELECT symbol, trade_date, open, high, low, close, adj_close, volume
+            FROM daily_bars
+            WHERE symbol IN ({placeholders})
+        """
+        params: list = list(symbols)
+        if start_date:
+            query += " AND trade_date >= ?"
+            params.append(start_date)
+        if end_date:
+            query += " AND trade_date <= ?"
+            params.append(end_date)
+        query += " ORDER BY symbol, trade_date"
+
+        df = self.conn.execute(query, params).fetchdf()
+        if df.empty:
+            return {}
+
+        df["trade_date"] = pd.to_datetime(df["trade_date"])
+        result = {}
+        for symbol, group in df.groupby("symbol"):
+            frame = group.drop(columns=["symbol"]).set_index("trade_date")
+            result[str(symbol)] = frame
+        return result
+
+    def symbols_with_data_on(self, trade_date: str, min_bars: int = 220) -> list[str]:
+        """Return symbols that have at least min_bars of data ending on or before trade_date.
+
+        Used by walk-forward backtester to filter to symbols with sufficient history.
+        """
+        query = """
+            SELECT symbol
+            FROM daily_bars
+            WHERE trade_date <= ?
+            GROUP BY symbol
+            HAVING COUNT(*) >= ?
+            ORDER BY symbol
+        """
+        rows = self.conn.execute(query, [trade_date, min_bars]).fetchall()
+        return [row[0] for row in rows]
+
     def close(self):
         self.conn.close()

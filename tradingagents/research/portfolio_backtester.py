@@ -36,7 +36,9 @@ class PortfolioMinerviniBacktester(MinerviniBacktester):
         benchmark_df: Optional[pd.DataFrame] = None,
         market_context_df: Optional[pd.DataFrame] = None,
         trade_start_date: Optional[str] = None,
+        candidate_schedule: Optional[Dict] = None,
     ) -> PortfolioBacktestResult:
+        self._candidate_schedule = candidate_schedule
         prepared_frames = {}
         for symbol, df in data_by_symbol.items():
             prepared = self.screener.prepare_features(df)
@@ -348,6 +350,17 @@ class PortfolioMinerviniBacktester(MinerviniBacktester):
                 exit_reason=exit_reason,
             )
 
+    def _get_approved_for_date(self, trade_date) -> set:
+        """Find the approved symbol set for a given trade date from the schedule."""
+        if not self._candidate_schedule:
+            return set()
+        import bisect
+        dates = sorted(self._candidate_schedule.keys())
+        idx = bisect.bisect_right(dates, trade_date) - 1
+        if idx < 0:
+            return set()
+        return self._candidate_schedule[dates[idx]]
+
     def _process_new_entries(
         self,
         trade_date,
@@ -362,8 +375,11 @@ class PortfolioMinerviniBacktester(MinerviniBacktester):
             return
 
         candidates = []
+        approved = self._get_approved_for_date(trade_date) if self._candidate_schedule else None
         for symbol, frame in prepared_frames.items():
             if symbol in positions or trade_date not in frame.index:
+                continue
+            if approved is not None and symbol not in approved:
                 continue
             row = frame.loc[trade_date]
             price = float(row["close"])
