@@ -33,6 +33,7 @@ def install_launch_agent(
     mode: str = "swing",
     symbols: Optional[list[str]] = None,
     label: str = DEFAULT_LABEL,
+    experiment: Optional[str] = None,
 ) -> Path:
     repo_path = Path(repo_root).resolve()
     # Preserve the venv entrypoint path. Resolving it can collapse the symlink
@@ -52,6 +53,13 @@ def install_launch_agent(
     ]
     if symbols:
         program_args.extend(["--symbols", ",".join(symbols)])
+    if experiment:
+        experiment_path = Path(experiment)
+        if not experiment_path.is_absolute():
+            experiment_path = (repo_path / experiment_path).resolve()
+        if not experiment_path.exists():
+            raise FileNotFoundError(f"Experiment YAML not found: {experiment_path}")
+        program_args.extend(["--experiment", str(experiment_path)])
 
     plist = {
         "Label": label,

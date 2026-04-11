@@ -155,6 +155,8 @@ Use `.env.example` as the template.
 
 - `OPENAI_API_KEY`: needed for most agent-based research and trading flows if you use OpenAI models.
 - `ALPACA_API_KEY` / `ALPACA_SECRET_KEY`: needed only for Alpaca paper/live trading, account status, and automated execution.
+- `ALPACA_MECHANICAL_API_KEY` / `ALPACA_MECHANICAL_SECRET_KEY`: optional, used by the `mechanical` variant of the A/B paper-trading experiment (see *A/B Paper Trading* below).
+- `ALPACA_LLM_API_KEY` / `ALPACA_LLM_SECRET_KEY`: optional, used by the `llm` variant of the A/B paper-trading experiment.
 - `ALPHA_VANTAGE_API_KEY`: optional, used by some market-data and research paths.
 - `NTFY_TOPIC`: optional, used for phone push notifications.
 - `SOCIAL_NTFY_TOPIC`: optional, used for social-monitor alerts.
@@ -203,6 +205,7 @@ These should stay local and should not be committed:
 
 - `.env`
 - `trading.db`
+- `trading_*.db` (per-variant A/B dbs like `trading_mechanical.db`, `trading_llm.db`)
 - `results/`
 - `research_data/`
 - `trading.log`
@@ -387,6 +390,13 @@ On macOS, install the scheduler as a `launchd` service:
 python run_trading.py install-service --mode both
 ```
 
+To install the service bound to an A/B experiment config (see below):
+
+```bash
+python run_trading.py install-service --mode swing \
+  --experiment experiments/paper_launch.yaml
+```
+
 Remove it:
 
 ```bash
@@ -398,6 +408,42 @@ Service logs are written under:
 ```text
 results/service_logs/
 ```
+
+#### A/B paper trading (mechanical vs LLM)
+
+You can run two paper-trading variants side by side against separate Alpaca
+paper accounts and separate local SQLite dbs. The bundled example at
+`experiments/paper_launch.yaml` defines two variants:
+
+- `mechanical` — pure rule-based Minervini entries, `ExitManager` exits, no
+  LLM calls (sets `mechanical_only_mode: true`)
+- `llm` — full 13-call LangGraph agent pipeline
+
+Alpaca keys are resolved at runtime from environment variables via `${VAR}`
+substitution, so the YAML is safe to commit. Set the following in `.env`:
+
+```bash
+ALPACA_MECHANICAL_API_KEY=...
+ALPACA_MECHANICAL_SECRET_KEY=...
+ALPACA_LLM_API_KEY=...
+ALPACA_LLM_SECRET_KEY=...
+```
+
+Then run either ad-hoc:
+
+```bash
+python run_trading.py run --experiment experiments/paper_launch.yaml
+```
+
+or on the scheduler:
+
+```bash
+python run_trading.py schedule --mode swing \
+  --experiment experiments/paper_launch.yaml
+```
+
+Each variant writes to its own db (`trading_mechanical.db`, `trading_llm.db`)
+so positions, trades, and agent memories never mix.
 
 #### Emergency close
 

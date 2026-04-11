@@ -66,11 +66,53 @@ def cmd_run(args):
         config["quick_think_llm"] = args.model
     if args.disable_minervini:
         config["minervini_enabled"] = False
+    if getattr(args, "experiment", None):
+        config["experiment_config_path"] = args.experiment
+
+    if config.get("experiment_config_path"):
+        from tradingagents.testing.ab_config import load_experiment
+        from tradingagents.testing.ab_runner import ABRunner
+
+        experiment = load_experiment(config["experiment_config_path"])
+        runner = ABRunner(experiment, config)
+        print(f"\nExperiment: {experiment.experiment_id}")
+        print(f"Variants: {', '.join(v.name for v in experiment.variants)}")
+        print("-" * 50)
+        all_results = runner.run_daily_analysis()
+        print("\n" + "=" * 50)
+        print("RESULTS")
+        print("=" * 50)
+        for variant_name, results in all_results.items():
+            print(f"\n[{variant_name}]")
+            if not isinstance(results, dict):
+                print(f"  {results}")
+                continue
+            if "error" in results:
+                print(f"  ERROR: {results['error']}")
+                continue
+            if results.get("status") == "market_closed":
+                print("  Market closed — no analysis run.")
+                continue
+            for symbol, result in results.items():
+                if not isinstance(result, dict):
+                    print(f"  {symbol}: {result}")
+                    continue
+                if "error" in result:
+                    print(f"  {symbol}: ERROR - {result['error']}")
+                elif result.get("traded"):
+                    print(f"  {symbol}: {result['side'].upper()} {result['qty']} shares ({result['status']})")
+                elif result.get("screen_rejected"):
+                    print(f"  {symbol}: SKIP - {result['screen_rejected']}")
+                else:
+                    print(f"  {symbol}: {result.get('action', '?')}")
+        print()
+        return
 
     orch = Orchestrator(config)
     print(f"\nRunning analysis for: {config['watchlist']}")
     print(f"Paper mode: {config['paper_trading']}")
     print(f"LLM: {config['deep_think_llm']}")
+    print(f"Mechanical-only: {config.get('mechanical_only_mode', False)}")
     print("-" * 50)
 
     results = orch.run_daily_analysis()
@@ -101,6 +143,8 @@ def cmd_schedule(args):
         config["trading_mode"] = args.mode
     if args.disable_minervini:
         config["minervini_enabled"] = False
+    if getattr(args, "experiment", None):
+        config["experiment_config_path"] = args.experiment
 
     print(f"Starting TradingAgents Scheduler")
     print(f"  Mode: {config['trading_mode']}")
@@ -378,6 +422,7 @@ def cmd_install_service(args):
         mode=args.mode,
         symbols=symbols,
         label=args.label,
+        experiment=args.experiment,
     )
 
     print("Launch agent installed.")
@@ -386,6 +431,7 @@ def cmd_install_service(args):
     print(f"  Python: {python_bin}")
     print(f"  Mode: {args.mode}")
     print(f"  Symbols: {symbols or 'config watchlist'}")
+    print(f"  Experiment: {args.experiment or '(none — single orchestrator)'}")
     print(f"  Logs: {repo_root / 'results' / 'service_logs'}")
     print()
 
@@ -568,12 +614,14 @@ def main():
     p_run.add_argument("--symbols", type=str, help="Comma-separated symbols (e.g. AAPL,NVDA)")
     p_run.add_argument("--model", type=str, help="LLM model to use")
     p_run.add_argument("--disable-minervini", action="store_true", help="Disable Minervini entry gating")
+    p_run.add_argument("--experiment", type=str, help="Path to A/B experiment YAML (enables ABRunner)")
 
     # schedule
     p_sched = sub.add_parser("schedule", help="Start automated scheduler")
     p_sched.add_argument("--symbols", type=str, help="Comma-separated symbols")
     p_sched.add_argument("--mode", choices=["swing", "day", "both"], help="Trading mode")
     p_sched.add_argument("--disable-minervini", action="store_true", help="Disable Minervini entry gating")
+    p_sched.add_argument("--experiment", type=str, help="Path to A/B experiment YAML (enables ABRunner)")
 
     # status
     sub.add_parser("status", help="Show current status")
@@ -608,6 +656,11 @@ def main():
         help="Trading mode for the background scheduler",
     )
     p_install.add_argument("--symbols", type=str, help="Optional comma-separated symbols")
+    p_install.add_argument(
+        "--experiment",
+        type=str,
+        help="Path to A/B experiment YAML (enables ABRunner in the launch agent)",
+    )
     p_install.add_argument(
         "--label",
         type=str,

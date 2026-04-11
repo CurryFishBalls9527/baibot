@@ -1,6 +1,8 @@
 """Configuration helpers for A/B experiments."""
 
 import logging
+import os
+import re
 from pathlib import Path
 
 import yaml
@@ -8,6 +10,27 @@ import yaml
 from .ab_models import Experiment, ExperimentVariant
 
 logger = logging.getLogger(__name__)
+
+# Matches ${VAR} or ${VAR:-default} in YAML string values.
+_ENV_VAR_RE = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)(?::-([^}]*))?\}")
+
+
+def _expand_env_vars(value):
+    """Recursively replace ${VAR} / ${VAR:-default} references with env values."""
+    if isinstance(value, str):
+        def _sub(match: re.Match) -> str:
+            name = match.group(1)
+            default = match.group(2) or ""
+            env_val = os.getenv(name)
+            if env_val is None or env_val == "":
+                return default
+            return env_val
+        return _ENV_VAR_RE.sub(_sub, value)
+    if isinstance(value, dict):
+        return {k: _expand_env_vars(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_expand_env_vars(v) for v in value]
+    return value
 
 
 def build_variant_config(base_config: dict, variant: ExperimentVariant) -> dict:
@@ -24,10 +47,15 @@ def build_variant_config(base_config: dict, variant: ExperimentVariant) -> dict:
 
 
 def load_experiment(yaml_path: str) -> Experiment:
-    """Load experiment definition from YAML file."""
+    """Load experiment definition from YAML file.
+
+    String values may reference environment variables with ${VAR} or
+    ${VAR:-default} syntax so secrets (Alpaca keys) stay out of the file.
+    """
     path = Path(yaml_path)
     with path.open("r") as f:
         data = yaml.safe_load(f)
+    data = _expand_env_vars(data)
 
     variants = []
     for v in data.get("variants", []):

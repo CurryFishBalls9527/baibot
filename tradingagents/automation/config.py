@@ -235,6 +235,13 @@ def build_config(overrides: dict = None) -> dict:
         "quick_think_llm": "gpt-4o-mini",
         "max_debate_rounds": 1,
         "max_risk_discuss_rounds": 1,
+        # Mechanical-only mode: skip all LLM analysis and run pure rule-based
+        # Minervini setups. Used for A/B comparison against the LLM variant.
+        "mechanical_only_mode": _env_flag("MECHANICAL_ONLY_MODE", False),
+
+        # A/B experiment: when set, the scheduler uses ABRunner with the
+        # variants defined in this YAML instead of a single Orchestrator.
+        "experiment_config_path": os.getenv("EXPERIMENT_CONFIG_PATH", ""),
 
         # Data
         "data_vendors": {

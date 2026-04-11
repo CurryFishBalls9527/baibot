@@ -624,6 +624,23 @@ class Orchestrator:
                         continue
 
                     # Step 3: Ambiguous — run AI only when needed
+                    if self.config.get("mechanical_only_mode"):
+                        # Mechanical variant: exit manager already ran; warnings
+                        # alone don't trigger a sell without LLM judgment.
+                        logger.info(
+                            f"{pos.symbol}: Warnings: {warnings}. Mechanical-only "
+                            f"mode — holding (exit manager retains control)."
+                        )
+                        if decision.updated_state:
+                            self.db.upsert_position_state(pos.symbol, decision.updated_state)
+                        results[pos.symbol] = {
+                            "symbol": pos.symbol,
+                            "action": "HOLD",
+                            "traded": False,
+                            "warnings": warnings,
+                        }
+                        continue
+
                     logger.info(f"{pos.symbol}: Warnings: {warnings}. Running AI.")
                     result = self._analyze_and_trade(pos.symbol, account, stock_positions)
                     if decision.updated_state:
@@ -636,6 +653,13 @@ class Orchestrator:
         else:
             for pos in stock_positions:
                 try:
+                    if self.config.get("mechanical_only_mode"):
+                        results[pos.symbol] = {
+                            "symbol": pos.symbol,
+                            "action": "HOLD",
+                            "traded": False,
+                        }
+                        continue
                     result = self._analyze_and_trade(pos.symbol, account, stock_positions)
                     results[pos.symbol] = result
                 except Exception as e:
@@ -699,6 +723,14 @@ class Orchestrator:
                         account,
                         stock_positions,
                     )
+                elif self.config.get("mechanical_only_mode"):
+                    # Mechanical variant requires a preflight setup to enter.
+                    result = {
+                        "symbol": symbol,
+                        "action": "SKIP",
+                        "traded": False,
+                        "screen_rejected": "Mechanical-only mode: preflight unavailable",
+                    }
                 else:
                     result = self._analyze_and_trade(symbol, account, stock_positions)
                 results[symbol] = result
@@ -1161,6 +1193,11 @@ class Orchestrator:
     def run_daily_reflection(self) -> Dict:
         """After market close: reflect on today's trades and update memories."""
         logger.info("Running daily reflection...")
+
+        if self.config.get("mechanical_only_mode"):
+            logger.info("Mechanical-only mode — skipping LLM reflection.")
+            self.tracker.take_daily_snapshot()
+            return self.generate_daily_report(save=True)
 
         positions = self.broker.get_positions()
         ta = self._get_ai_engine()

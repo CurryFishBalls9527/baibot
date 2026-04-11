@@ -1,0 +1,41 @@
+experiment_id: paper_launch_v1
+start_date: "2026-04-13"
+primary_metric: sharpe_ratio
+min_trades: 20
+min_days: 15
+status: running
+
+# Two-variant paper trading launch:
+#   mechanical — pure Minervini rule-based entries + exit manager, no LLM
+#   llm        — full 13-call agent pipeline (default orchestrator behavior)
+#
+# Each variant points at a SEPARATE Alpaca paper account and a SEPARATE
+# local SQLite db so positions, trades, and memories never mix.
+#
+# Alpaca keys are loaded from environment variables at runtime via ${VAR}
+# substitution. Set these in your .env (gitignored) before running:
+#   ALPACA_MECHANICAL_API_KEY, ALPACA_MECHANICAL_SECRET_KEY
+#   ALPACA_LLM_API_KEY,        ALPACA_LLM_SECRET_KEY
+# This file is safe to commit — it contains no secrets.
+
+variants:
+  - name: mechanical
+    description: Rule-based Minervini entries, ExitManager exits, no LLM calls
+    alpaca_api_key: "${ALPACA_MECHANICAL_API_KEY}"
+    alpaca_secret_key: "${ALPACA_MECHANICAL_SECRET_KEY}"
+    db_path: trading_mechanical.db
+    config_overrides:
+      mechanical_only_mode: true
+      # Keep Minervini preflight ON — mechanical variant depends on it
+      # for setup data (buy_point, buy_limit, stop). Without preflight,
+      # new entries are skipped in mechanical mode.
+      minervini_enabled: true
+
+  - name: llm
+    description: Full 13-call agent graph pipeline (analysts → debaters → risk)
+    alpaca_api_key: "${ALPACA_LLM_API_KEY}"
+    alpaca_secret_key: "${ALPACA_LLM_SECRET_KEY}"
+    db_path: trading_llm.db
+    config_overrides:
+      mechanical_only_mode: false
+      minervini_enabled: true

@@ -220,6 +220,7 @@ __marimo__/
 
 # Trading platform
 trading.db
+trading_*.db
 trading.log
 eval_results/
 results/
