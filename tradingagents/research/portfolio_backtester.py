@@ -103,6 +103,8 @@ class PortfolioMinerviniBacktester(MinerviniBacktester):
             )
             cash = float(cash_ref["cash"])
 
+            vol_scalar = self._compute_vol_scalar(equity_curve)
+
             if trade_date >= trade_start_ts:
                 self._process_new_entries(
                     trade_date=trade_date,
@@ -116,6 +118,7 @@ class PortfolioMinerviniBacktester(MinerviniBacktester):
                     overlay_symbol=overlay_symbol,
                     benchmark_df=benchmark_df,
                     trades=trades,
+                    vol_scalar=vol_scalar,
                 )
                 cash = float(cash_ref["cash"])
 
@@ -162,6 +165,7 @@ class PortfolioMinerviniBacktester(MinerviniBacktester):
                     "regime": regime_label,
                     "regime_confirmed_uptrend": bool(regime_ok),
                     "target_exposure": target_exposure,
+                    "vol_scalar": round(vol_scalar, 4),
                     "actual_exposure": round(exposure, 4),
                     "market_score": (
                         int(market_score) if pd.notna(market_score) else None
@@ -429,6 +433,34 @@ class PortfolioMinerviniBacktester(MinerviniBacktester):
             return set()
         return self._candidate_schedule[dates[idx]]
 
+    def _compute_vol_scalar(self, equity_history: list) -> float:
+        """Barroso & Santa-Clara style vol scalar computed from strategy equity.
+
+        Scales intended exposure inversely with recent realized strategy vol.
+        Returns 1.0 until enough equity history has accumulated.
+        """
+        if not self.config.vol_target_enabled:
+            return 1.0
+        warmup = self.config.vol_target_warmup_days
+        if len(equity_history) < warmup + 2:
+            return 1.0
+        equities = pd.Series([row["equity"] for row in equity_history], dtype=float)
+        rets = equities.pct_change().dropna()
+        if len(rets) < warmup:
+            return 1.0
+        recent = rets.iloc[-self.config.vol_target_lookback_days:]
+        ewm_var = recent.ewm(halflife=self.config.vol_target_halflife_days, adjust=False).var().iloc[-1]
+        if pd.isna(ewm_var) or ewm_var <= 0:
+            return 1.0
+        realized_vol = float((ewm_var * 252) ** 0.5)
+        scalar = self.config.vol_target_annual / max(realized_vol, 0.05)
+        return float(
+            max(
+                self.config.vol_target_min_scalar,
+                min(self.config.vol_target_max_scalar, scalar),
+            )
+        )
+
     def _process_new_entries(
         self,
         trade_date,
@@ -442,9 +474,11 @@ class PortfolioMinerviniBacktester(MinerviniBacktester):
         overlay_symbol: str = "SPY",
         benchmark_df: Optional[pd.DataFrame] = None,
         trades: Optional[list] = None,
+        vol_scalar: float = 1.0,
     ) -> None:
         if regime_label == "market_correction" and not self.config.allow_new_entries_in_correction:
             return
+        effective_target_exposure = min(1.0, target_exposure * vol_scalar)
 
         candidates = []
         approved = self._get_approved_for_date(trade_date) if self._candidate_schedule else None
@@ -455,7 +489,15 @@ class PortfolioMinerviniBacktester(MinerviniBacktester):
                 continue
             row = frame.loc[trade_date]
             price = float(row["close"])
-            breakout_ok = self._row_passes_entry(row, price, regime_ok)
+            breakouts_disabled = (
+                self.config.disable_breakouts_in_uptrend
+                and regime_label in ("confirmed_uptrend", "uptrend_under_pressure")
+            )
+            breakout_ok = (
+                False
+                if breakouts_disabled
+                else self._row_passes_entry(row, price, regime_ok)
+            )
             continuation_ok = (
                 not breakout_ok
                 and self._row_passes_continuation_entry(row, price)
@@ -502,7 +544,7 @@ class PortfolioMinerviniBacktester(MinerviniBacktester):
             )
             portfolio_value = cash_ref["cash"] + market_value + overlay_mv
             current_exposure = market_value / portfolio_value if portfolio_value > 0 else 0.0
-            if current_exposure >= target_exposure:
+            if current_exposure >= effective_target_exposure:
                 break
 
             price = candidate["price"]
@@ -517,8 +559,8 @@ class PortfolioMinerviniBacktester(MinerviniBacktester):
             if risk_per_share <= 0:
                 continue
 
-            per_position_cap = portfolio_value * self.config.max_position_pct
-            remaining_to_target = max(0.0, (target_exposure * portfolio_value) - market_value)
+            per_position_cap = portfolio_value * self.config.max_position_pct * vol_scalar
+            remaining_to_target = max(0.0, (effective_target_exposure * portfolio_value) - market_value)
             desired_budget = min(per_position_cap, remaining_to_target)
             if desired_budget <= 0:
                 continue
@@ -546,7 +588,12 @@ class PortfolioMinerviniBacktester(MinerviniBacktester):
             budget = min(desired_budget, cash_ref["cash"])
             if budget <= 0:
                 continue
-            risk_budget = portfolio_value * self.config.risk_per_trade * self.config.initial_entry_fraction
+            risk_budget = (
+                portfolio_value
+                * self.config.risk_per_trade
+                * self.config.initial_entry_fraction
+                * vol_scalar
+            )
             qty = min(
                 int((budget * self.config.initial_entry_fraction) / price),
                 int(risk_budget / risk_per_share),

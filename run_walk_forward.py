@@ -121,6 +121,26 @@ def parse_args():
         "--target-exposure", type=float, default=None,
         help="Override regime-based target exposure for all regimes (e.g. 1.0 for full overlay)",
     )
+    parser.add_argument(
+        "--vol-target", action="store_true",
+        help="Enable Barroso-Santa Clara strategy-vol-targeted exposure scaling",
+    )
+    parser.add_argument(
+        "--vol-target-level", type=float, default=0.15,
+        help="Annualized strategy vol target (default 0.15 = 15%)",
+    )
+    parser.add_argument(
+        "--vol-target-halflife", type=int, default=20,
+        help="EWM halflife in trading days for vol estimation (default 20)",
+    )
+    parser.add_argument(
+        "--min-rvol", type=float, default=0.0,
+        help="Hard gate: require breakout_volume_ratio >= N on breakout entries (default 0 = off)",
+    )
+    parser.add_argument(
+        "--disable-breakouts-in-uptrend", action="store_true",
+        help="In confirmed_uptrend regime, skip breakout entries and run continuation-only",
+    )
     return parser.parse_args()
 
 
@@ -181,6 +201,11 @@ def main():
         use_50dma_exit=not args.no_50dma_exit,
         overlay_enabled=args.overlay,
         overlay_rebalance_threshold=args.overlay_threshold,
+        vol_target_enabled=args.vol_target,
+        vol_target_annual=args.vol_target_level,
+        vol_target_halflife_days=args.vol_target_halflife,
+        min_breakout_volume_ratio=args.min_rvol,
+        disable_breakouts_in_uptrend=args.disable_breakouts_in_uptrend,
         **(
             {
                 "target_exposure_confirmed_uptrend": args.target_exposure,

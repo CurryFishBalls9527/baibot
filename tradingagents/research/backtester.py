@@ -58,6 +58,15 @@ class BacktestConfig:
     continuation_min_roc_60: float = 0.10
     continuation_max_distance_from_high: float = 0.10
     continuation_max_atr_pct: float = 0.06
+    vol_target_enabled: bool = False
+    vol_target_annual: float = 0.15
+    vol_target_halflife_days: int = 20
+    vol_target_lookback_days: int = 60
+    vol_target_min_scalar: float = 0.25
+    vol_target_max_scalar: float = 1.50
+    vol_target_warmup_days: int = 30
+    min_breakout_volume_ratio: float = 0.0
+    disable_breakouts_in_uptrend: bool = False
 
 
 class MinerviniBacktester:
@@ -657,6 +666,10 @@ class MinerviniBacktester:
     def _row_passes_entry(self, row: pd.Series, price: float, regime_ok: bool) -> bool:
         template_score = self._template_score(row)
         volume_ok = (not self.config.require_volume_surge) or bool(row.get("breakout_signal"))
+        if self.config.min_breakout_volume_ratio > 0:
+            rvol = row.get("breakout_volume_ratio")
+            if pd.isna(rvol) or float(rvol) < self.config.min_breakout_volume_ratio:
+                return False
         has_base = (
             (pd.notna(row.get("base_candidate")) and bool(row.get("base_candidate")))
             or (pd.notna(row.get("vcp_candidate")) and bool(row.get("vcp_candidate")))

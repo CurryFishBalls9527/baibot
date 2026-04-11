@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Optional
 
+import numpy as np
 import pandas as pd
 
 
@@ -84,7 +85,7 @@ class MinerviniScreener:
         volume = features["volume"]
         prev_close = close.shift(1)
         daily_returns = close.pct_change()
-        intraday_range = (high - low).replace(0, pd.NA)
+        intraday_range = (high - low).replace(0, np.nan)
         true_range = pd.concat(
             [
                 high - low,
@@ -101,24 +102,24 @@ class MinerviniScreener:
         plus_di_14 = (
             100.0
             * plus_dm.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
-            / atr_14.replace(0, pd.NA)
+            / atr_14.replace(0, np.nan)
         )
         minus_di_14 = (
             100.0
             * minus_dm.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
-            / atr_14.replace(0, pd.NA)
+            / atr_14.replace(0, np.nan)
         )
         dx = (
             100.0
             * (plus_di_14 - minus_di_14).abs()
-            / (plus_di_14 + minus_di_14).replace(0, pd.NA)
+            / (plus_di_14 + minus_di_14).replace(0, np.nan)
         )
         delta = close.diff()
         gains = delta.clip(lower=0)
         losses = -delta.clip(upper=0)
         avg_gain = gains.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
         avg_loss = losses.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
-        rs = avg_gain / avg_loss.replace(0, pd.NA)
+        rs = avg_gain / avg_loss.replace(0, np.nan)
 
         features["ema_10"] = close.ewm(span=10, adjust=False).mean()
         features["ema_21"] = close.ewm(span=21, adjust=False).mean()
@@ -133,7 +134,7 @@ class MinerviniScreener:
         features["avg_dollar_volume_50"] = features["avg_volume_50"] * close
         features["close_range_pct"] = (close - low) / intraday_range
         features["atr_14"] = atr_14
-        features["atr_pct_14"] = atr_14 / close.replace(0, pd.NA)
+        features["atr_pct_14"] = atr_14 / close.replace(0, np.nan)
         features["plus_di_14"] = plus_di_14
         features["minus_di_14"] = minus_di_14
         features["adx_14"] = dx.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
@@ -146,39 +147,39 @@ class MinerviniScreener:
         features["handle_low"] = low.rolling(self.config.handle_window).min().shift(1)
         features["handle_depth_pct"] = (
             (features["handle_high"] - features["handle_low"])
-            / features["handle_high"].replace(0, pd.NA)
+            / features["handle_high"].replace(0, np.nan)
         )
         features["pivot_price"] = high.rolling(self.config.breakout_lookback).max().shift(1)
         features["base_high"] = high.rolling(self.config.base_window).max().shift(1)
         features["base_low"] = low.rolling(self.config.base_window).min().shift(1)
         features["base_depth_pct"] = (
             (features["base_high"] - features["base_low"])
-            / features["base_high"].replace(0, pd.NA)
+            / features["base_high"].replace(0, np.nan)
         )
         features["distance_from_base_high_pct"] = (
-            (features["base_high"] - close) / features["base_high"].replace(0, pd.NA)
+            (features["base_high"] - close) / features["base_high"].replace(0, np.nan)
         )
         features["drawdown_from_52w_high_pct"] = (
-            (features["52w_high"] - close) / features["52w_high"].replace(0, pd.NA)
+            (features["52w_high"] - close) / features["52w_high"].replace(0, np.nan)
         )
         features["prior_stage_high"] = (
             high.rolling(self.config.stage_breakout_lookback).max().shift(1)
         )
 
-        range_pct = (high - low) / close.replace(0, pd.NA)
+        range_pct = (high - low) / close.replace(0, np.nan)
         features["range_pct_10"] = range_pct.rolling(10).mean()
         features["range_pct_20"] = range_pct.rolling(20).mean()
         features["range_pct_40"] = range_pct.rolling(40).mean()
         features["tight_closes_10"] = (
             (close.rolling(10).max() - close.rolling(10).min())
-            / close.replace(0, pd.NA)
+            / close.replace(0, np.nan)
         )
         features["volume_contraction_ratio"] = (
-            features["avg_volume_10"] / features["avg_volume_50"].replace(0, pd.NA)
+            features["avg_volume_10"] / features["avg_volume_50"].replace(0, np.nan)
         )
         features["base_recovery_pct"] = (
             (close - features["base_low"])
-            / (features["base_high"] - features["base_low"]).replace(0, pd.NA)
+            / (features["base_high"] - features["base_low"]).replace(0, np.nan)
         )
         features["vcp_candidate"] = (
             (features["range_pct_10"] < features["range_pct_20"])
@@ -208,7 +209,7 @@ class MinerviniScreener:
             & (features["volume_contraction_ratio"] <= 0.85)
             & (
                 (features["handle_high"] - close)
-                / features["handle_high"].replace(0, pd.NA)
+                / features["handle_high"].replace(0, np.nan)
                 <= 0.08
             )
         )
@@ -257,7 +258,7 @@ class MinerviniScreener:
         features.loc[features["cup_handle_candidate"], "stop_reference"] = features["handle_low"]
         features["initial_stop_pct"] = (
             (features["buy_point"] - features["stop_reference"])
-            / features["buy_point"].replace(0, pd.NA)
+            / features["buy_point"].replace(0, np.nan)
         ).clip(
             lower=self.config.min_initial_stop_pct,
             upper=self.config.max_initial_stop_pct,
@@ -266,13 +267,13 @@ class MinerviniScreener:
             features["buy_point"] * (1.0 - features["initial_stop_pct"])
         )
         features["distance_to_buy_point_pct"] = (
-            (features["buy_point"] - close) / features["buy_point"].replace(0, pd.NA)
+            (features["buy_point"] - close) / features["buy_point"].replace(0, np.nan)
         )
         features["buy_zone_pct"] = (
-            (close - features["buy_point"]) / features["buy_point"].replace(0, pd.NA)
+            (close - features["buy_point"]) / features["buy_point"].replace(0, np.nan)
         )
         features["breakout_volume_ratio"] = (
-            volume / features["avg_volume_50"].replace(0, pd.NA)
+            volume / features["avg_volume_50"].replace(0, np.nan)
         )
         features["breakout_signal"] = (
             (close > features["buy_point"])
