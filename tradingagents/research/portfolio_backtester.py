@@ -455,24 +455,36 @@ class PortfolioMinerviniBacktester(MinerviniBacktester):
                 continue
             row = frame.loc[trade_date]
             price = float(row["close"])
-            if not self._row_passes_entry(row, price, regime_ok):
+            breakout_ok = self._row_passes_entry(row, price, regime_ok)
+            continuation_ok = (
+                not breakout_ok
+                and self._row_passes_continuation_entry(row, price)
+            )
+            if not (breakout_ok or continuation_ok):
                 continue
+            entry_type = "breakout" if breakout_ok else "continuation"
+
+            def _num(key: str, default: float = 0.0) -> float:
+                val = row.get(key)
+                return float(val) if pd.notna(val) else default
+
             candidates.append(
                 {
                     "symbol": symbol,
                     "price": price,
                     "row": row,
+                    "entry_type": entry_type,
                     "rank": (
-                        int(bool(row.get("breakout_signal"))),
-                        float(row.get("template_score") or 0.0),
-                        float(row.get("roc_60") or 0.0),
-                        float(row.get("roc_120") or 0.0),
-                        float(row.get("adx_14") or 0.0),
-                        float(row.get("rsi_14") or 0.0),
-                        -float(row.get("atr_pct_14") or 0.0),
-                        float(row.get("close_range_pct") or 0.0),
-                        float(row.get("breakout_volume_ratio") or 0.0),
-                        -float(row.get("stage_number") or 99.0),
+                        int(bool(row.get("breakout_signal"))) if pd.notna(row.get("breakout_signal")) else 0,
+                        _num("template_score"),
+                        _num("roc_60"),
+                        _num("roc_120"),
+                        _num("adx_14"),
+                        _num("rsi_14"),
+                        -_num("atr_pct_14"),
+                        _num("close_range_pct"),
+                        _num("breakout_volume_ratio"),
+                        -_num("stage_number", 99.0),
                     ),
                 }
             )
@@ -558,6 +570,7 @@ class PortfolioMinerviniBacktester(MinerviniBacktester):
                 "partial_taken": False,
                 "add_on_1_done": False,
                 "add_on_2_done": False,
+                "entry_type": candidate["entry_type"],
             }
 
     def _portfolio_market_value(

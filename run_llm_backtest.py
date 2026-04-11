@@ -96,6 +96,26 @@ def parse_args():
     parser.add_argument(
         "--max-candidates", type=int, default=50,
     )
+    parser.add_argument(
+        "--max-stage", type=int, default=2,
+        help="Max Minervini stage for entries",
+    )
+    parser.add_argument(
+        "--buy-point-tolerance", type=float, default=1.0,
+        help="Pivot buy-point tolerance (0.98 = allow 2% below pivot)",
+    )
+    parser.add_argument(
+        "--trail-stop", type=float, default=0.10,
+        help="Trailing stop percent",
+    )
+    parser.add_argument(
+        "--no-50dma-exit", action="store_true",
+        help="Disable 50 DMA break as an exit condition",
+    )
+    parser.add_argument(
+        "--allow-continuation-entry", action="store_true",
+        help="Enable alt entry path for persistent leaders",
+    )
     # Output
     parser.add_argument(
         "--results-dir", type=str, default="results/llm_backtest",
@@ -178,11 +198,16 @@ def main():
         require_volume_surge=False,
         require_base_pattern=False,
         require_market_regime=False,
+        buy_point_tolerance=args.buy_point_tolerance,
+        trail_stop_pct=args.trail_stop,
+        use_50dma_exit=not args.no_50dma_exit,
+        allow_continuation_entry=args.allow_continuation_entry,
     )
 
     screener_config = MinerviniConfig(
         require_fundamentals=False,
         require_market_uptrend=False,
+        max_stage_number=args.max_stage,
     )
 
     # Run

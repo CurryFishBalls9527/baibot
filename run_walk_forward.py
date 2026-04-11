@@ -102,6 +102,10 @@ def parse_args():
         help="Disable the breakout_ready flag gate (rely on pivot check alone)",
     )
     parser.add_argument(
+        "--allow-continuation-entry", action="store_true",
+        help="Enable alt entry path for persistent leaders (pullback to EMA, not breakout)",
+    )
+    parser.add_argument(
         "--trail-stop", type=float, default=0.10,
         help="Trailing stop percent (0.10 = 10%)",
     )
@@ -171,6 +175,7 @@ def main():
         require_base_pattern=False,
         require_breakout_ready=not args.no_require_breakout_ready,
         require_market_regime=False,
+        allow_continuation_entry=args.allow_continuation_entry,
         buy_point_tolerance=args.buy_point_tolerance,
         trail_stop_pct=args.trail_stop,
         use_50dma_exit=not args.no_50dma_exit,

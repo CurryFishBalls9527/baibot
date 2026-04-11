@@ -53,6 +53,11 @@ class BacktestConfig:
     buy_point_tolerance: float = 1.0
     overlay_enabled: bool = False
     overlay_rebalance_threshold: float = 0.05
+    allow_continuation_entry: bool = False
+    continuation_min_template_score: int = 7
+    continuation_min_roc_60: float = 0.10
+    continuation_max_distance_from_high: float = 0.10
+    continuation_max_atr_pct: float = 0.06
 
 
 class MinerviniBacktester:
@@ -736,6 +741,48 @@ class MinerviniBacktester:
             return False
         if pd.notna(buy_limit_price) and price > float(buy_limit_price):
             return False
+        return True
+
+    def _row_passes_continuation_entry(self, row: pd.Series, price: float) -> bool:
+        """Alt entry path for persistent leaders that never form a fresh base.
+
+        The primary path requires a breakout from a 20-day pivot. Stocks in
+        a sustained uptrend (AMZN 2015, NVDA 2023) rarely consolidate long
+        enough to form that base — they just keep running. This path lets
+        them enter on a mild pullback when the trend structure is intact.
+        """
+        if not self.config.allow_continuation_entry:
+            return False
+
+        template_score = self._template_score(row)
+        if template_score < self.config.continuation_min_template_score:
+            return False
+
+        ema_21 = row.get("ema_21")
+        sma_50 = row.get("sma_50")
+        sma_150 = row.get("sma_150")
+        sma_200 = row.get("sma_200")
+        if any(pd.isna(x) for x in (ema_21, sma_50, sma_150, sma_200)):
+            return False
+        if price < float(ema_21) or price < float(sma_50):
+            return False
+        if not (float(sma_50) > float(sma_150) > float(sma_200)):
+            return False
+
+        roc_60 = row.get("roc_60")
+        if pd.isna(roc_60) or float(roc_60) < self.config.continuation_min_roc_60:
+            return False
+
+        high_52w = row.get("52w_high")
+        if pd.isna(high_52w) or high_52w <= 0:
+            return False
+        if price < float(high_52w) * (1.0 - self.config.continuation_max_distance_from_high):
+            return False
+
+        atr_pct = row.get("atr_pct_14")
+        if pd.notna(atr_pct) and float(atr_pct) > self.config.continuation_max_atr_pct:
+            return False
+
         return True
 
     def _row_supports_pyramiding(self, row: pd.Series, price: float) -> bool:

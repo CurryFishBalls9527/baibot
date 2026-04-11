@@ -29,38 +29,62 @@ from .warehouse import MarketDataWarehouse
 logger = logging.getLogger(__name__)
 
 
-BACKTEST_ENTRY_PROMPT = """You are grading momentum trade setups for a Minervini SEPA portfolio.
+BACKTEST_ENTRY_PROMPT = """You are grading entries for a Minervini SEPA momentum portfolio.
 
-IMPORTANT CONTEXT: this candidate has ALREADY passed a strict mechanical screen
-(Stage 2 uptrend, SMA stacking, RS leadership, base pattern, and more). Your
-job is NOT to re-validate the screen — assume it's a qualifying setup. Your
-job is to decide whether it's an A-grade entry worth taking a slot for, or
-a marginal one worth skipping.
+READ THIS FIRST — IT OVERRIDES YOUR TEXTBOOK INSTINCTS
+======================================================
+Every candidate below has ALREADY cleared a strict mechanical screen: Stage 2
+uptrend, proper SMA stacking (50 > 150 > 200), RS leadership vs the market,
+base pattern, and a breakout/continuation trigger. The screen is the gate.
+Your job is NOT to re-check it.
 
-Default to BUY. Passing has real opportunity cost: the portfolio holds at
-most 10 names and slots go empty when you pass. Only PASS when you see a
-specific disqualifying condition.
+This strategy deliberately hunts right-tail winners (APP, RKLB, HOOD, NVDA
+archetypes). ~40-50% of trades lose small; a handful of trades return 100%+.
+Rejecting the big winners destroys the strategy. Standard TA "overbought" and
+"weak volume" rules are ANTI-CORRELATED with how leaders actually act.
+
+Do NOT treat the following as red flags. They are NORMAL for Stage 2 leaders:
+  - RSI 70-85  →  normal operating range for leaders. Only RSI > 85 WITH
+    price > 25% above SMA50 is true blow-off extension.
+  - Volume below 50-day average  →  normal during tight consolidation and
+    mid-trend continuation. Only dismiss volume if the candidate is tagged
+    as a FRESH breakout AND volume ratio < 1.0x.
+  - ADX 10-20  →  normal during base-building. Only a concern if ADX < 15
+    AND 60-day rate of change is also negative.
+  - Price extended above SMA50  →  this is Stage 2 by definition. Only a
+    problem if also > 25% above SMA50 with RSI > 85.
+  - "Looks extended after a big run"  →  leaders are supposed to look
+    extended. That is the setup, not a warning.
+
+Your only job: filter out the small set of genuinely broken setups where the
+underlying structure has actually cracked. Default strongly to BUY. A slot
+left empty is a slot that misses the next APP/RKLB. The opportunity cost of
+a false PASS is far larger than the cost of a false BUY — the trailing stop
+handles bad entries, but there is no recovery from missing the few names
+that return 200%+.
 
 {screener_context}
 
-Decision rule:
-- BUY if the setup looks tradable under Minervini rules. Most pre-screened
-  candidates qualify. This should be your default answer.
-- PASS only if you spot a concrete red flag, such as:
-    * RSI > 80 AND price > 20% above SMA50 (blow-off extension)
-    * Price below SMA50 (trend break, not a momentum entry)
-    * ADX < 15 (no directional strength, choppy)
-    * Rate of change negative over 60 AND 120 days (momentum reversal)
-  Ambiguity or "could go either way" is NOT a red flag — that's a BUY.
+HARD PASS GATES — pass ONLY if one of these is unambiguously true
+==================================================================
+1. Blow-off extension: RSI > 85 AND price is > 25% above the 50-day SMA.
+2. Trend break: closing price is BELOW the 50-day SMA (not just near it).
+3. Momentum reversal: 60-day rate of change is negative AND 120-day rate
+   of change is also negative (both must be negative).
+4. Dead drift: ADX < 15 AND 60-day rate of change is negative.
+
+If NONE of the four gates above is clearly triggered → the answer is BUY.
+Ambiguity, mild concerns, "could go either way", "might be extended",
+"volume could be stronger" → all of these are BUY. Do not invent reasons.
 
 Confidence calibration:
-- 0.85-0.95: clean momentum setup, all indicators aligned
-- 0.70-0.84: solid setup with one minor concern
-- 0.60-0.69: marginal but still tradable (still BUY)
-- < 0.60: PASS (use only when a red flag above is present)
+- 0.85-0.95: clean Stage 2 leader, all indicators aligned
+- 0.70-0.84: solid setup, one minor observation
+- 0.60-0.69: marginal but still tradable (still BUY — slot has value)
+- < 0.60: PASS, and only when one of the 4 hard gates above is triggered
 
 Respond with ONLY valid JSON (no markdown, no extra text):
-{{"action": "BUY" or "PASS", "confidence": 0.0 to 1.0, "reasoning": "1-2 sentences naming the specific factor that drove the decision"}}"""
+{{"action": "BUY" or "PASS", "confidence": 0.0 to 1.0, "reasoning": "1-2 sentences. If PASS, name which of the 4 hard gates triggered and cite the specific numbers."}}"""
 
 
 @dataclass
