@@ -21,6 +21,7 @@ class BacktestConfig:
     min_template_score: int = 8
     require_volume_surge: bool = True
     require_base_pattern: bool = True
+    require_breakout_ready: bool = True
     require_market_regime: bool = True
     exit_on_market_correction: bool = False
     progressive_entries: bool = False
@@ -33,6 +34,7 @@ class BacktestConfig:
     partial_profit_trigger_pct: float = 0.12
     partial_profit_fraction: float = 0.33
     use_ema21_exit: bool = False
+    use_50dma_exit: bool = True
     use_close_range_filter: bool = False
     min_close_range_pct: float = 0.60
     scale_exposure_in_weak_market: bool = False
@@ -48,6 +50,9 @@ class BacktestConfig:
     min_roc_20: float = -1.0
     min_roc_60: float = -1.0
     min_roc_120: float = -1.0
+    buy_point_tolerance: float = 1.0
+    overlay_enabled: bool = False
+    overlay_rebalance_threshold: float = 0.05
 
 
 class MinerviniBacktester:
@@ -652,7 +657,10 @@ class MinerviniBacktester:
             or (pd.notna(row.get("vcp_candidate")) and bool(row.get("vcp_candidate")))
         )
         base_ok = (not self.config.require_base_pattern) or has_base
-        setup_ready = True if pd.isna(row.get("breakout_ready")) else bool(row.get("breakout_ready"))
+        if self.config.require_breakout_ready:
+            setup_ready = True if pd.isna(row.get("breakout_ready")) else bool(row.get("breakout_ready"))
+        else:
+            setup_ready = True
         stage_ok = (
             pd.notna(row.get("stage_number"))
             and float(row.get("stage_number")) <= self.screener.config.max_stage_number
@@ -724,7 +732,7 @@ class MinerviniBacktester:
             or (self.config.require_market_regime and not regime_ok)
         ):
             return False
-        if pd.isna(buy_point) or price < float(buy_point):
+        if pd.isna(buy_point) or price < float(buy_point) * self.config.buy_point_tolerance:
             return False
         if pd.notna(buy_limit_price) and price > float(buy_limit_price):
             return False

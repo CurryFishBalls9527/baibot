@@ -85,6 +85,38 @@ def parse_args():
         "--results-dir", type=str, default="results/walk_forward",
         help="Directory for output files",
     )
+    parser.add_argument(
+        "--buy-point-tolerance", type=float, default=1.0,
+        help="Entry price tolerance below pivot buy point (1.0 = strict, 0.98 = allow 2% below)",
+    )
+    parser.add_argument(
+        "--max-stage", type=int, default=2,
+        help="Maximum Minervini stage number for entries (2 = early breakouts only, 3 = mid-cycle ok)",
+    )
+    parser.add_argument(
+        "--no-50dma-exit", action="store_true",
+        help="Disable 50 DMA break as an exit condition",
+    )
+    parser.add_argument(
+        "--no-require-breakout-ready", action="store_true",
+        help="Disable the breakout_ready flag gate (rely on pivot check alone)",
+    )
+    parser.add_argument(
+        "--trail-stop", type=float, default=0.10,
+        help="Trailing stop percent (0.10 = 10%)",
+    )
+    parser.add_argument(
+        "--overlay", action="store_true",
+        help="Park idle cash in SPY to match target exposure",
+    )
+    parser.add_argument(
+        "--overlay-threshold", type=float, default=0.05,
+        help="Min gap (fraction of equity) to trigger overlay rebalance",
+    )
+    parser.add_argument(
+        "--target-exposure", type=float, default=None,
+        help="Override regime-based target exposure for all regimes (e.g. 1.0 for full overlay)",
+    )
     return parser.parse_args()
 
 
@@ -137,12 +169,28 @@ def main():
         min_template_score=5,
         require_volume_surge=False,
         require_base_pattern=False,
+        require_breakout_ready=not args.no_require_breakout_ready,
         require_market_regime=False,
+        buy_point_tolerance=args.buy_point_tolerance,
+        trail_stop_pct=args.trail_stop,
+        use_50dma_exit=not args.no_50dma_exit,
+        overlay_enabled=args.overlay,
+        overlay_rebalance_threshold=args.overlay_threshold,
+        **(
+            {
+                "target_exposure_confirmed_uptrend": args.target_exposure,
+                "target_exposure_uptrend_under_pressure": args.target_exposure,
+                "target_exposure_market_correction": args.target_exposure,
+            }
+            if args.target_exposure is not None
+            else {}
+        ),
     )
 
     screener_config = MinerviniConfig(
         require_fundamentals=False,
         require_market_uptrend=False,
+        max_stage_number=args.max_stage,
     )
 
     # Run

@@ -75,6 +75,8 @@ class PortfolioMinerviniBacktester(MinerviniBacktester):
         daily_state: list[dict] = []
         running_peak = float(self.config.initial_cash)
         max_drawdown = 0.0
+        overlay_state = {"shares": 0, "cost_basis": 0.0}
+        overlay_symbol = "SPY"
 
         for trade_date in all_dates:
             regime_label, regime_ok, target_exposure = self._regime_state(
@@ -82,7 +84,11 @@ class PortfolioMinerviniBacktester(MinerviniBacktester):
             )
             cash_ref = {"cash": cash}
 
-            equity_before = cash_ref["cash"] + self._portfolio_market_value(positions, prepared_frames, trade_date)
+            stock_mv_before = self._portfolio_market_value(positions, prepared_frames, trade_date)
+            overlay_mv_before = self._overlay_market_value(
+                overlay_state, benchmark_df, trade_date
+            )
+            equity_before = cash_ref["cash"] + stock_mv_before + overlay_mv_before
             running_peak = max(running_peak, equity_before)
             max_drawdown = max(max_drawdown, (running_peak - equity_before) / running_peak)
 
@@ -106,12 +112,33 @@ class PortfolioMinerviniBacktester(MinerviniBacktester):
                     regime_label=regime_label,
                     target_exposure=target_exposure,
                     cash_ref=cash_ref,
+                    overlay_state=overlay_state,
+                    overlay_symbol=overlay_symbol,
+                    benchmark_df=benchmark_df,
+                    trades=trades,
                 )
                 cash = float(cash_ref["cash"])
 
+                if self.config.overlay_enabled and benchmark_df is not None:
+                    self._rebalance_overlay(
+                        trade_date=trade_date,
+                        overlay_symbol=overlay_symbol,
+                        overlay_state=overlay_state,
+                        benchmark_df=benchmark_df,
+                        positions=positions,
+                        prepared_frames=prepared_frames,
+                        target_exposure=target_exposure,
+                        regime_label=regime_label,
+                        cash_ref=cash_ref,
+                        trades=trades,
+                    )
+                    cash = float(cash_ref["cash"])
+
             market_value = self._portfolio_market_value(positions, prepared_frames, trade_date)
-            equity = cash + market_value
-            exposure = market_value / equity if equity > 0 else 0.0
+            overlay_mv = self._overlay_market_value(overlay_state, benchmark_df, trade_date)
+            equity = cash + market_value + overlay_mv
+            total_exposure_mv = market_value + overlay_mv
+            exposure = total_exposure_mv / equity if equity > 0 else 0.0
             market_score = None
             if (
                 not regime_frame.empty
@@ -125,6 +152,7 @@ class PortfolioMinerviniBacktester(MinerviniBacktester):
                     "equity": round(equity, 2),
                     "cash": round(cash, 2),
                     "market_value": round(market_value, 2),
+                    "overlay_value": round(overlay_mv, 2),
                     "exposure": round(exposure, 4),
                 }
             )
@@ -159,18 +187,57 @@ class PortfolioMinerviniBacktester(MinerviniBacktester):
                     exit_reason="final_bar",
                 )
 
+        if overlay_state["shares"] > 0 and benchmark_df is not None:
+            final_date = all_dates[-1]
+            final_price = self._overlay_price(benchmark_df, final_date)
+            if final_price is not None:
+                shares = overlay_state["shares"]
+                proceeds = shares * final_price
+                cost = overlay_state["cost_basis"]
+                cash += proceeds
+                trades.append(
+                    {
+                        "symbol": overlay_symbol,
+                        "entry_date": None,
+                        "exit_date": final_date,
+                        "entry_price": cost / shares if shares else 0.0,
+                        "exit_price": final_price,
+                        "shares": shares,
+                        "pnl": round(proceeds - cost, 2),
+                        "return_pct": round((proceeds - cost) / cost, 4) if cost else 0.0,
+                        "hold_days": 0,
+                        "exit_reason": "overlay_final",
+                        "leg_type": "overlay",
+                    }
+                )
+                overlay_state["shares"] = 0
+                overlay_state["cost_basis"] = 0.0
+
         equity_curve_df = pd.DataFrame(equity_curve)
         daily_state_df = pd.DataFrame(daily_state)
         trades_df = pd.DataFrame(trades)
         symbol_summary_df = self._build_symbol_summary(trades_df)
         total_return = (cash / self.config.initial_cash) - 1.0 if self.config.initial_cash else 0.0
         benchmark_return = self._portfolio_benchmark_return(benchmark_df, trade_start_ts)
+
+        avg_exposure_pct = 0.0
+        sharpe_ratio = 0.0
+        if not equity_curve_df.empty:
+            avg_exposure_pct = float(equity_curve_df["exposure"].mean())
+            daily_returns = equity_curve_df["equity"].pct_change().dropna()
+            if len(daily_returns) > 1 and daily_returns.std() > 0:
+                sharpe_ratio = float(
+                    (daily_returns.mean() / daily_returns.std()) * (252 ** 0.5)
+                )
+
         summary = {
             "start_value": round(float(self.config.initial_cash), 2),
             "end_value": round(float(cash), 2),
             "total_return": round(float(total_return), 4),
             "benchmark_return": round(float(benchmark_return), 4),
             "max_drawdown": round(float(max_drawdown), 4),
+            "avg_exposure_pct": round(avg_exposure_pct, 4),
+            "sharpe_ratio": round(sharpe_ratio, 4),
             "symbols_tested": len(prepared_frames),
             "symbols_with_trades": int(trades_df["symbol"].nunique()) if not trades_df.empty else 0,
             "total_trades": int(len(trades_df)),
@@ -331,6 +398,7 @@ class PortfolioMinerviniBacktester(MinerviniBacktester):
                 exit_reason = "lost_21ema"
             elif (
                 not self.config.use_ema21_exit
+                and self.config.use_50dma_exit
                 and pd.notna(row.get("sma_50"))
                 and price < float(row["sma_50"])
             ):
@@ -370,6 +438,10 @@ class PortfolioMinerviniBacktester(MinerviniBacktester):
         regime_label: str,
         target_exposure: float,
         cash_ref: dict[str, float],
+        overlay_state: Optional[dict] = None,
+        overlay_symbol: str = "SPY",
+        benchmark_df: Optional[pd.DataFrame] = None,
+        trades: Optional[list] = None,
     ) -> None:
         if regime_label == "market_correction" and not self.config.allow_new_entries_in_correction:
             return
@@ -410,10 +482,13 @@ class PortfolioMinerviniBacktester(MinerviniBacktester):
             if len(positions) >= self.config.max_positions:
                 break
 
-            portfolio_value = cash_ref["cash"] + self._portfolio_market_value(
-                positions, prepared_frames, trade_date
-            )
             market_value = self._portfolio_market_value(positions, prepared_frames, trade_date)
+            overlay_mv = (
+                self._overlay_market_value(overlay_state, benchmark_df, trade_date)
+                if overlay_state is not None and benchmark_df is not None
+                else 0.0
+            )
+            portfolio_value = cash_ref["cash"] + market_value + overlay_mv
             current_exposure = market_value / portfolio_value if portfolio_value > 0 else 0.0
             if current_exposure >= target_exposure:
                 break
@@ -432,11 +507,31 @@ class PortfolioMinerviniBacktester(MinerviniBacktester):
 
             per_position_cap = portfolio_value * self.config.max_position_pct
             remaining_to_target = max(0.0, (target_exposure * portfolio_value) - market_value)
-            budget = min(
-                per_position_cap,
-                remaining_to_target,
-                cash_ref["cash"],
-            )
+            desired_budget = min(per_position_cap, remaining_to_target)
+            if desired_budget <= 0:
+                continue
+
+            # If cash is insufficient, liquidate SPY overlay to free the shortfall.
+            if (
+                self.config.overlay_enabled
+                and overlay_state is not None
+                and benchmark_df is not None
+                and trades is not None
+                and cash_ref["cash"] < desired_budget
+                and overlay_state.get("shares", 0) > 0
+            ):
+                shortfall = desired_budget - cash_ref["cash"]
+                self._liquidate_overlay(
+                    shortfall=shortfall,
+                    trade_date=trade_date,
+                    overlay_symbol=overlay_symbol,
+                    overlay_state=overlay_state,
+                    benchmark_df=benchmark_df,
+                    cash_ref=cash_ref,
+                    trades=trades,
+                )
+
+            budget = min(desired_budget, cash_ref["cash"])
             if budget <= 0:
                 continue
             risk_budget = portfolio_value * self.config.risk_per_trade * self.config.initial_entry_fraction
@@ -478,6 +573,145 @@ class PortfolioMinerviniBacktester(MinerviniBacktester):
                 continue
             total += self._total_shares(position["lots"]) * float(frame.loc[trade_date, "close"])
         return total
+
+    @staticmethod
+    def _overlay_price(
+        benchmark_df: Optional[pd.DataFrame],
+        trade_date,
+    ) -> Optional[float]:
+        if benchmark_df is None or benchmark_df.empty or trade_date not in benchmark_df.index:
+            return None
+        return float(benchmark_df.loc[trade_date, "close"])
+
+    def _overlay_market_value(
+        self,
+        overlay_state: dict,
+        benchmark_df: Optional[pd.DataFrame],
+        trade_date,
+    ) -> float:
+        if overlay_state["shares"] <= 0:
+            return 0.0
+        price = self._overlay_price(benchmark_df, trade_date)
+        if price is None:
+            return overlay_state["cost_basis"]
+        return overlay_state["shares"] * price
+
+    def _liquidate_overlay(
+        self,
+        shortfall: float,
+        trade_date,
+        overlay_symbol: str,
+        overlay_state: dict,
+        benchmark_df: pd.DataFrame,
+        cash_ref: dict,
+        trades: list,
+    ) -> None:
+        """Sell just enough SPY overlay shares to free ``shortfall`` cash."""
+        price = self._overlay_price(benchmark_df, trade_date)
+        if price is None or price <= 0 or overlay_state["shares"] <= 0:
+            return
+
+        qty = min(overlay_state["shares"], int(shortfall / price) + 1)
+        if qty <= 0:
+            return
+        proceeds = qty * price
+        avg_cost = (
+            overlay_state["cost_basis"] / overlay_state["shares"]
+            if overlay_state["shares"] > 0
+            else 0.0
+        )
+        realized_cost = avg_cost * qty
+        cash_ref["cash"] += proceeds
+        overlay_state["shares"] -= qty
+        overlay_state["cost_basis"] = max(0.0, overlay_state["cost_basis"] - realized_cost)
+        trades.append(
+            {
+                "symbol": overlay_symbol,
+                "entry_date": None,
+                "exit_date": trade_date,
+                "entry_price": avg_cost,
+                "exit_price": price,
+                "shares": qty,
+                "pnl": round(proceeds - realized_cost, 2),
+                "return_pct": round((proceeds - realized_cost) / realized_cost, 4) if realized_cost else 0.0,
+                "hold_days": 0,
+                "exit_reason": "overlay_make_room",
+                "leg_type": "overlay",
+            }
+        )
+
+    def _rebalance_overlay(
+        self,
+        trade_date,
+        overlay_symbol: str,
+        overlay_state: dict,
+        benchmark_df: pd.DataFrame,
+        positions: dict[str, dict],
+        prepared_frames: dict[str, pd.DataFrame],
+        target_exposure: float,
+        regime_label: str,
+        cash_ref: dict,
+        trades: list,
+    ) -> None:
+        price = self._overlay_price(benchmark_df, trade_date)
+        if price is None or price <= 0:
+            return
+
+        effective_target = target_exposure
+
+        stock_mv = self._portfolio_market_value(positions, prepared_frames, trade_date)
+        overlay_mv = overlay_state["shares"] * price
+        equity = cash_ref["cash"] + stock_mv + overlay_mv
+
+        target_total_mv = equity * effective_target
+        desired_overlay_mv = max(0.0, target_total_mv - stock_mv)
+        # Cap overlay by available cash when buying.
+        desired_overlay_mv = min(desired_overlay_mv, cash_ref["cash"] + overlay_mv)
+        delta_mv = desired_overlay_mv - overlay_mv
+
+        # Only act if the gap is material to avoid daily churn.
+        if abs(delta_mv) < equity * self.config.overlay_rebalance_threshold:
+            return
+
+        if delta_mv > 0:
+            qty = int(delta_mv / price)
+            if qty <= 0:
+                return
+            cost = qty * price
+            if cost > cash_ref["cash"]:
+                return
+            cash_ref["cash"] -= cost
+            overlay_state["shares"] += qty
+            overlay_state["cost_basis"] += cost
+        else:
+            qty = min(overlay_state["shares"], int((-delta_mv) / price) + 1)
+            if qty <= 0:
+                return
+            proceeds = qty * price
+            avg_cost = (
+                overlay_state["cost_basis"] / overlay_state["shares"]
+                if overlay_state["shares"] > 0
+                else 0.0
+            )
+            realized_cost = avg_cost * qty
+            cash_ref["cash"] += proceeds
+            overlay_state["shares"] -= qty
+            overlay_state["cost_basis"] = max(0.0, overlay_state["cost_basis"] - realized_cost)
+            trades.append(
+                {
+                    "symbol": overlay_symbol,
+                    "entry_date": None,
+                    "exit_date": trade_date,
+                    "entry_price": avg_cost,
+                    "exit_price": price,
+                    "shares": qty,
+                    "pnl": round(proceeds - realized_cost, 2),
+                    "return_pct": round((proceeds - realized_cost) / realized_cost, 4) if realized_cost else 0.0,
+                    "hold_days": 0,
+                    "exit_reason": "overlay_rebalance",
+                    "leg_type": "overlay",
+                }
+            )
 
     def _regime_state(self, regime_frame: pd.DataFrame, trade_date) -> tuple[str, bool, float]:
         if not regime_frame.empty and trade_date in regime_frame.index:
