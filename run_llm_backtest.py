@@ -116,6 +116,10 @@ def parse_args():
         "--allow-continuation-entry", action="store_true",
         help="Enable alt entry path for persistent leaders",
     )
+    parser.add_argument(
+        "--disable-breakouts-in-uptrend", action="store_true",
+        help="Skip breakout entries in confirmed_uptrend/uptrend_under_pressure regimes",
+    )
     # Output
     parser.add_argument(
         "--results-dir", type=str, default="results/llm_backtest",
@@ -202,6 +206,7 @@ def main():
         trail_stop_pct=args.trail_stop,
         use_50dma_exit=not args.no_50dma_exit,
         allow_continuation_entry=args.allow_continuation_entry,
+        disable_breakouts_in_uptrend=args.disable_breakouts_in_uptrend,
     )
 
     screener_config = MinerviniConfig(
