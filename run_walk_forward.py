@@ -141,6 +141,15 @@ def parse_args():
         "--disable-breakouts-in-uptrend", action="store_true",
         help="In confirmed_uptrend regime, skip breakout entries and run continuation-only",
     )
+    parser.add_argument(
+        "--min-group-rank", type=float, default=0.0,
+        help="Industry group rank percentile gate (0-100). 0 = off. 60 = require top 40% group.",
+    )
+    parser.add_argument(
+        "--group-by", type=str, default="industry",
+        choices=["industry", "sector"],
+        help="Grouping level for group rank filter",
+    )
     return parser.parse_args()
 
 
@@ -182,6 +191,8 @@ def main():
         min_rs_percentile=args.min_rs,
         max_screen_candidates=args.max_candidates,
         benchmark=args.benchmark,
+        min_group_rank_pct=args.min_group_rank,
+        group_by=args.group_by,
     )
 
     backtest_config = BacktestConfig(

@@ -7,13 +7,16 @@ universe dynamically, just like in live trading.
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, List, Optional, Set
 
 import pandas as pd
 
 from .backtester import BacktestConfig
+from .market_context import build_market_context
 from .minervini import MinerviniConfig, MinerviniScreener
 from .portfolio_backtester import PortfolioBacktestResult, PortfolioMinerviniBacktester
 from .warehouse import MarketDataWarehouse
@@ -29,6 +32,18 @@ class WalkForwardConfig:
     min_data_bars: int = 252  # require 1yr history for indicators
     max_screen_candidates: int = 50
     benchmark: str = "SPY"
+    # Industry-group rank filter (Minervini "leaders in leading groups")
+    sector_map_path: Optional[str] = "research_data/sector_map.json"
+    group_by: str = "industry"  # "industry" or "sector"
+    min_group_rank_pct: float = 0.0  # 0 = off; 60 = require top 40% group
+    group_min_members: int = 3  # groups with fewer members keep their raw score
+    # Gate the group filter by regime. Set to ("confirmed_uptrend",
+    # "uptrend_under_pressure") to only enforce leaders-in-leading-groups
+    # during trending markets. Empty tuple = apply to all regimes.
+    group_filter_regimes: tuple = (
+        "confirmed_uptrend",
+        "uptrend_under_pressure",
+    )
 
 
 @dataclass
@@ -56,6 +71,25 @@ class WalkForwardBacktester:
             require_market_uptrend=False,
         )
         self.screener = MinerviniScreener(self.screener_config)
+        self.sector_map = self._load_sector_map()
+
+    def _load_sector_map(self) -> Dict[str, Dict[str, str]]:
+        path = self.wf_config.sector_map_path
+        if not path:
+            return {}
+        p = Path(path)
+        if not p.exists():
+            if self.wf_config.min_group_rank_pct > 0:
+                raise FileNotFoundError(
+                    f"sector_map_path {path} missing but min_group_rank_pct > 0. "
+                    "Run scripts/build_sector_map.py first."
+                )
+            return {}
+        try:
+            return json.loads(p.read_text())
+        except Exception as e:
+            logger.warning("Failed to load sector map %s: %s", path, e)
+            return {}
 
     def run(
         self,
@@ -123,10 +157,13 @@ class WalkForwardBacktester:
             f"({len(rebalance_dates)} rebalance points)"
         )
 
+        # Build regime frame once (needs SPY at minimum)
+        regime_frame = build_market_context({benchmark: benchmark_df})
+
         # 4. Build candidate schedule (point-in-time screening)
         logger.info("Screening at each rebalance point (point-in-time)...")
         candidate_schedule, rebalance_log = self._build_candidate_schedule(
-            prepared_frames, benchmark_df, rebalance_dates
+            prepared_frames, benchmark_df, rebalance_dates, regime_frame
         )
 
         # Log universe stats
@@ -178,6 +215,7 @@ class WalkForwardBacktester:
         prepared_frames: dict[str, pd.DataFrame],
         benchmark_df: pd.DataFrame,
         rebalance_dates: list[pd.Timestamp],
+        regime_frame: pd.DataFrame,
     ) -> tuple[dict[pd.Timestamp, set[str]], pd.DataFrame]:
         """Pre-compute approved candidates at each rebalance date.
 
@@ -188,8 +226,9 @@ class WalkForwardBacktester:
         log_rows: list[dict] = []
 
         for i, rebalance_date in enumerate(rebalance_dates):
+            regime_label = self._regime_at(regime_frame, rebalance_date)
             approved = self._screen_at_date(
-                prepared_frames, benchmark_df, rebalance_date
+                prepared_frames, benchmark_df, rebalance_date, regime_label
             )
             schedule[rebalance_date] = set(approved)
             log_rows.append({
@@ -210,11 +249,21 @@ class WalkForwardBacktester:
 
         return schedule, pd.DataFrame(log_rows)
 
+    @staticmethod
+    def _regime_at(regime_frame: pd.DataFrame, as_of_date: pd.Timestamp) -> str:
+        if regime_frame is None or regime_frame.empty:
+            return "unknown"
+        valid = regime_frame.loc[regime_frame.index <= as_of_date]
+        if valid.empty:
+            return "unknown"
+        return str(valid["market_regime"].iloc[-1])
+
     def _screen_at_date(
         self,
         prepared_frames: dict[str, pd.DataFrame],
         benchmark_df: pd.DataFrame,
         as_of_date: pd.Timestamp,
+        regime_label: str = "unknown",
     ) -> list[str]:
         """Run Minervini screen using only data available up to as_of_date.
 
@@ -301,6 +350,54 @@ class WalkForwardBacktester:
             c for c in candidates
             if c["rs_percentile"] >= self.wf_config.min_rs_percentile
         ]
+
+        # Industry/sector group rank: compute mean RS per group across all
+        # template-passing candidates (not just RS-qualified), so that a stock
+        # in a weak group can't sneak in even if its own RS is high.
+        if self.sector_map and (
+            self.wf_config.min_group_rank_pct > 0
+            or True  # always annotate for diagnostics
+        ):
+            group_key = self.wf_config.group_by
+            per_group_rs: Dict[str, List[float]] = {}
+            for c in candidates:
+                meta = self.sector_map.get(c["symbol"], {})
+                group = meta.get(group_key) or "Unknown"
+                per_group_rs.setdefault(group, []).append(c["rs_percentile"])
+
+            group_means = {
+                g: (sum(vals) / len(vals))
+                for g, vals in per_group_rs.items()
+                if len(vals) >= self.wf_config.group_min_members
+            }
+            if group_means:
+                sorted_groups = sorted(group_means.items(), key=lambda x: x[1])
+                group_rank = {
+                    g: (i + 1) / len(sorted_groups) * 100.0
+                    for i, (g, _) in enumerate(sorted_groups)
+                }
+            else:
+                group_rank = {}
+
+            for c in qualified:
+                meta = self.sector_map.get(c["symbol"], {})
+                group = meta.get(group_key) or "Unknown"
+                c["group"] = group
+                c["group_rank_pct"] = group_rank.get(group, 100.0)
+                # 100.0 default: stocks in tiny groups pass by default
+
+            apply_group_filter = (
+                self.wf_config.min_group_rank_pct > 0
+                and (
+                    not self.wf_config.group_filter_regimes
+                    or regime_label in self.wf_config.group_filter_regimes
+                )
+            )
+            if apply_group_filter:
+                qualified = [
+                    c for c in qualified
+                    if c["group_rank_pct"] >= self.wf_config.min_group_rank_pct
+                ]
 
         # Rank: prefer setups, then template score, then momentum
         qualified.sort(
