@@ -98,9 +98,27 @@ class SeedUniverseConfig:
     include_sp500: bool = True
     include_nasdaq100: bool = True
     include_growth_extra: bool = True
+    include_ijr: bool = False  # S&P SmallCap 600 — run scripts/fetch_ijr_holdings.py first
+    ijr_holdings_path: str = "research_data/ijr_holdings.json"
     min_price: float = 10.0
-    max_symbols: int = 800
+    max_symbols: int = 1500
     cache_path: str = "research_data/seed_universe.json"
+
+
+def _load_ijr_tickers(path: str, min_price: float) -> list[str]:
+    p = Path(path)
+    if not p.exists():
+        logger.warning(
+            "IJR holdings file %s missing; skipping. Run scripts/fetch_ijr_holdings.py first.",
+            path,
+        )
+        return []
+    data = json.loads(p.read_text())
+    holdings = data.get("holdings", [])
+    return [
+        h["ticker"] for h in holdings
+        if h.get("ticker") and float(h.get("price", 0) or 0) >= min_price
+    ]
 
 
 def build_seed_universe(config: SeedUniverseConfig | None = None) -> list[str]:
@@ -117,6 +135,10 @@ def build_seed_universe(config: SeedUniverseConfig | None = None) -> list[str]:
         symbols.update(NASDAQ100_EXTRA)
     if config.include_growth_extra:
         symbols.update(LIQUID_GROWTH_EXTRA)
+    if config.include_ijr:
+        ijr = _load_ijr_tickers(config.ijr_holdings_path, config.min_price)
+        symbols.update(ijr)
+        logger.info(f"Added {len(ijr)} IJR (S&P SmallCap 600) tickers")
 
     result = sorted(symbols)[: config.max_symbols]
     logger.info(f"Built seed universe: {len(result)} symbols")
