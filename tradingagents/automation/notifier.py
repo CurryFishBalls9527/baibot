@@ -100,3 +100,11 @@ class NtfyNotifier:
             return json.loads(self.state_path.read_text(encoding="utf-8"))
         except Exception:
             return {}
+
+
+def build_notifier(config: dict):
+    """Build a composite notifier that fans out to all enabled backends."""
+    from .composite_notifier import CompositeNotifier
+    from .telegram_notifier import TelegramNotifier
+
+    return CompositeNotifier([NtfyNotifier(config), TelegramNotifier(config)])

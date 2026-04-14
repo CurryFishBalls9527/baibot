@@ -15,7 +15,7 @@ from urllib import parse, request
 import feedparser
 from openai import OpenAI
 
-from .notifier import NtfyNotifier
+from .notifier import build_notifier
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +35,7 @@ class SocialFeedMonitor:
         )
         self.x_bearer_token = os.getenv("X_BEARER_TOKEN", "").strip()
         self.x_api_base = "https://api.x.com/2"
-        self.notifier = NtfyNotifier(
+        self.notifier = build_notifier(
             {
                 "ntfy_enabled": config.get("social_ntfy_enabled", False),
                 "ntfy_server": config.get(
@@ -46,6 +46,10 @@ class SocialFeedMonitor:
                 "ntfy_priority": config.get("social_ntfy_priority", "default"),
                 "ntfy_tags": config.get("social_ntfy_tags", ["newspaper", "speech_balloon"]),
                 "ntfy_click_url": config.get("social_ntfy_click_url", ""),
+                "telegram_enabled": config.get("telegram_enabled", False),
+                "telegram_bot_token": config.get("telegram_bot_token", ""),
+                "telegram_chat_id": config.get("telegram_chat_id", ""),
+                "strategy_tag": "social",
                 "results_dir": config.get("results_dir", "./results"),
             }
         )

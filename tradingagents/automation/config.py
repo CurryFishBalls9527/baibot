@@ -166,6 +166,10 @@ def build_config(overrides: dict = None) -> dict:
             if item.strip()
         ],
         "ntfy_click_url": os.getenv("NTFY_CLICK_URL", ""),
+        # Telegram
+        "telegram_enabled": _env_flag("TELEGRAM_ENABLED", False),
+        "telegram_bot_token": os.getenv("TELEGRAM_BOT_TOKEN", ""),
+        "telegram_chat_id": os.getenv("TELEGRAM_CHAT_ID", ""),
         "ntfy_morning_scan_enabled": _env_flag("NTFY_MORNING_SCAN_ENABLED", True),
         "ntfy_daily_summary_enabled": _env_flag("NTFY_DAILY_SUMMARY_ENABLED", True),
         "ntfy_morning_scan_top_n": int(os.getenv("NTFY_MORNING_SCAN_TOP_N", "5")),
