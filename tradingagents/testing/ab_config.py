@@ -43,6 +43,7 @@ def build_variant_config(base_config: dict, variant: ExperimentVariant) -> dict:
     if variant.db_path:
         config["db_path"] = variant.db_path
     config.update(variant.config_overrides)
+    config.setdefault("strategy_tag", variant.name)
     return config
 
 

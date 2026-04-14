@@ -73,6 +73,28 @@ class TradingScheduler:
             open_snapshot_time,
         )
 
+        # Morning bulk refresh of 30m bars for Chan universe
+        if self.ab_runner:
+            chan_refresh_time = self.config.get("chan_bulk_refresh_time", "09:35")
+            hour, minute = chan_refresh_time.split(":")
+            self.scheduler.add_job(
+                self._run_with_logging,
+                args=[self.ab_runner.bulk_refresh_chan_data, "Chan Bulk 30m Refresh"],
+                trigger=CronTrigger(
+                    day_of_week="mon-fri",
+                    hour=int(hour),
+                    minute=int(minute),
+                    timezone="US/Eastern",
+                ),
+                id="chan_bulk_refresh",
+                name="Chan Bulk 30m Refresh",
+                misfire_grace_time=600,
+            )
+            logger.info(
+                "Scheduled Chan bulk 30m refresh at %s ET (Mon-Fri)",
+                chan_refresh_time,
+            )
+
         # Swing trade: daily analysis before close
         if mode in ("swing", "both"):
             swing_time = self.config.get("swing_analysis_time", "15:30")
@@ -109,6 +131,27 @@ class TradingScheduler:
                 misfire_grace_time=120,
             )
             logger.info(f"Scheduled intraday scans every {interval}min (10AM-3PM ET)")
+
+        # Intraday scan — mechanical (price checks) + Chan (30m signals)
+        if self.ab_runner:
+            scan_interval = self.config.get("intraday_scan_interval_minutes", 10)
+            self.scheduler.add_job(
+                self._run_with_logging,
+                args=[self.ab_runner.run_intraday_scan, "Intraday Entry Scan"],
+                trigger=CronTrigger(
+                    day_of_week="mon-fri",
+                    hour="10-15",
+                    minute=f"*/{scan_interval}",
+                    timezone="US/Eastern",
+                ),
+                id="intraday_entry_scan",
+                name="Intraday Entry Scan (mechanical + Chan)",
+                misfire_grace_time=120,
+            )
+            logger.info(
+                "Scheduled intraday entry scan every %dmin (10AM-3:50PM ET)",
+                scan_interval,
+            )
 
         # Daily reflection after market close
         reflection_time = self.config.get("reflection_time", "16:30")

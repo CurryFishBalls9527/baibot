@@ -1,0 +1,54 @@
+experiment_id: paper_launch_v2
+start_date: "2026-04-13"
+primary_metric: sharpe_ratio
+min_trades: 20
+min_days: 15
+status: running
+
+# Three-variant paper trading:
+#   mechanical — pure Minervini rule-based entries (existing)
+#   llm        — full agent pipeline (existing)
+#   chan       — Chan 缠论 structural signals + RS filter (new)
+#
+# Each variant uses a SEPARATE Alpaca paper account and SQLite db.
+# Set these env vars in .env before running:
+#   ALPACA_MECHANICAL_API_KEY, ALPACA_MECHANICAL_SECRET_KEY
+#   ALPACA_LLM_API_KEY,        ALPACA_LLM_SECRET_KEY
+#   ALPACA_CHAN_API_KEY,        ALPACA_CHAN_SECRET_KEY
+
+variants:
+  - name: mechanical
+    description: Rule-based Minervini entries, ExitManager exits, no LLM calls
+    alpaca_api_key: "${ALPACA_MECHANICAL_API_KEY}"
+    alpaca_secret_key: "${ALPACA_MECHANICAL_SECRET_KEY}"
+    db_path: trading_mechanical.db
+    config_overrides:
+      mechanical_only_mode: true
+      minervini_enabled: true
+
+  - name: llm
+    description: Full 13-call agent graph pipeline (analysts → debaters → risk)
+    alpaca_api_key: "${ALPACA_LLM_API_KEY}"
+    alpaca_secret_key: "${ALPACA_LLM_SECRET_KEY}"
+    db_path: trading_llm.db
+    config_overrides:
+      mechanical_only_mode: false
+      minervini_enabled: true
+
+  - name: chan
+    description: Chan 缠论 structural signals with RS top-15% filter
+    alpaca_api_key: "${ALPACA_CHAN_API_KEY}"
+    alpaca_secret_key: "${ALPACA_CHAN_SECRET_KEY}"
+    db_path: trading_chan.db
+    config_overrides:
+      strategy_type: chan
+      chan_intraday_db: research_data/intraday_30m_broad.duckdb
+      chan_daily_db: research_data/market_data.duckdb
+      chan_rs_top_pct: 0.15
+      chan_rs_lookback_days: 126
+      chan_buy_types: ["T1", "T2", "T2S"]
+      chan_filter_macd_zero: true
+      chan_filter_divergence_max: 0.6
+      max_positions: 8
+      default_stop_loss_pct: 0.05
+      default_take_profit_pct: 0.15

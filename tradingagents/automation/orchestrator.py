@@ -20,7 +20,7 @@ from tradingagents.portfolio.exit_manager import ExitManager
 from tradingagents.portfolio.portfolio_tracker import PortfolioTracker
 from tradingagents.automation.prescreener import MinerviniPreScreener
 from tradingagents.broker.models import OrderRequest
-from tradingagents.automation.notifier import NtfyNotifier
+from tradingagents.automation.notifier import build_notifier
 from tradingagents.storage.database import TradingDatabase
 from tradingagents.storage.memory_store import PersistentMemory
 from tradingagents.graph.trading_graph import TradingAgentsGraph
@@ -49,7 +49,8 @@ class Orchestrator:
 
         # Database
         self.db = TradingDatabase(config.get("db_path", "trading.db"))
-        self.notifier = NtfyNotifier(config)
+        config.setdefault("strategy_tag", "llm" if not config.get("mechanical_only_mode") else "mechanical")
+        self.notifier = build_notifier(config)
 
         # Risk engine
         starting_equity = self.db.get_starting_equity()
@@ -499,6 +500,60 @@ class Orchestrator:
         base["buy_point"] = row.get("buy_point")
         base["candidate_status"] = row.get("candidate_status")
         return base
+
+    def run_intraday_entry_scan(self) -> Dict:
+        """Lightweight scan: re-check approved setups at current prices.
+
+        Uses cached Minervini preflight from the morning snapshot.
+        Only runs entry checks — no exit manager, no LLM, no overlay logic.
+        """
+
+        if not self.broker.is_market_open():
+            return {"status": "market_closed"}
+
+        preflight = self._latest_minervini_preflight
+        if preflight is None or preflight.screen_df is None or preflight.screen_df.empty:
+            try:
+                preflight = self._run_minervini_preflight()
+            except Exception as e:
+                logger.error("Preflight failed during intraday scan: %s", e)
+                return {"status": "preflight_failed", "error": str(e)}
+
+        setup_rows = {
+            row["symbol"]: row.to_dict()
+            for _, row in preflight.screen_df.iterrows()
+        }
+        candidate_symbols = set(getattr(preflight, "screened_symbols", []))
+
+        account = self.broker.get_account()
+        positions = self.broker.get_positions()
+        stock_positions = self._stock_positions(positions)
+        held_symbols = {p.symbol for p in stock_positions}
+
+        results = {}
+        for symbol in candidate_symbols:
+            if symbol in held_symbols:
+                continue
+            try:
+                result = self._trade_rule_based_setup(
+                    setup_rows.get(symbol, {"symbol": symbol}),
+                    account, stock_positions,
+                )
+                results[symbol] = result
+                if result.get("traded"):
+                    account = self.broker.get_account()
+                    positions = self.broker.get_positions()
+                    stock_positions = self._stock_positions(positions)
+            except Exception as e:
+                logger.warning("Intraday entry check failed for %s: %s", symbol, e)
+
+        traded = [s for s, r in results.items() if r.get("traded")]
+        waiting = [s for s, r in results.items() if r.get("action") == "WAIT"]
+        logger.info(
+            "Intraday entry scan: %d candidates, %d traded, %d waiting",
+            len(candidate_symbols - held_symbols), len(traded), len(waiting),
+        )
+        return results
 
     def run_daily_analysis(self) -> Dict:
         """Run full analysis → trade cycle for all watchlist symbols."""

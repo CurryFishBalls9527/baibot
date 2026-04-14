@@ -219,20 +219,22 @@ class AlpacaBroker(BaseBroker):
             timestamp=c.timestamp,
         )
 
+    @staticmethod
+    def _mid_price(q) -> float:
+        ask = float(q.ask_price)
+        bid = float(q.bid_price)
+        if ask > 0 and bid > 0:
+            return (ask + bid) / 2
+        return ask or bid
+
     def get_latest_price(self, symbol: str) -> float:
         quotes = self.data_client.get_stock_latest_quote(
             StockLatestQuoteRequest(symbol_or_symbols=[symbol])
         )
-        q = quotes[symbol]
-        mid = (float(q.ask_price) + float(q.bid_price)) / 2
-        return mid if mid > 0 else float(q.ask_price or q.bid_price)
+        return self._mid_price(quotes[symbol])
 
     def get_latest_prices(self, symbols: List[str]) -> dict:
         quotes = self.data_client.get_stock_latest_quote(
             StockLatestQuoteRequest(symbol_or_symbols=symbols)
         )
-        prices = {}
-        for sym, q in quotes.items():
-            mid = (float(q.ask_price) + float(q.bid_price)) / 2
-            prices[sym] = mid if mid > 0 else float(q.ask_price or q.bid_price)
-        return prices
+        return {sym: self._mid_price(q) for sym, q in quotes.items()}

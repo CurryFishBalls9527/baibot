@@ -32,10 +32,30 @@ load_dotenv()
 
 from tradingagents.automation.config import build_config
 from tradingagents.automation.launchd import install_launch_agent, uninstall_launch_agent
-from tradingagents.automation.notifier import NtfyNotifier
+from tradingagents.automation.notifier import build_notifier
 from tradingagents.automation.orchestrator import Orchestrator
 from tradingagents.automation.scheduler import TradingScheduler
 from tradingagents.automation.social_monitor import SocialFeedMonitor
+
+
+def _resolve_variant_config(args) -> dict:
+    """Build config for a specific variant from experiment YAML."""
+    variant_name = getattr(args, "variant", None)
+    if not variant_name:
+        return build_config()
+
+    experiment_path = getattr(args, "experiment", "experiments/paper_launch_v2.yaml")
+    from tradingagents.testing.ab_config import load_experiment, build_variant_config
+    experiment = load_experiment(experiment_path)
+
+    for v in experiment.variants:
+        if v.name == variant_name:
+            base = build_config()
+            return build_variant_config(base, v)
+
+    available = [v.name for v in experiment.variants]
+    print(f"Error: variant '{variant_name}' not found. Available: {', '.join(available)}")
+    sys.exit(1)
 
 
 def setup_logging(verbose: bool = False):
@@ -165,8 +185,14 @@ def cmd_schedule(args):
 
 def cmd_status(args):
     """Show current status."""
-    config = build_config()
-    orch = Orchestrator(config)
+    config = _resolve_variant_config(args)
+    variant_name = getattr(args, "variant", None)
+    strategy_type = config.get("strategy_type", "minervini")
+    if strategy_type == "chan":
+        from tradingagents.automation.chan_orchestrator import ChanOrchestrator
+        orch = ChanOrchestrator(config)
+    else:
+        orch = Orchestrator(config)
     status = orch.get_status()
 
     print("\n" + "=" * 50)
@@ -264,9 +290,9 @@ def cmd_close_all(args):
 
 def cmd_trades(args):
     """Show recent trades."""
-    config = build_config()
+    config = _resolve_variant_config(args)
     from tradingagents.storage.database import TradingDatabase
-    db = TradingDatabase(config["db_path"])
+    db = TradingDatabase(config.get("db_path", "trading.db"))
     trades = db.get_recent_trades(limit=args.limit)
 
     print(f"\nRecent Trades (last {args.limit}):")
@@ -281,8 +307,13 @@ def cmd_trades(args):
 
 def cmd_report(args):
     """Show and optionally save the current daily report."""
-    config = build_config()
-    orch = Orchestrator(config)
+    config = _resolve_variant_config(args)
+    strategy_type = config.get("strategy_type", "minervini")
+    if strategy_type == "chan":
+        from tradingagents.automation.chan_orchestrator import ChanOrchestrator
+        orch = ChanOrchestrator(config)
+    else:
+        orch = Orchestrator(config)
     report = orch.generate_daily_report(save=not args.no_save)
 
     acct = report["account"]
@@ -409,6 +440,111 @@ def cmd_setups(args):
     print()
 
 
+def cmd_chart(args):
+    """Generate an interactive Plotly chart for a symbol."""
+    import webbrowser
+    import tempfile
+    from datetime import datetime, timedelta
+
+    import duckdb
+    import pandas as pd
+
+    from tradingagents.dashboard.chart_builder import TradeChartBuilder
+
+    symbol = args.symbol.upper()
+    overlays = [o.strip() for o in args.overlays.split(",") if o.strip()]
+
+    is_chan = getattr(args, "variant", None) == "chan"
+    if is_chan:
+        db_path = "research_data/intraday_30m_broad.duckdb"
+        table, ts_col = "bars_30m", "ts"
+    else:
+        db_path = "research_data/market_data.duckdb"
+        table, ts_col = "daily_bars", "trade_date"
+
+    if not Path(db_path).exists():
+        print(f"Error: OHLCV database not found: {db_path}")
+        return
+
+    conn_peek = duckdb.connect(db_path, read_only=True)
+    max_date_row = conn_peek.execute(
+        f"SELECT MAX({ts_col}) FROM {table} WHERE symbol = ?", [symbol]
+    ).fetchone()
+    conn_peek.close()
+    if not max_date_row or not max_date_row[0]:
+        print(f"No data found for {symbol} in {db_path}")
+        return
+    end_date = pd.Timestamp(max_date_row[0]).to_pydatetime()
+    begin_date = end_date - timedelta(days=args.days)
+
+    variant = getattr(args, "variant", None)
+
+    conn = duckdb.connect(db_path, read_only=True)
+    df = conn.execute(
+        f"SELECT {ts_col} as ts, open, high, low, close, volume "
+        f"FROM {table} WHERE symbol = ? AND {ts_col} >= ? AND {ts_col} <= ? "
+        f"ORDER BY {ts_col}",
+        [symbol, begin_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d")],
+    ).fetchdf()
+    conn.close()
+
+    if df.empty:
+        print(f"No data found for {symbol} in {db_path}")
+        return
+
+    df["ts"] = pd.to_datetime(df["ts"])
+    df = df.set_index("ts").sort_index()
+
+    builder = TradeChartBuilder(symbol, df).add_candlesticks()
+
+    if "volume" in overlays:
+        builder.add_volume()
+    if "sma" in overlays:
+        builder.add_sma([50, 150, 200])
+    if "bollinger" in overlays:
+        builder.add_bollinger()
+    if "macd" in overlays:
+        builder.add_macd()
+    if "rsi" in overlays:
+        builder.add_rsi()
+    if "atr" in overlays:
+        builder.add_atr()
+
+    if "chan" in overlays and is_chan:
+        try:
+            from tradingagents.dashboard.chan_structures import extract_chan_structures
+            structures = extract_chan_structures(
+                symbol, begin_date.strftime("%Y-%m-%d"),
+                end_date.strftime("%Y-%m-%d"), db_path,
+            )
+            builder.add_chan_bi(structures["bi_list"])
+            builder.add_chan_zs(structures["zs_list"])
+            builder.add_chan_bsp(structures["bsp_list"])
+        except Exception as e:
+            print(f"Warning: Chan structure extraction failed: {e}")
+
+    if variant:
+        config = _resolve_variant_config(args)
+        trade_db_path = config.get("db_path", "trading.db")
+        if Path(trade_db_path).exists():
+            from tradingagents.storage.database import TradingDatabase
+            db = TradingDatabase(trade_db_path)
+            trades = db.get_recent_trades(limit=200)
+            symbol_trades = [t for t in trades if t.get("symbol") == symbol]
+            if symbol_trades:
+                builder.add_trade_markers(symbol_trades)
+                print(f"  Overlaid {len(symbol_trades)} trades for {symbol}")
+
+    fig = builder.build()
+
+    out_dir = Path("results/charts")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    html_path = out_dir / f"{symbol}_{args.days}d.html"
+    fig.write_html(str(html_path))
+    print(f"  Chart saved: {html_path}")
+    webbrowser.open(f"file://{html_path.resolve()}")
+
+
 def cmd_install_service(args):
     """Install the scheduler as a macOS launch agent."""
     repo_root = Path(__file__).resolve().parent
@@ -477,9 +613,9 @@ def cmd_dashboard(args):
 def cmd_notify_test(args):
     """Send a test ntfy notification."""
     config = build_config()
-    notifier = NtfyNotifier(config)
+    notifier = build_notifier(config)
     if not notifier.enabled:
-        print("ntfy is not enabled. Set NTFY_ENABLED=1 and NTFY_TOPIC first.")
+        print("No notifier enabled. Set NTFY_ENABLED=1 / TELEGRAM_ENABLED=1 first.")
         return
 
     ok = notifier.send(
@@ -624,7 +760,10 @@ def main():
     p_sched.add_argument("--experiment", type=str, help="Path to A/B experiment YAML (enables ABRunner)")
 
     # status
-    sub.add_parser("status", help="Show current status")
+    p_status = sub.add_parser("status", help="Show current status")
+    p_status.add_argument("--variant", type=str, help="Variant name (e.g. chan, mechanical, llm)")
+    p_status.add_argument("--experiment", type=str, default="experiments/paper_launch_v2.yaml",
+                          help="Path to experiment YAML")
 
     # close-all
     p_close = sub.add_parser("close-all", help="Emergency close all positions")
@@ -633,16 +772,31 @@ def main():
     # trades
     p_trades = sub.add_parser("trades", help="Show recent trades")
     p_trades.add_argument("--limit", type=int, default=20, help="Number of trades")
+    p_trades.add_argument("--variant", type=str, help="Variant name (e.g. chan, mechanical, llm)")
+    p_trades.add_argument("--experiment", type=str, default="experiments/paper_launch_v2.yaml",
+                          help="Path to experiment YAML")
 
     # report
     p_report = sub.add_parser("report", help="Show today's trade and P&L report")
     p_report.add_argument("--limit", type=int, default=20, help="Number of trade rows to show")
     p_report.add_argument("--no-save", action="store_true", help="Do not save the JSON report")
+    p_report.add_argument("--variant", type=str, help="Variant name (e.g. chan, mechanical, llm)")
+    p_report.add_argument("--experiment", type=str, default="experiments/paper_launch_v2.yaml",
+                          help="Path to experiment YAML")
 
     # setups
     p_setups = sub.add_parser("setups", help="Show the latest Minervini setup candidates")
     p_setups.add_argument("--date", type=str, help="Specific screen date (YYYY-MM-DD)")
     p_setups.add_argument("--limit", type=int, default=20, help="Number of rows to show")
+
+    # chart
+    p_chart = sub.add_parser("chart", help="Generate interactive chart for a symbol")
+    p_chart.add_argument("--symbol", type=str, required=True, help="Symbol to chart")
+    p_chart.add_argument("--days", type=int, default=30, help="Days of data to show")
+    p_chart.add_argument("--variant", type=str, help="Variant for trade overlay (chan, mechanical, llm)")
+    p_chart.add_argument("--experiment", type=str, default="experiments/paper_launch_v2.yaml")
+    p_chart.add_argument("--overlays", type=str, default="sma,volume",
+                         help="Comma-separated: sma,macd,rsi,bollinger,atr,volume,chan")
 
     # install-service
     p_install = sub.add_parser(
@@ -749,6 +903,7 @@ def main():
         "trades": cmd_trades,
         "report": cmd_report,
         "setups": cmd_setups,
+        "chart": cmd_chart,
         "install-service": cmd_install_service,
         "remove-service": cmd_remove_service,
         "dashboard": cmd_dashboard,
