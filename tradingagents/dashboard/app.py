@@ -6,6 +6,7 @@ import json
 import subprocess
 from datetime import datetime
 from pathlib import Path
+from typing import Dict, Optional
 
 import pandas as pd
 import streamlit as st
@@ -15,9 +16,12 @@ load_dotenv()
 
 from tradingagents.automation.config import build_config
 from tradingagents.automation.orchestrator import Orchestrator
+from tradingagents.dashboard.multi_variant import get_variant_dbs
 from tradingagents.storage.database import TradingDatabase
+from tradingagents.testing.ab_config import build_variant_config, load_experiment
 
 SERVICE_LABEL = "com.tradingagents.scheduler"
+_DEFAULT_EXPERIMENT = "experiments/paper_launch_v2.yaml"
 
 
 def _repo_root() -> Path:
@@ -33,11 +37,24 @@ def _log_paths(repo_root: Path) -> tuple[Path, Path]:
 
 
 @st.cache_resource(show_spinner=False)
-def _load_runtime():
-    config = build_config()
-    db = TradingDatabase(config["db_path"])
-    orchestrator = Orchestrator(config)
-    return config, db, orchestrator
+def _load_variant_orchestrators() -> Dict[str, Orchestrator]:
+    """Build an Orchestrator per experiment variant that has valid Alpaca keys."""
+    import os
+    yaml_path = os.getenv("EXPERIMENT_CONFIG_PATH", _DEFAULT_EXPERIMENT)
+    if not Path(yaml_path).exists():
+        return {}
+    experiment = load_experiment(yaml_path)
+    base_config = build_config()
+    orchestrators = {}
+    for v in experiment.variants:
+        vconfig = build_variant_config(base_config, v)
+        if not vconfig.get("alpaca_api_key") or not vconfig.get("alpaca_secret_key"):
+            continue
+        try:
+            orchestrators[v.name] = Orchestrator(vconfig)
+        except Exception:
+            continue
+    return orchestrators
 
 
 def _launchctl_status(label: str) -> dict:
@@ -139,48 +156,41 @@ def _latest_report(repo_root: Path) -> tuple[dict | None, Path | None]:
         return json.load(handle), latest
 
 
-def main():
-    st.set_page_config(
-        page_title="TradingAgents Dashboard",
-        layout="wide",
-        initial_sidebar_state="expanded",
-    )
-    st.title("TradingAgents Dashboard")
-    st.caption("Live monitor for Alpaca paper trading, Minervini screening, and automation service.")
-
-    config, db, orchestrator = _load_runtime()
-    repo_root = _repo_root()
+def _render_variant(variant_name: str, orchestrator: Orchestrator, repo_root: Path):
+    """Render the dashboard content for a single variant."""
+    db = orchestrator.db
     stdout_log, stderr_log = _log_paths(repo_root)
-    status = orchestrator.get_status()
+
+    try:
+        status = orchestrator.get_status()
+    except Exception as exc:
+        st.error(f"Failed to fetch status for {variant_name}: {exc}")
+        status = None
+
     service = _launchctl_status(SERVICE_LABEL)
     snapshots = _snapshots_frame(db)
     recent_trades = _recent_trades_frame(db)
     latest_setups = _setups_frame(db)
     report, report_path = _latest_report(repo_root)
 
-    with st.sidebar:
-        st.subheader("System")
-        st.write(f"Time: `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`")
-        st.write(f"Universe: `{config.get('trading_universe', 'n/a')}`")
-        st.write(f"Paper mode: `{config.get('paper_trading', True)}`")
-        st.write(f"Service: `{service.get('state', 'unknown')}`")
-        if service.get("pid"):
-            st.write(f"PID: `{service['pid']}`")
-        if service.get("last_exit_code"):
-            st.write(f"Last exit: `{service['last_exit_code']}`")
-        if st.button("Refresh"):
-            st.rerun()
-
-    acct = status["account"]
-    today = status["today"]
-    screening = status.get("screening", {})
-    overlay = status.get("overlay", {})
+    if status is None:
+        acct = {"equity": 0, "cash": 0, "daily_pl": 0, "daily_pl_pct": "N/A"}
+        today = {"trade_summary": {"total_orders": 0}}
+        screening = {}
+        overlay = {}
+        positions_list = []
+    else:
+        acct = status["account"]
+        today = status["today"]
+        screening = status.get("screening", {})
+        overlay = status.get("overlay", {})
+        positions_list = status["positions"]
 
     metric_cols = st.columns(6)
     metric_cols[0].metric("Equity", f"${acct['equity']:,.2f}")
     metric_cols[1].metric("Cash", f"${acct['cash']:,.2f}")
     metric_cols[2].metric("Daily P&L", f"${acct['daily_pl']:,.2f}", acct["daily_pl_pct"])
-    metric_cols[3].metric("Open Positions", str(len(status["positions"])))
+    metric_cols[3].metric("Open Positions", str(len(positions_list)))
     metric_cols[4].metric("Today Orders", str(today["trade_summary"]["total_orders"]))
     metric_cols[5].metric("Approved Setups", str(len(screening.get("approved_symbols", []))))
 
@@ -200,7 +210,7 @@ def main():
             )
 
         st.subheader("Open Positions")
-        positions = pd.DataFrame(status["positions"])
+        positions = pd.DataFrame(positions_list)
         if positions.empty:
             st.info("No open positions.")
         else:
@@ -253,6 +263,40 @@ def main():
             st.code(_tail_text(stdout_log), language="text")
         with err_tab:
             st.code(_tail_text(stderr_log), language="text")
+
+
+def main():
+    st.set_page_config(
+        page_title="TradingAgents Dashboard",
+        layout="wide",
+        initial_sidebar_state="expanded",
+    )
+    st.title("TradingAgents Dashboard")
+    st.caption("Live monitor for Alpaca paper trading, Minervini screening, and automation service.")
+
+    repo_root = _repo_root()
+    orchestrators = _load_variant_orchestrators()
+
+    if not orchestrators:
+        st.warning(
+            "No variant accounts found. Check that experiments/paper_launch_v2.yaml "
+            "exists and ALPACA_*_API_KEY / ALPACA_*_SECRET_KEY env vars are set."
+        )
+        st.stop()
+
+    with st.sidebar:
+        st.subheader("System")
+        st.write(f"Time: `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`")
+        st.write(f"Variants: `{', '.join(orchestrators.keys())}`")
+        if st.button("Refresh"):
+            st.rerun()
+
+    variant_names = list(orchestrators.keys())
+    tabs = st.tabs(variant_names)
+
+    for tab, name in zip(tabs, variant_names):
+        with tab:
+            _render_variant(name, orchestrators[name], repo_root)
 
 
 if __name__ == "__main__":

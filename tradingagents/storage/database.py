@@ -179,9 +179,14 @@ class TradingDatabase:
                 rs_at_entry REAL,
                 regime_at_entry TEXT,
                 max_favorable_excursion REAL,
-                max_adverse_excursion REAL
+                max_adverse_excursion REAL,
+                trade_analysis TEXT
             );
         """)
+        self._ensure_columns(
+            "trade_outcomes",
+            {"trade_analysis": "TEXT"},
+        )
         self._ensure_columns(
             "setup_candidates",
             {
@@ -636,6 +641,56 @@ class TradingDatabase:
             HAVING trades >= 3
         """).fetchall()
         return [dict(r) for r in rows]
+
+    # ── Dashboard Queries ──────────────────────────────────────────
+
+    def get_all_snapshots(self) -> List[Dict]:
+        """All daily snapshots, oldest first."""
+        rows = self.conn.execute(
+            "SELECT * FROM daily_snapshots ORDER BY date ASC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_trades_in_range(self, start_date: str, end_date: str) -> List[Dict]:
+        rows = self.conn.execute(
+            "SELECT * FROM trades WHERE date(timestamp) BETWEEN ? AND ? ORDER BY timestamp",
+            (start_date, end_date),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_all_trade_outcomes(self) -> List[Dict]:
+        rows = self.conn.execute(
+            "SELECT * FROM trade_outcomes ORDER BY exit_date DESC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_trade_outcomes_in_range(self, start_date: str, end_date: str) -> List[Dict]:
+        rows = self.conn.execute(
+            "SELECT * FROM trade_outcomes WHERE exit_date BETWEEN ? AND ? ORDER BY exit_date",
+            (start_date, end_date),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_entry_signal_for_trade(self, symbol: str, entry_date: str) -> Optional[Dict]:
+        """Get the entry signal reasoning for a trade by matching symbol + date."""
+        row = self.conn.execute(
+            """SELECT s.reasoning, s.full_analysis, s.confidence, s.action
+               FROM signals s
+               JOIN trades t ON t.signal_id = s.id
+               WHERE t.symbol = ? AND date(t.timestamp) = ?
+               AND t.side = 'buy'
+               ORDER BY t.timestamp DESC LIMIT 1""",
+            (symbol, entry_date),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def update_trade_analysis(self, outcome_id: int, analysis: str):
+        """Cache LLM analysis on a trade outcome."""
+        self.conn.execute(
+            "UPDATE trade_outcomes SET trade_analysis = ? WHERE id = ?",
+            (analysis, outcome_id),
+        )
+        self.conn.commit()
 
     def close(self):
         self.conn.close()
