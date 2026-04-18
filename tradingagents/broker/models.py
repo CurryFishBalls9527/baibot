@@ -31,6 +31,10 @@ class OrderResult:
     filled_avg_price: Optional[float] = None
     submitted_at: Optional[datetime] = None
     filled_at: Optional[datetime] = None
+    # Bracket child legs: IDs of the stop-loss and take-profit orders created by
+    # a BRACKET parent. Populated only for bracket parent responses.
+    stop_order_id: Optional[str] = None
+    tp_order_id: Optional[str] = None
 
 
 @dataclass

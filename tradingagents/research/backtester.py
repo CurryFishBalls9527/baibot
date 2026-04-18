@@ -67,6 +67,83 @@ class BacktestConfig:
     vol_target_warmup_days: int = 30
     min_breakout_volume_ratio: float = 0.0
     disable_breakouts_in_uptrend: bool = False
+    # Chandelier exit (Change #1). When enabled, trail stop uses
+    # highest_close - chandelier_atr_multiple * atr_14 instead of a flat %.
+    # Defaults off so existing baselines/tests are byte-for-byte unchanged.
+    use_chandelier_exit: bool = False
+    chandelier_atr_multiple: float = 3.0
+    # Dead-money time stop (Change #2). When enabled, exits if position has not
+    # gained >= dead_money_min_gain_pct within dead_money_max_days trading days.
+    # Defaults off.
+    use_dead_money_stop: bool = False
+    dead_money_min_gain_pct: float = 0.05
+    dead_money_max_days: int = 15
+    # Change #17: adaptive dead-money — when enabled, overrides dead_money_max_days
+    # with a regime-specific value. Lets winners breathe in confirmed uptrends,
+    # cuts stuck names faster in corrections.
+    adaptive_dead_money: bool = False
+    dead_money_max_days_uptrend: int = 15
+    dead_money_max_days_pressure: int = 10
+    dead_money_max_days_correction: int = 7
+    # Change #3: breakeven lock offset. When stop is moved to breakeven,
+    # lock it at average_cost * (1 + this). Default 0.0 = exact entry (old behavior).
+    breakeven_lock_offset_pct: float = 0.0
+    # B2L parity: port of live's `leader_continuation_*` entry path from
+    # automation/config.py. The live orchestrator enters on this path in
+    # addition to the VCP breakout path; B0/B1/B2 backtests do not model it.
+    # Defaults mirror automation/config.py so enabling gives live parity.
+    use_leader_continuation_entry: bool = False
+    leader_cont_min_rs_percentile: float = 75.0
+    leader_cont_min_adx_14: float = 12.0
+    leader_cont_min_close_range_pct: float = 0.15
+    leader_cont_min_roc_60: float = 0.0
+    leader_cont_min_roc_120: float = 0.0
+    leader_cont_max_below_52w_high: float = 0.30
+    leader_cont_max_extension_pct: float = 0.07
+    leader_cont_max_pullback_pct: float = 0.08
+    # Change #16 (Wave 2): composite entry scoring. Replaces the raw-feature
+    # ranking tuple with a composite score built from template, RS,
+    # base depth, volume contraction, stage, RVOL, and 60d momentum. Intent:
+    # pick the best-quality subset when candidates exceed max_positions.
+    use_composite_scoring: bool = False
+    # If "v2", composite drops stage/RS bands (already floor-filtered) and
+    # double-weights template + ROC60 to avoid penalizing leader_continuation
+    # entries (Stage 2 by definition).
+    composite_variant: str = "v1"
+    # Change #15 (Wave 2): RSI-2 mean-reversion sleeve on SPY. Activates only
+    # when main strategy exposure is below the threshold (deploys idle cash
+    # in flat/choppy years). Entry: SPY close > 200-DMA AND RSI(2) < entry_th.
+    # Exit: close > 5-DMA OR bars_held >= max_hold_days.
+    rsi2_sleeve_enabled: bool = False
+    rsi2_sleeve_exposure_threshold: float = 0.50
+    rsi2_sleeve_entry_threshold: float = 10.0
+    rsi2_sleeve_exit_ma_days: int = 5
+    rsi2_sleeve_max_hold_days: int = 5
+    rsi2_sleeve_position_pct: float = 0.20
+    rsi2_sleeve_long_term_ma_days: int = 200
+    # Change #12 (Wave 2): regime-dependent trail stop. When enabled, the
+    # flat-% trail uses regime-specific widths instead of trail_stop_pct.
+    # Hypothesis: wider in uptrends (let winners breathe), tighter in
+    # corrections (protect profits). Off by default.
+    regime_aware_trail: bool = False
+    trail_stop_pct_uptrend: float = 0.12
+    trail_stop_pct_pressure: float = 0.10
+    trail_stop_pct_correction: float = 0.07
+    # Change #13 (Wave 2): cross-asset rotation. Deploy a fixed position in
+    # a bond ETF (TLT default) when main strategy is light AND regime is
+    # not confirmed_uptrend. Idle-cash sink for flat/down equity years.
+    cross_asset_enabled: bool = False
+    cross_asset_symbol: str = "TLT"
+    cross_asset_exposure_threshold: float = 0.50
+    cross_asset_position_pct: float = 0.50
+    # Exit cross_asset position when regime flips back to confirmed_uptrend
+    cross_asset_exit_on_uptrend: bool = True
+    # Require cross_asset to be above its own long-term MA before buying.
+    # Avoids buying into a bond bear market (e.g. TLT 2022-2024).
+    cross_asset_require_trend: bool = True
+    cross_asset_trend_ma_days: int = 200
+    # Stop-loss on the cross_asset position itself (peak-to-close drop).
+    cross_asset_stop_loss_pct: float = 0.10
 
 
 class MinerviniBacktester:
@@ -79,6 +156,33 @@ class MinerviniBacktester:
     ):
         self.screener = screener or MinerviniScreener()
         self.config = config or BacktestConfig()
+
+    def _trail_stop_from_row(
+        self,
+        row,
+        highest_close: float,
+        regime_label: str | None = None,
+    ) -> float:
+        """Compute the trailing stop for a given bar.
+
+        If chandelier is enabled and atr_14 is available, use
+        highest_close - k * atr_14. Otherwise falls back to flat %.
+        Change #12: if regime_aware_trail is on, branch width by regime.
+        """
+        if self.config.use_chandelier_exit:
+            atr = row.get("atr_14") if hasattr(row, "get") else None
+            if atr is not None and pd.notna(atr) and float(atr) > 0:
+                return float(highest_close) - self.config.chandelier_atr_multiple * float(atr)
+        if self.config.regime_aware_trail and regime_label is not None:
+            if regime_label == "confirmed_uptrend":
+                pct = self.config.trail_stop_pct_uptrend
+            elif regime_label == "market_correction":
+                pct = self.config.trail_stop_pct_correction
+            else:
+                pct = self.config.trail_stop_pct_pressure
+        else:
+            pct = self.config.trail_stop_pct
+        return float(highest_close) * (1.0 - pct)
 
     def _build_regime_frame(
         self,
@@ -238,7 +342,7 @@ class MinerviniBacktester:
                 continue
 
             highest_close = max(highest_close, price)
-            stop_price = max(stop_price, highest_close * (1.0 - self.config.trail_stop_pct))
+            stop_price = max(stop_price, self._trail_stop_from_row(row, highest_close))
             hold_days = (trade_date - entry_date).days if entry_date is not None else 0
 
             exit_reason = None
@@ -246,6 +350,12 @@ class MinerviniBacktester:
                 exit_reason = "stop"
             elif self.config.exit_on_market_correction and not regime_ok:
                 exit_reason = "market_regime"
+            elif (
+                self.config.use_dead_money_stop
+                and hold_days >= self.config.dead_money_max_days
+                and price < entry_price * (1.0 + self.config.dead_money_min_gain_pct)
+            ):
+                exit_reason = "dead_money"
             elif pd.notna(row.get("sma_50")) and price < float(row["sma_50"]):
                 exit_reason = "lost_50dma"
             elif hold_days >= self.config.max_hold_days:
@@ -423,12 +533,15 @@ class MinerviniBacktester:
             hold_days = (trade_date - lots[0]["entry_date"]).days if lots else 0
 
             if price >= average_cost * (1.0 + self.config.breakeven_trigger_pct):
-                stop_price = max(stop_price, average_cost)
+                stop_price = max(
+                    stop_price,
+                    average_cost * (1.0 + self.config.breakeven_lock_offset_pct),
+                )
 
             if partial_taken and pd.notna(row.get("ema_21")):
                 stop_price = max(stop_price, float(row["ema_21"]))
             else:
-                stop_price = max(stop_price, highest_close * (1.0 - self.config.trail_stop_pct))
+                stop_price = max(stop_price, self._trail_stop_from_row(row, highest_close))
 
             if (
                 not add_on_1_done
@@ -794,6 +907,74 @@ class MinerviniBacktester:
 
         atr_pct = row.get("atr_pct_14")
         if pd.notna(atr_pct) and float(atr_pct) > self.config.continuation_max_atr_pct:
+            return False
+
+        return True
+
+    def _row_passes_leader_continuation_entry(self, row: pd.Series, price: float) -> bool:
+        """B2L parity: mirrors `leader_continuation_*` gate in minervini.py.
+
+        Live orchestrator's screener (MinerviniScreener) emits
+        `leader_continuation_actionable` signals on persistent leaders whose
+        pullbacks sit inside a small buy zone around the current buy_point.
+        The live orchestrator enters on those signals in addition to VCP
+        breakouts. B0/B1/B2 backtests never modeled this path.
+
+        Parity note: live's per-path RS >= 75 is not enforced here per-row
+        because rs_percentile is computed cross-sectionally in walk_forward
+        and isn't attached to prepared frames. The walk-forward RS floor
+        (min_rs_percentile) applies to all candidates, so this path
+        inherits that floor (typically 70 for live flavor, 60 for research).
+        """
+        if not self.config.use_leader_continuation_entry:
+            return False
+
+        sma_50 = row.get("sma_50")
+        sma_150 = row.get("sma_150")
+        sma_200 = row.get("sma_200")
+        sma_200_20d_ago = row.get("sma_200_20d_ago")
+        if any(pd.isna(x) for x in (sma_50, sma_150, sma_200, sma_200_20d_ago)):
+            return False
+        if price < float(sma_50) or price < float(sma_150) or price < float(sma_200):
+            return False
+        if not (float(sma_50) > float(sma_150) > float(sma_200)):
+            return False
+        if not (float(sma_200) > float(sma_200_20d_ago)):
+            return False
+
+        high_52w = row.get("52w_high")
+        if pd.isna(high_52w) or high_52w <= 0:
+            return False
+        if price < float(high_52w) * (1.0 - self.config.leader_cont_max_below_52w_high):
+            return False
+
+        adx = row.get("adx_14")
+        if pd.isna(adx) or float(adx) < self.config.leader_cont_min_adx_14:
+            return False
+
+        close_range = row.get("close_range_pct")
+        if pd.isna(close_range) or float(close_range) < self.config.leader_cont_min_close_range_pct:
+            return False
+
+        roc_60 = row.get("roc_60")
+        if pd.isna(roc_60) or float(roc_60) < self.config.leader_cont_min_roc_60:
+            return False
+        roc_120 = row.get("roc_120")
+        if pd.isna(roc_120) or float(roc_120) < self.config.leader_cont_min_roc_120:
+            return False
+
+        buy_point = row.get("buy_point")
+        if pd.isna(buy_point) or float(buy_point) <= 0:
+            return False
+        buy_zone_pct = (price - float(buy_point)) / float(buy_point)
+        # Live actionable: 0 <= extension <= leader_cont_max_extension_pct
+        # Live watch (also entered via same screener tag): pullback within
+        # [-leader_cont_max_pullback_pct, 0]. Union covers both.
+        if not (
+            -self.config.leader_cont_max_pullback_pct
+            <= buy_zone_pct
+            <= self.config.leader_cont_max_extension_pct
+        ):
             return False
 
         return True

@@ -153,6 +153,37 @@ class TradingScheduler:
                 scan_interval,
             )
 
+        # Order reconciliation (Track P-SYNC) — sync local DB against broker.
+        # Off by default; enable via `reconciler_enabled: true` in config.
+        if self.config.get("reconciler_enabled", False):
+            reconcile_interval = max(
+                int(self.config.get("reconciler_interval_minutes", 5)), 1
+            )
+            reconcile_func = (
+                self.ab_runner.reconcile_orders
+                if self.ab_runner
+                else self.orchestrator.reconcile_orders
+            )
+            self.scheduler.add_job(
+                self._run_with_logging,
+                args=[reconcile_func, "Order Reconciliation"],
+                trigger=CronTrigger(
+                    day_of_week="mon-fri",
+                    hour="9-16",
+                    minute=f"*/{reconcile_interval}"
+                    if reconcile_interval < 60
+                    else "0",
+                    timezone="US/Eastern",
+                ),
+                id="order_reconciliation",
+                name="Order Reconciliation",
+                misfire_grace_time=120,
+            )
+            logger.info(
+                "Scheduled order reconciliation every %dmin (9AM-4PM ET)",
+                reconcile_interval,
+            )
+
         # Daily reflection after market close
         reflection_time = self.config.get("reflection_time", "16:30")
         hour, minute = reflection_time.split(":")

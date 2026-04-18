@@ -17,6 +17,7 @@ from tradingagents.broker.models import Account, Position
 from tradingagents.risk.risk_engine import RiskEngine
 from tradingagents.portfolio.position_sizer import PositionSizer
 from tradingagents.portfolio.exit_manager import ExitManager
+from tradingagents.portfolio.exit_manager_v2 import ExitManagerV2
 from tradingagents.portfolio.portfolio_tracker import PortfolioTracker
 from tradingagents.automation.prescreener import MinerviniPreScreener
 from tradingagents.broker.models import OrderRequest
@@ -48,7 +49,10 @@ class Orchestrator:
         )
 
         # Database
-        self.db = TradingDatabase(config.get("db_path", "trading.db"))
+        self.db = TradingDatabase(
+            config.get("db_path", "trading.db"),
+            variant=config.get("variant_name"),
+        )
         config.setdefault("strategy_tag", "llm" if not config.get("mechanical_only_mode") else "mechanical")
         self.notifier = build_notifier(config)
 
@@ -588,7 +592,16 @@ class Orchestrator:
         # First check existing positions using exit manager + sell-side rules
         exit_manager_enabled = self.config.get("exit_manager_enabled", True)
         if exit_manager_enabled:
-            exit_mgr = ExitManager(self.config)
+            exit_manager_version = self.config.get("exit_manager_version", "v1")
+            use_v2 = exit_manager_version == "v2"
+            if use_v2:
+                exit_mgr = ExitManagerV2(self.config, broker=self.broker)
+                regime_label_for_exit = (
+                    getattr(preflight, "market_regime", None) if preflight else None
+                )
+            else:
+                exit_mgr = ExitManager(self.config)
+                regime_label_for_exit = None
             for pos in stock_positions:
                 try:
                     # Step 1: Run exit manager rules
@@ -602,7 +615,12 @@ class Orchestrator:
                             "partial_taken": False,
                         }
                     features = self._get_latest_features(pos.symbol)
-                    decision = exit_mgr.check_position(pos, features, pos_state)
+                    if use_v2:
+                        decision = exit_mgr.check_position(
+                            pos, features, pos_state, regime_label=regime_label_for_exit
+                        )
+                    else:
+                        decision = exit_mgr.check_position(pos, features, pos_state)
 
                     if decision.action == "SELL":
                         result = self._execute_structured_signal(
@@ -635,7 +653,13 @@ class Orchestrator:
                             partial_order, account, stock_positions,
                             float(pos.current_price),
                         )
-                        if risk_result.passed:
+                        existing_open_order = self._find_existing_open_order(pos.symbol, "sell")
+                        if existing_open_order is not None:
+                            logger.info(
+                                f"{pos.symbol}: Skipping partial sell — existing open sell order "
+                                f"{existing_open_order.order_id} [{existing_open_order.status}]"
+                            )
+                        elif risk_result.passed:
                             order_result = self.broker.submit_order(partial_order)
                             self.db.log_trade(
                                 symbol=pos.symbol, side="sell",
@@ -957,6 +981,21 @@ class Orchestrator:
             logger.info(f"{symbol}: No trade needed (action={structured['action']})")
             return {"symbol": symbol, "action": structured["action"], "traded": False}
 
+        existing_open_order = self._find_existing_open_order(symbol, order_request.side)
+        if existing_open_order is not None:
+            reason = (
+                f"Existing open {order_request.side} order "
+                f"{existing_open_order.order_id} [{existing_open_order.status}]"
+            )
+            logger.info(f"{symbol}: {reason}")
+            self.db.mark_signal_rejected(signal_id, reason)
+            return {
+                "symbol": symbol,
+                "action": structured["action"],
+                "traded": False,
+                "screen_rejected": reason,
+            }
+
         # 5. Risk check
         risk_result = self.risk_engine.check_order(
             order_request, account, positions, current_price
@@ -1014,13 +1053,25 @@ class Orchestrator:
 
         # Persist position state on BUY fill for exit manager tracking
         if order_request.side == "buy" and "fill" in str(order_result.status).lower():
-            self.db.upsert_position_state(symbol, {
+            state_to_persist = {
                 "entry_price": order_result.filled_avg_price or current_price,
                 "entry_date": date.today().isoformat(),
                 "highest_close": order_result.filled_avg_price or current_price,
                 "current_stop": sl_price,
                 "partial_taken": False,
-            })
+            }
+            # Track P: capture bracket child-leg IDs so v2 exit manager can
+            # ratchet the broker stop via replace_order. These default to None
+            # for non-bracket orders; v1 exit path ignores them.
+            stop_leg = getattr(order_result, "stop_order_id", None)
+            tp_leg = getattr(order_result, "tp_order_id", None)
+            if stop_leg is not None:
+                state_to_persist["stop_order_id"] = stop_leg
+            if tp_leg is not None:
+                state_to_persist["tp_order_id"] = tp_leg
+            state_to_persist["entry_order_id"] = order_result.order_id
+            state_to_persist["variant"] = self.config.get("variant_name")
+            self.db.upsert_position_state(symbol, state_to_persist)
 
         logger.info(
             f"{symbol}: Order {order_result.status} — "
@@ -1232,6 +1283,18 @@ class Orchestrator:
         )
 
     # ── Reflection ───────────────────────────────────────────────────
+
+    def reconcile_orders(self) -> Dict:
+        """Sync local `trades` rows against broker state (Track P-SYNC)."""
+        from .reconciler import OrderReconciler
+
+        reconciler = OrderReconciler(
+            broker=self.broker,
+            db=self.db,
+            variant=self.config.get("variant_name"),
+            notifier=self.notifier,
+        )
+        return reconciler.reconcile_once()
 
     def take_market_snapshot(self) -> Dict:
         """Capture the current account and portfolio state."""
@@ -1624,6 +1687,21 @@ class Orchestrator:
                 qty=float(qty),
                 order_type="market",
             )
+            existing_open_order = self._find_existing_open_order(symbol, side)
+            if existing_open_order is not None:
+                reason = (
+                    f"Existing open {side} order "
+                    f"{existing_open_order.order_id} [{existing_open_order.status}]"
+                )
+                logger.info(f"{symbol}: {reason}")
+                self.db.mark_signal_rejected(signal_id, reason)
+                return {
+                    "symbol": symbol,
+                    "action": action,
+                    "traded": False,
+                    "risk_rejected": reason,
+                    "overlay_managed": True,
+                }
             order_result = self.broker.submit_order(order_request)
         except Exception as exc:
             self.db.mark_signal_rejected(signal_id, str(exc))
@@ -1890,6 +1968,34 @@ class Orchestrator:
         for p in positions:
             if p.symbol == symbol:
                 return p
+        return None
+
+    def _find_existing_open_order(self, symbol: str, side: Optional[str] = None):
+        getter = getattr(self.broker, "get_open_orders", None)
+        if not callable(getter):
+            return None
+        try:
+            orders = getter(symbol=symbol)
+        except TypeError:
+            orders = getter()
+        except Exception as exc:
+            logger.warning("Could not fetch open orders for %s: %s", symbol, exc)
+            return None
+
+        target_symbol = symbol.upper()
+        target_side = side.lower() if side else None
+        terminal_statuses = {"filled", "canceled", "cancelled", "expired", "rejected"}
+        for order in orders or []:
+            order_symbol = str(getattr(order, "symbol", "") or "").upper()
+            order_side = str(getattr(order, "side", "") or "").lower()
+            order_status = str(getattr(order, "status", "") or "").lower()
+            if order_symbol != target_symbol:
+                continue
+            if target_side and order_side != target_side:
+                continue
+            if order_status in terminal_statuses:
+                continue
+            return order
         return None
 
     def _target_exposure_for_regime(self, regime: Optional[str]) -> float:

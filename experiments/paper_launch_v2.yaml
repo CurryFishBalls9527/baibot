@@ -5,16 +5,18 @@ min_trades: 20
 min_days: 15
 status: running
 
-# Three-variant paper trading:
-#   mechanical — pure Minervini rule-based entries (existing)
-#   llm        — full agent pipeline (existing)
-#   chan       — Chan 缠论 structural signals + RS filter (new)
+# Four-variant paper trading:
+#   mechanical    — pure Minervini rule-based entries, ExitManager v1 (existing)
+#   llm           — full agent pipeline, ExitManager v1 (existing)
+#   chan          — Chan 缠论 structural signals + RS filter (existing)
+#   mechanical_v2 — same as mechanical + ExitManager v2 (B1→B4L parity) (new)
 #
 # Each variant uses a SEPARATE Alpaca paper account and SQLite db.
 # Set these env vars in .env before running:
-#   ALPACA_MECHANICAL_API_KEY, ALPACA_MECHANICAL_SECRET_KEY
-#   ALPACA_LLM_API_KEY,        ALPACA_LLM_SECRET_KEY
-#   ALPACA_CHAN_API_KEY,        ALPACA_CHAN_SECRET_KEY
+#   ALPACA_MECHANICAL_API_KEY,     ALPACA_MECHANICAL_SECRET_KEY
+#   ALPACA_LLM_API_KEY,            ALPACA_LLM_SECRET_KEY
+#   ALPACA_CHAN_API_KEY,           ALPACA_CHAN_SECRET_KEY
+#   ALPACA_MECHANICAL_V2_API_KEY,  ALPACA_MECHANICAL_V2_SECRET_KEY
 
 variants:
   - name: mechanical
@@ -52,3 +54,27 @@ variants:
       max_positions: 8
       default_stop_loss_pct: 0.05
       default_take_profit_pct: 0.15
+
+  - name: mechanical_v2
+    description: Mechanical + ExitManager v2 (B4L parity — regime trail, breakeven +8%, dead-money, partial-off, broker stop ratcheting)
+    alpaca_api_key: "${ALPACA_MECHANICAL_V2_API_KEY}"
+    alpaca_secret_key: "${ALPACA_MECHANICAL_V2_SECRET_KEY}"
+    db_path: trading_mechanical_v2.db
+    config_overrides:
+      mechanical_only_mode: true
+      minervini_enabled: true
+      exit_manager_version: v2
+      # B1: dead-money stop
+      dead_money_enabled: true
+      dead_money_min_gain_pct: 0.03
+      dead_money_max_days: 10
+      # B2: disable partial profits, let winners run
+      partial_profit_fraction: 0.0
+      # B3L: breakeven at +8%, lock entry+1%
+      breakeven_trigger_pct: 0.08
+      breakeven_lock_offset_pct: 0.01
+      # B4L: regime-dependent trail (tighten only in correction)
+      regime_aware_trail: true
+      trail_stop_pct_uptrend: 0.10
+      trail_stop_pct_pressure: 0.10
+      trail_stop_pct_correction: 0.07

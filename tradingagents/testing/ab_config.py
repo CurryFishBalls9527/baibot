@@ -44,6 +44,9 @@ def build_variant_config(base_config: dict, variant: ExperimentVariant) -> dict:
         config["db_path"] = variant.db_path
     config.update(variant.config_overrides)
     config.setdefault("strategy_tag", variant.name)
+    # Track P: v2 orchestrator path stamps trades/position_states with this
+    # so the reconciler and dashboard can slice by variant.
+    config["variant_name"] = variant.name
     return config
 
 

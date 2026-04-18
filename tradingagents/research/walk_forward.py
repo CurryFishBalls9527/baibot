@@ -109,8 +109,14 @@ class WalkForwardBacktester:
         benchmark = self.wf_config.benchmark
 
         # 1. Load all data from warehouse
-        logger.info(f"Loading data for {len(seed_symbols)} symbols + {benchmark}...")
-        all_symbols = sorted(set(seed_symbols + [benchmark]))
+        cross_asset_symbol = (
+            self.backtest_config.cross_asset_symbol
+            if self.backtest_config.cross_asset_enabled
+            else None
+        )
+        extras = [benchmark] + ([cross_asset_symbol] if cross_asset_symbol else [])
+        logger.info(f"Loading data for {len(seed_symbols)} symbols + {extras}...")
+        all_symbols = sorted(set(seed_symbols + extras))
         all_data = self.warehouse.get_daily_bars_bulk(all_symbols, start_date, end_date)
 
         if benchmark not in all_data:
@@ -118,6 +124,9 @@ class WalkForwardBacktester:
 
         # Filter to symbols with enough data
         benchmark_df = all_data.pop(benchmark)
+        cross_asset_df = (
+            all_data.pop(cross_asset_symbol, None) if cross_asset_symbol else None
+        )
         data_by_symbol = {
             sym: df for sym, df in all_data.items()
             if len(df) >= self.wf_config.min_data_bars
@@ -182,6 +191,7 @@ class WalkForwardBacktester:
             benchmark_df=benchmark_df,
             trade_start_date=trade_start_ts.strftime("%Y-%m-%d"),
             candidate_schedule=candidate_schedule,
+            cross_asset_df=cross_asset_df,
         )
 
         # 6. Build universe snapshots dict

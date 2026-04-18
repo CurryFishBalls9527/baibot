@@ -37,6 +37,7 @@ class PortfolioMinerviniBacktester(MinerviniBacktester):
         market_context_df: Optional[pd.DataFrame] = None,
         trade_start_date: Optional[str] = None,
         candidate_schedule: Optional[Dict] = None,
+        cross_asset_df: Optional[pd.DataFrame] = None,
     ) -> PortfolioBacktestResult:
         self._candidate_schedule = candidate_schedule
         prepared_frames = {}
@@ -77,6 +78,20 @@ class PortfolioMinerviniBacktester(MinerviniBacktester):
         max_drawdown = 0.0
         overlay_state = {"shares": 0, "cost_basis": 0.0}
         overlay_symbol = "SPY"
+        rsi2_state = {
+            "shares": 0,
+            "entry_price": 0.0,
+            "entry_date": None,
+            "entry_bar_idx": -1,
+        }
+        rsi2_features = self._build_rsi2_features(benchmark_df)
+        cross_asset_state = {
+            "shares": 0,
+            "entry_price": 0.0,
+            "entry_date": None,
+            "highest_close": 0.0,
+        }
+        cross_asset_trend = self._build_cross_asset_trend(cross_asset_df)
 
         for trade_date in all_dates:
             regime_label, regime_ok, target_exposure = self._regime_state(
@@ -88,7 +103,19 @@ class PortfolioMinerviniBacktester(MinerviniBacktester):
             overlay_mv_before = self._overlay_market_value(
                 overlay_state, benchmark_df, trade_date
             )
-            equity_before = cash_ref["cash"] + stock_mv_before + overlay_mv_before
+            rsi2_mv_before = self._rsi2_market_value(
+                rsi2_state, rsi2_features, trade_date
+            )
+            cross_mv_before = self._cross_asset_market_value(
+                cross_asset_state, cross_asset_df, trade_date
+            )
+            equity_before = (
+                cash_ref["cash"]
+                + stock_mv_before
+                + overlay_mv_before
+                + rsi2_mv_before
+                + cross_mv_before
+            )
             running_peak = max(running_peak, equity_before)
             max_drawdown = max(max_drawdown, (running_peak - equity_before) / running_peak)
 
@@ -137,10 +164,38 @@ class PortfolioMinerviniBacktester(MinerviniBacktester):
                     )
                     cash = float(cash_ref["cash"])
 
+            if self.config.rsi2_sleeve_enabled and rsi2_features is not None:
+                self._process_rsi2_sleeve(
+                    trade_date=trade_date,
+                    rsi2_state=rsi2_state,
+                    rsi2_features=rsi2_features,
+                    positions=positions,
+                    prepared_frames=prepared_frames,
+                    cash_ref=cash_ref,
+                    trades=trades,
+                )
+                cash = float(cash_ref["cash"])
+
+            if self.config.cross_asset_enabled and cross_asset_df is not None:
+                self._process_cross_asset(
+                    trade_date=trade_date,
+                    cross_asset_state=cross_asset_state,
+                    cross_asset_df=cross_asset_df,
+                    cross_asset_trend=cross_asset_trend,
+                    regime_label=regime_label,
+                    positions=positions,
+                    prepared_frames=prepared_frames,
+                    cash_ref=cash_ref,
+                    trades=trades,
+                )
+                cash = float(cash_ref["cash"])
+
             market_value = self._portfolio_market_value(positions, prepared_frames, trade_date)
             overlay_mv = self._overlay_market_value(overlay_state, benchmark_df, trade_date)
-            equity = cash + market_value + overlay_mv
-            total_exposure_mv = market_value + overlay_mv
+            rsi2_mv = self._rsi2_market_value(rsi2_state, rsi2_features, trade_date)
+            cross_mv = self._cross_asset_market_value(cross_asset_state, cross_asset_df, trade_date)
+            equity = cash + market_value + overlay_mv + rsi2_mv + cross_mv
+            total_exposure_mv = market_value + overlay_mv + rsi2_mv + cross_mv
             exposure = total_exposure_mv / equity if equity > 0 else 0.0
             market_score = None
             if (
@@ -180,16 +235,80 @@ class PortfolioMinerviniBacktester(MinerviniBacktester):
         if positions:
             final_date = all_dates[-1]
             for symbol in list(positions):
-                row = prepared_frames[symbol].loc[final_date]
+                frame = prepared_frames[symbol]
+                if final_date in frame.index:
+                    row = frame.loc[final_date]
+                    exit_date = final_date
+                else:
+                    prior = frame.loc[:final_date]
+                    if prior.empty:
+                        continue
+                    row = prior.iloc[-1]
+                    exit_date = prior.index[-1]
                 price = float(row["close"])
                 cash += self._liquidate_position(
                     symbol=symbol,
                     position=positions.pop(symbol),
                     exit_price=price,
-                    exit_date=final_date,
+                    exit_date=exit_date,
                     trades=trades,
                     exit_reason="final_bar",
                 )
+
+        if cross_asset_state["shares"] > 0 and cross_asset_df is not None:
+            final_date = all_dates[-1]
+            final_price = self._cross_asset_price(cross_asset_df, final_date)
+            if final_price is not None:
+                shares = cross_asset_state["shares"]
+                proceeds = shares * final_price
+                cost = shares * cross_asset_state["entry_price"]
+                cash += proceeds
+                trades.append(
+                    {
+                        "symbol": self.config.cross_asset_symbol,
+                        "entry_date": cross_asset_state["entry_date"],
+                        "exit_date": final_date,
+                        "entry_price": cross_asset_state["entry_price"],
+                        "exit_price": final_price,
+                        "shares": shares,
+                        "pnl": round(proceeds - cost, 2),
+                        "return_pct": round((proceeds - cost) / cost, 4) if cost else 0.0,
+                        "hold_days": 0,
+                        "exit_reason": "cross_asset_final",
+                        "leg_type": "cross_asset",
+                    }
+                )
+                cross_asset_state["shares"] = 0
+                cross_asset_state["entry_price"] = 0.0
+                cross_asset_state["entry_date"] = None
+
+        if rsi2_state["shares"] > 0 and rsi2_features is not None:
+            final_date = all_dates[-1]
+            final_price = self._rsi2_price(rsi2_features, final_date)
+            if final_price is not None:
+                shares = rsi2_state["shares"]
+                proceeds = shares * final_price
+                cost = shares * rsi2_state["entry_price"]
+                cash += proceeds
+                trades.append(
+                    {
+                        "symbol": "SPY",
+                        "entry_date": rsi2_state["entry_date"],
+                        "exit_date": final_date,
+                        "entry_price": rsi2_state["entry_price"],
+                        "exit_price": final_price,
+                        "shares": shares,
+                        "pnl": round(proceeds - cost, 2),
+                        "return_pct": round((proceeds - cost) / cost, 4) if cost else 0.0,
+                        "hold_days": 0,
+                        "exit_reason": "rsi2_sleeve_final",
+                        "leg_type": "rsi2_sleeve",
+                    }
+                )
+                rsi2_state["shares"] = 0
+                rsi2_state["entry_price"] = 0.0
+                rsi2_state["entry_date"] = None
+                rsi2_state["entry_bar_idx"] = -1
 
         if overlay_state["shares"] > 0 and benchmark_df is not None:
             final_date = all_dates[-1]
@@ -291,14 +410,17 @@ class PortfolioMinerviniBacktester(MinerviniBacktester):
             hold_days = (trade_date - position["entry_date"]).days
 
             if price >= average_cost * (1.0 + self.config.breakeven_trigger_pct):
-                position["stop_price"] = max(position["stop_price"], average_cost)
+                position["stop_price"] = max(
+                    position["stop_price"],
+                    average_cost * (1.0 + self.config.breakeven_lock_offset_pct),
+                )
 
             if position["partial_taken"] and pd.notna(row.get("ema_21")):
                 position["stop_price"] = max(position["stop_price"], float(row["ema_21"]))
             else:
                 position["stop_price"] = max(
                     position["stop_price"],
-                    position["highest_close"] * (1.0 - self.config.trail_stop_pct),
+                    self._trail_stop_from_row(row, position["highest_close"], regime_label),
                 )
 
             if (
@@ -393,6 +515,21 @@ class PortfolioMinerviniBacktester(MinerviniBacktester):
                 exit_reason = "stop"
             elif self.config.exit_on_market_correction and regime_label == "market_correction":
                 exit_reason = "market_regime"
+            elif self.config.use_dead_money_stop:
+                if self.config.adaptive_dead_money:
+                    if regime_label == "confirmed_uptrend":
+                        dm_days = self.config.dead_money_max_days_uptrend
+                    elif regime_label == "market_correction":
+                        dm_days = self.config.dead_money_max_days_correction
+                    else:
+                        dm_days = self.config.dead_money_max_days_pressure
+                else:
+                    dm_days = self.config.dead_money_max_days
+                if (
+                    hold_days >= dm_days
+                    and price < average_cost * (1.0 + self.config.dead_money_min_gain_pct)
+                ):
+                    exit_reason = "dead_money"
             elif (
                 self.config.use_ema21_exit
                 and pd.notna(row.get("ema_21"))
@@ -502,13 +639,82 @@ class PortfolioMinerviniBacktester(MinerviniBacktester):
                 not breakout_ok
                 and self._row_passes_continuation_entry(row, price)
             )
-            if not (breakout_ok or continuation_ok):
+            leader_cont_ok = (
+                not breakout_ok
+                and not continuation_ok
+                and self._row_passes_leader_continuation_entry(row, price)
+            )
+            if not (breakout_ok or continuation_ok or leader_cont_ok):
                 continue
-            entry_type = "breakout" if breakout_ok else "continuation"
+            if breakout_ok:
+                entry_type = "breakout"
+            elif continuation_ok:
+                entry_type = "continuation"
+            else:
+                entry_type = "leader_continuation"
+
+            # Change #6: RVOL gate on breakout entries only (continuation is a
+            # pullback setup with no breakout-day volume expectation).
+            if entry_type == "breakout" and self.config.min_breakout_volume_ratio > 0:
+                rvol = row.get("breakout_volume_ratio")
+                if pd.isna(rvol) or float(rvol) < self.config.min_breakout_volume_ratio:
+                    continue
 
             def _num(key: str, default: float = 0.0) -> float:
                 val = row.get(key)
                 return float(val) if pd.notna(val) else default
+
+            if self.config.use_composite_scoring:
+                template = _num("template_score")
+                depth = _num("base_depth_pct", default=1.0)
+                depth_band = (
+                    2 if 0.08 <= depth <= 0.15
+                    else 1 if 0.15 < depth <= 0.25
+                    else 0
+                )
+                vcr = _num("volume_contraction_ratio", default=1.5)
+                vcr_band = 2 if vcr <= 0.70 else 1 if vcr <= 0.85 else 0
+                rvol = _num("breakout_volume_ratio")
+                rvol_band = 2 if rvol >= 2.0 else 1 if rvol >= 1.5 else 0
+                roc60 = _num("roc_60")
+                roc_band = (
+                    3 if roc60 >= 0.25
+                    else 2 if roc60 >= 0.15
+                    else 1 if roc60 >= 0.05
+                    else 0
+                )
+                if self.config.composite_variant == "v2":
+                    # v2: drop stage/RS bands (floor-filtered already); double
+                    # template and roc to rank inside the leader-cont heavy pool
+                    composite = 2.0 * template + depth_band + vcr_band + rvol_band + 2.0 * roc_band
+                else:
+                    rs = _num("rs_percentile")
+                    rs_band = 3 if rs >= 90 else 2 if rs >= 80 else 1 if rs >= 70 else 0
+                    stage = _num("stage_number", default=99.0)
+                    stage_band = 3 if stage == 1 else 2 if stage == 2 else 0
+                    composite = (
+                        template + rs_band + depth_band + vcr_band
+                        + stage_band + rvol_band + roc_band
+                    )
+                rank = (
+                    int(bool(row.get("breakout_signal"))) if pd.notna(row.get("breakout_signal")) else 0,
+                    composite,
+                    _num("close_range_pct"),
+                    -_num("atr_pct_14"),
+                )
+            else:
+                rank = (
+                    int(bool(row.get("breakout_signal"))) if pd.notna(row.get("breakout_signal")) else 0,
+                    _num("template_score"),
+                    _num("roc_60"),
+                    _num("roc_120"),
+                    _num("adx_14"),
+                    _num("rsi_14"),
+                    -_num("atr_pct_14"),
+                    _num("close_range_pct"),
+                    _num("breakout_volume_ratio"),
+                    -_num("stage_number", 99.0),
+                )
 
             candidates.append(
                 {
@@ -516,18 +722,7 @@ class PortfolioMinerviniBacktester(MinerviniBacktester):
                     "price": price,
                     "row": row,
                     "entry_type": entry_type,
-                    "rank": (
-                        int(bool(row.get("breakout_signal"))) if pd.notna(row.get("breakout_signal")) else 0,
-                        _num("template_score"),
-                        _num("roc_60"),
-                        _num("roc_120"),
-                        _num("adx_14"),
-                        _num("rsi_14"),
-                        -_num("atr_pct_14"),
-                        _num("close_range_pct"),
-                        _num("breakout_volume_ratio"),
-                        -_num("stage_number", 99.0),
-                    ),
+                    "rank": rank,
                 }
             )
 
@@ -642,6 +837,272 @@ class PortfolioMinerviniBacktester(MinerviniBacktester):
         if benchmark_df is None or benchmark_df.empty or trade_date not in benchmark_df.index:
             return None
         return float(benchmark_df.loc[trade_date, "close"])
+
+    @staticmethod
+    def _cross_asset_price(
+        cross_asset_df: Optional[pd.DataFrame], trade_date
+    ) -> Optional[float]:
+        if (
+            cross_asset_df is None
+            or cross_asset_df.empty
+            or trade_date not in cross_asset_df.index
+        ):
+            return None
+        return float(cross_asset_df.loc[trade_date, "close"])
+
+    def _build_cross_asset_trend(
+        self,
+        cross_asset_df: Optional[pd.DataFrame],
+    ) -> Optional[pd.Series]:
+        if cross_asset_df is None or cross_asset_df.empty:
+            return None
+        window = max(1, self.config.cross_asset_trend_ma_days)
+        return cross_asset_df["close"].astype(float).rolling(window).mean()
+
+    def _cross_asset_market_value(
+        self,
+        cross_asset_state: dict,
+        cross_asset_df: Optional[pd.DataFrame],
+        trade_date,
+    ) -> float:
+        if cross_asset_state["shares"] <= 0:
+            return 0.0
+        price = self._cross_asset_price(cross_asset_df, trade_date)
+        if price is None:
+            return cross_asset_state["shares"] * cross_asset_state["entry_price"]
+        return cross_asset_state["shares"] * price
+
+    def _process_cross_asset(
+        self,
+        trade_date,
+        cross_asset_state: dict,
+        cross_asset_df: pd.DataFrame,
+        cross_asset_trend: Optional[pd.Series],
+        regime_label: str,
+        positions: dict[str, dict],
+        prepared_frames: dict[str, pd.DataFrame],
+        cash_ref: dict[str, float],
+        trades: list[dict],
+    ) -> None:
+        price = self._cross_asset_price(cross_asset_df, trade_date)
+        if price is None or price <= 0:
+            return
+        symbol = self.config.cross_asset_symbol
+        trend_ma = (
+            cross_asset_trend.get(trade_date)
+            if cross_asset_trend is not None
+            else None
+        )
+
+        if cross_asset_state["shares"] > 0:
+            cross_asset_state["highest_close"] = max(
+                cross_asset_state["highest_close"], price
+            )
+            exit_reason = None
+            stop_level = cross_asset_state["highest_close"] * (
+                1.0 - self.config.cross_asset_stop_loss_pct
+            )
+            if (
+                self.config.cross_asset_exit_on_uptrend
+                and regime_label == "confirmed_uptrend"
+            ):
+                exit_reason = "cross_asset_regime_uptrend"
+            elif price <= stop_level:
+                exit_reason = "cross_asset_stop"
+            elif (
+                self.config.cross_asset_require_trend
+                and trend_ma is not None
+                and pd.notna(trend_ma)
+                and price < float(trend_ma)
+            ):
+                exit_reason = "cross_asset_trend_lost"
+            if exit_reason is not None:
+                shares = cross_asset_state["shares"]
+                proceeds = shares * price
+                cost = shares * cross_asset_state["entry_price"]
+                cash_ref["cash"] += proceeds
+                trades.append(
+                    {
+                        "symbol": symbol,
+                        "entry_date": cross_asset_state["entry_date"],
+                        "exit_date": trade_date,
+                        "entry_price": cross_asset_state["entry_price"],
+                        "exit_price": price,
+                        "shares": shares,
+                        "pnl": round(proceeds - cost, 2),
+                        "return_pct": round((proceeds - cost) / cost, 4) if cost else 0.0,
+                        "hold_days": 0,
+                        "exit_reason": exit_reason,
+                        "leg_type": "cross_asset",
+                    }
+                )
+                cross_asset_state["shares"] = 0
+                cross_asset_state["entry_price"] = 0.0
+                cross_asset_state["entry_date"] = None
+                cross_asset_state["highest_close"] = 0.0
+            return
+
+        if regime_label == "confirmed_uptrend":
+            return
+        if (
+            self.config.cross_asset_require_trend
+            and trend_ma is not None
+            and pd.notna(trend_ma)
+            and price < float(trend_ma)
+        ):
+            return
+
+        stock_mv = self._portfolio_market_value(positions, prepared_frames, trade_date)
+        equity = cash_ref["cash"] + stock_mv
+        if equity <= 0:
+            return
+        main_exposure = stock_mv / equity
+        if main_exposure >= self.config.cross_asset_exposure_threshold:
+            return
+
+        budget = equity * self.config.cross_asset_position_pct
+        budget = min(budget, cash_ref["cash"])
+        if budget <= 0:
+            return
+        qty = int(budget / price)
+        if qty <= 0:
+            return
+        cost = qty * price
+        cash_ref["cash"] -= cost
+        cross_asset_state["shares"] = qty
+        cross_asset_state["entry_price"] = price
+        cross_asset_state["entry_date"] = trade_date
+        cross_asset_state["highest_close"] = price
+
+    def _build_rsi2_features(
+        self,
+        benchmark_df: Optional[pd.DataFrame],
+    ) -> Optional[pd.DataFrame]:
+        if benchmark_df is None or benchmark_df.empty or "close" not in benchmark_df.columns:
+            return None
+        close = benchmark_df["close"].astype(float)
+        delta = close.diff()
+        gain = delta.clip(lower=0.0)
+        loss = (-delta).clip(lower=0.0)
+        avg_gain = gain.ewm(alpha=0.5, adjust=False).mean()
+        avg_loss = loss.ewm(alpha=0.5, adjust=False).mean()
+        rs = avg_gain / avg_loss.replace(0.0, pd.NA)
+        rsi2 = 100.0 - 100.0 / (1.0 + rs)
+        rsi2 = rsi2.fillna(100.0)
+        exit_ma = close.rolling(self.config.rsi2_sleeve_exit_ma_days).mean()
+        long_ma = close.rolling(self.config.rsi2_sleeve_long_term_ma_days).mean()
+        return pd.DataFrame(
+            {
+                "close": close,
+                "rsi2": rsi2,
+                "exit_ma": exit_ma,
+                "long_ma": long_ma,
+            },
+            index=benchmark_df.index,
+        )
+
+    @staticmethod
+    def _rsi2_price(rsi2_features: Optional[pd.DataFrame], trade_date) -> Optional[float]:
+        if rsi2_features is None or trade_date not in rsi2_features.index:
+            return None
+        close = rsi2_features.loc[trade_date, "close"]
+        return float(close) if pd.notna(close) else None
+
+    def _rsi2_market_value(
+        self,
+        rsi2_state: dict,
+        rsi2_features: Optional[pd.DataFrame],
+        trade_date,
+    ) -> float:
+        if rsi2_state["shares"] <= 0:
+            return 0.0
+        price = self._rsi2_price(rsi2_features, trade_date)
+        if price is None:
+            return rsi2_state["shares"] * rsi2_state["entry_price"]
+        return rsi2_state["shares"] * price
+
+    def _process_rsi2_sleeve(
+        self,
+        trade_date,
+        rsi2_state: dict,
+        rsi2_features: pd.DataFrame,
+        positions: dict[str, dict],
+        prepared_frames: dict[str, pd.DataFrame],
+        cash_ref: dict[str, float],
+        trades: list[dict],
+    ) -> None:
+        if trade_date not in rsi2_features.index:
+            return
+        row = rsi2_features.loc[trade_date]
+        price = float(row["close"]) if pd.notna(row["close"]) else None
+        if price is None or price <= 0:
+            return
+
+        if rsi2_state["shares"] > 0:
+            exit_ma = row.get("exit_ma")
+            bars_held = rsi2_state["entry_bar_idx"]
+            rsi2_state["entry_bar_idx"] = bars_held + 1
+            exit_reason = None
+            if pd.notna(exit_ma) and price > float(exit_ma):
+                exit_reason = "rsi2_exit_ma"
+            elif (bars_held + 1) >= self.config.rsi2_sleeve_max_hold_days:
+                exit_reason = "rsi2_max_hold"
+            if exit_reason is not None:
+                shares = rsi2_state["shares"]
+                proceeds = shares * price
+                cost = shares * rsi2_state["entry_price"]
+                cash_ref["cash"] += proceeds
+                trades.append(
+                    {
+                        "symbol": "SPY",
+                        "entry_date": rsi2_state["entry_date"],
+                        "exit_date": trade_date,
+                        "entry_price": rsi2_state["entry_price"],
+                        "exit_price": price,
+                        "shares": shares,
+                        "pnl": round(proceeds - cost, 2),
+                        "return_pct": round((proceeds - cost) / cost, 4) if cost else 0.0,
+                        "hold_days": bars_held + 1,
+                        "exit_reason": exit_reason,
+                        "leg_type": "rsi2_sleeve",
+                    }
+                )
+                rsi2_state["shares"] = 0
+                rsi2_state["entry_price"] = 0.0
+                rsi2_state["entry_date"] = None
+                rsi2_state["entry_bar_idx"] = -1
+            return
+
+        long_ma = row.get("long_ma")
+        rsi2 = row.get("rsi2")
+        if pd.isna(long_ma) or pd.isna(rsi2):
+            return
+        if price <= float(long_ma):
+            return
+        if float(rsi2) >= self.config.rsi2_sleeve_entry_threshold:
+            return
+
+        stock_mv = self._portfolio_market_value(positions, prepared_frames, trade_date)
+        equity = cash_ref["cash"] + stock_mv
+        if equity <= 0:
+            return
+        main_exposure = stock_mv / equity
+        if main_exposure >= self.config.rsi2_sleeve_exposure_threshold:
+            return
+
+        budget = equity * self.config.rsi2_sleeve_position_pct
+        budget = min(budget, cash_ref["cash"])
+        if budget <= 0:
+            return
+        qty = int(budget / price)
+        if qty <= 0:
+            return
+        cost = qty * price
+        cash_ref["cash"] -= cost
+        rsi2_state["shares"] = qty
+        rsi2_state["entry_price"] = price
+        rsi2_state["entry_date"] = trade_date
+        rsi2_state["entry_bar_idx"] = 0
 
     def _overlay_market_value(
         self,

@@ -42,6 +42,19 @@ class ABRunner:
                 results[name] = {"error": str(e)}
         return results
 
+    def reconcile_orders(self) -> Dict[str, Dict]:
+        """Run local↔broker reconciliation for all variants (Track P-SYNC)."""
+        results = {}
+        for name, orch in self.orchestrators.items():
+            try:
+                results[name] = orch.reconcile_orders()
+            except Exception as e:
+                logger.error(
+                    "Variant '%s' reconcile failed: %s", name, e, exc_info=True
+                )
+                results[name] = {"error": str(e)}
+        return results
+
     def run_intraday_scan(self) -> Dict[str, Dict]:
         """Run intraday scans for Chan (30m signals) and mechanical (price checks)."""
         from tradingagents.automation.chan_orchestrator import ChanOrchestrator

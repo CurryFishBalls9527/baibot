@@ -11,8 +11,10 @@ from alpaca.trading.requests import (
     StopLimitOrderRequest,
     TrailingStopOrderRequest,
     ClosePositionRequest,
+    GetOrdersRequest,
+    ReplaceOrderRequest,
 )
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, OrderClass
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, OrderClass, QueryOrderStatus
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestQuoteRequest
 
@@ -167,15 +169,64 @@ class AlpacaBroker(BaseBroker):
             f"Bracket order: BUY {order.qty} {order.symbol} "
             f"SL=${stop_loss_price:.2f} TP=${take_profit_price:.2f} -> {result.status}"
         )
-        return self._to_order_result(result)
+        out = self._to_order_result(result)
+        # Alpaca returns child orders on the parent response's `legs` attribute.
+        # Stop leg has stop_price; take-profit leg has limit_price and no stop_price.
+        legs = getattr(result, "legs", None) or []
+        for leg in legs:
+            leg_stop = getattr(leg, "stop_price", None)
+            leg_limit = getattr(leg, "limit_price", None)
+            if leg_stop and out.stop_order_id is None:
+                out.stop_order_id = str(leg.id)
+            elif leg_limit and out.tp_order_id is None:
+                out.tp_order_id = str(leg.id)
+        return out
 
     def cancel_order(self, order_id: str) -> None:
         self.trading_client.cancel_order_by_id(order_id)
         logger.info(f"Order cancelled: {order_id}")
 
+    def replace_order(
+        self,
+        order_id: str,
+        stop_price: Optional[float] = None,
+        limit_price: Optional[float] = None,
+        qty: Optional[float] = None,
+    ) -> Optional[OrderResult]:
+        """Replace an open order's stop_price / limit_price / qty.
+
+        Used by ExitManagerV2 to ratchet the stop leg of a bracket OCO as the
+        trailing stop moves up. Returns the new OrderResult or None on failure.
+        """
+        kwargs = {}
+        if stop_price is not None:
+            kwargs["stop_price"] = round(float(stop_price), 2)
+        if limit_price is not None:
+            kwargs["limit_price"] = round(float(limit_price), 2)
+        if qty is not None:
+            kwargs["qty"] = int(qty)
+        if not kwargs:
+            return None
+        req = ReplaceOrderRequest(**kwargs)
+        try:
+            raw = self.trading_client.replace_order_by_id(order_id, req)
+        except Exception as e:
+            logger.warning(f"replace_order({order_id}, {kwargs}) failed: {e}")
+            return None
+        logger.info(f"Order replaced: {order_id} {kwargs} -> {raw.id}")
+        return self._to_order_result(raw)
+
     def get_order(self, order_id: str) -> OrderResult:
         raw = self.trading_client.get_order_by_id(order_id)
         return self._to_order_result(raw)
+
+    def get_open_orders(self, symbol: Optional[str] = None) -> List[OrderResult]:
+        req = GetOrdersRequest(
+            status=QueryOrderStatus.OPEN,
+            symbols=[symbol] if symbol else None,
+        )
+        raw = self.trading_client.get_orders(filter=req)
+        return [self._to_order_result(order) for order in raw]
 
     @staticmethod
     def _to_order_result(o) -> OrderResult:

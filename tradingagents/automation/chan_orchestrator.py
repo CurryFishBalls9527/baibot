@@ -38,6 +38,7 @@ from tradingagents.risk.risk_engine import RiskEngine
 from tradingagents.storage.database import TradingDatabase
 from tradingagents.automation.notifier import build_notifier
 from tradingagents.research.chan_adapter import DuckDBIntradayAPI
+from tradingagents.research import MarketDataWarehouse, build_market_context
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +72,10 @@ class ChanOrchestrator:
             paper=config.get("paper_trading", True),
         )
 
-        self.db = TradingDatabase(config.get("db_path", "trading_chan.db"))
+        self.db = TradingDatabase(
+            config.get("db_path", "trading_chan.db"),
+            variant=config.get("variant_name"),
+        )
         config.setdefault("strategy_tag", "chan")
         self.notifier = build_notifier(config)
 
@@ -94,6 +98,14 @@ class ChanOrchestrator:
 
         self._seen_buy_keys: Set[str] = set()
         self._seen_sell_keys: Dict[str, Set[str]] = {}
+
+        # C3 regime gate. Off by default to preserve existing chan variant
+        # behavior. Set chan_regime_gate_enabled: true + chan_regime_min_score
+        # to activate.
+        self.regime_gate_enabled = config.get("chan_regime_gate_enabled", False)
+        self.regime_min_score = config.get("chan_regime_min_score", 4)
+        self._cached_regime: Optional[Dict] = None
+        self._regime_cache_date: Optional[str] = None
 
 
     def run_daily_analysis(self) -> Dict:
@@ -170,6 +182,44 @@ class ChanOrchestrator:
 
         return exit_results
 
+    def _load_market_regime(self) -> Optional[Dict]:
+        """Return {'market_score', 'market_regime', 'confirmed_uptrend'} or None.
+
+        Cached once per day. Mirrors the approach used by Orchestrator for the
+        mechanical overlay regime source. Safe to call repeatedly.
+        """
+        today = date.today().isoformat()
+        if self._cached_regime is not None and self._regime_cache_date == today:
+            return self._cached_regime
+
+        try:
+            lookback = max(int(self.config.get("minervini_lookback_days", 730)), 400)
+            start = (datetime.now() - timedelta(days=lookback)).strftime("%Y-%m-%d")
+            end = today
+            symbols = ["SPY", "QQQ", "IWM", "SMH", "^VIX"]
+            warehouse = MarketDataWarehouse(
+                self.config.get("minervini_db_path", self.daily_db)
+            )
+            try:
+                frames = {s: warehouse.get_daily_bars(s, start, end) for s in symbols}
+            finally:
+                warehouse.close()
+            df = build_market_context(frames)
+            if df is None or df.empty:
+                return None
+            latest = df.iloc[-1]
+            score = latest.get("market_score")
+            self._cached_regime = {
+                "market_score": int(score) if score is not None else None,
+                "market_regime": str(latest["market_regime"]),
+                "confirmed_uptrend": bool(latest["market_confirmed_uptrend"]),
+            }
+            self._regime_cache_date = today
+            return self._cached_regime
+        except Exception as e:
+            logger.warning("Chan regime gate: failed to load regime: %s", e)
+            return None
+
     def _check_entries(
         self, rs_qualifying: Set[str], positions: List[Position], account: Account,
     ) -> List[Dict]:
@@ -180,6 +230,20 @@ class ChanOrchestrator:
         if len(positions) >= self.max_positions:
             logger.info("At max positions (%d), skipping entry scan", self.max_positions)
             return entry_results
+
+        # C3: regime gate — suppress new entries in weak markets when enabled.
+        if self.regime_gate_enabled:
+            regime = self._load_market_regime()
+            if regime is not None and regime.get("market_score") is not None:
+                if regime["market_score"] <= self.regime_min_score:
+                    logger.info(
+                        "Chan regime gate: score=%s regime=%s <= min=%s — "
+                        "suppressing new entries",
+                        regime["market_score"],
+                        regime["market_regime"],
+                        self.regime_min_score,
+                    )
+                    return entry_results
 
         DuckDBIntradayAPI.DB_PATH = self.intraday_db
         chan_cfg = CChanConfig(DEFAULT_CHAN_CONFIG.copy())
@@ -327,7 +391,18 @@ class ChanOrchestrator:
             )
 
             end = datetime.now()
-            start = end - timedelta(days=90)
+            # Incremental: only fetch from the latest bar we already have
+            latest_row = conn.execute(
+                "SELECT MAX(ts) FROM bars_30m"
+            ).fetchone()
+            latest_ts = latest_row[0] if latest_row and latest_row[0] else None
+            if latest_ts:
+                # Small overlap to catch any bars we might have missed
+                start = latest_ts - timedelta(hours=1)
+                logger.info("Incremental 30m refresh from %s", start)
+            else:
+                start = end - timedelta(days=90)
+                logger.info("Full 30m backfill (no existing data)")
             batch_size = 100
             total_updated = 0
             total_bars = 0
@@ -702,6 +777,17 @@ class ChanOrchestrator:
             logger.info("%s: No trade needed (sizer returned None)", symbol)
             return {"symbol": symbol, "action": action, "traded": False}
 
+        existing_open_order = self._find_existing_open_order(symbol, order_request.side)
+        if existing_open_order is not None:
+            reason = (
+                f"Existing open {order_request.side} order "
+                f"{existing_open_order.order_id} [{existing_open_order.status}]"
+            )
+            logger.info("%s: %s", symbol, reason)
+            self.db.mark_signal_rejected(signal_id, reason)
+            return {"symbol": symbol, "action": action, "traded": False,
+                    "screen_rejected": reason}
+
         risk_result = self.risk_engine.check_order(
             order_request, account, positions, current_price
         )
@@ -753,6 +839,34 @@ class ChanOrchestrator:
             "symbol": symbol, "action": action, "traded": True,
             "qty": order_request.qty, "status": order_result.status,
         }
+
+    def _find_existing_open_order(self, symbol: str, side: Optional[str] = None):
+        getter = getattr(self.broker, "get_open_orders", None)
+        if not callable(getter):
+            return None
+        try:
+            orders = getter(symbol=symbol)
+        except TypeError:
+            orders = getter()
+        except Exception as exc:
+            logger.warning("Could not fetch open orders for %s: %s", symbol, exc)
+            return None
+
+        target_symbol = symbol.upper()
+        target_side = side.lower() if side else None
+        terminal_statuses = {"filled", "canceled", "cancelled", "expired", "rejected"}
+        for order in orders or []:
+            order_symbol = str(getattr(order, "symbol", "") or "").upper()
+            order_side = str(getattr(order, "side", "") or "").lower()
+            order_status = str(getattr(order, "status", "") or "").lower()
+            if order_symbol != target_symbol:
+                continue
+            if target_side and order_side != target_side:
+                continue
+            if order_status in terminal_statuses:
+                continue
+            return order
+        return None
 
     def _notify_summary(self, results: Dict):
         """Send notification summary of today's actions."""
@@ -867,3 +981,15 @@ class ChanOrchestrator:
     def take_market_snapshot(self) -> Dict:
         """Placeholder — Chan doesn't need a pre-market snapshot."""
         return {}
+
+    def reconcile_orders(self) -> Dict:
+        """Sync local `trades` rows against broker state (Track P-SYNC)."""
+        from .reconciler import OrderReconciler
+
+        reconciler = OrderReconciler(
+            broker=self.broker,
+            db=self.db,
+            variant=self.config.get("variant_name"),
+            notifier=self.notifier,
+        )
+        return reconciler.reconcile_once()

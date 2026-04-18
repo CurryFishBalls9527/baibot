@@ -29,6 +29,18 @@ class BaseBroker(ABC):
     def cancel_order(self, order_id: str) -> None:
         ...
 
+    def replace_order(
+        self,
+        order_id: str,
+        stop_price: Optional[float] = None,
+        limit_price: Optional[float] = None,
+        qty: Optional[float] = None,
+    ) -> Optional[OrderResult]:
+        """Replace an open order's price/qty. Default no-op for brokers without support."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement replace_order"
+        )
+
     @abstractmethod
     def close_position(self, symbol: str) -> OrderResult:
         ...

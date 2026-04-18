@@ -13,8 +13,9 @@ logger = logging.getLogger(__name__)
 class TradingDatabase:
     """Lightweight SQLite database for all trading records."""
 
-    def __init__(self, db_path: str = "trading.db"):
+    def __init__(self, db_path: str = "trading.db", variant: Optional[str] = None):
         self.db_path = db_path
+        self.default_variant = variant
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
@@ -187,6 +188,24 @@ class TradingDatabase:
             "trade_outcomes",
             {"trade_analysis": "TEXT"},
         )
+        # Track P: additive columns for bracket-leg tracking and variant attribution.
+        # All default NULL — existing code ignores them, v2 path populates them.
+        self._ensure_columns(
+            "position_states",
+            {
+                "stop_order_id": "TEXT",
+                "tp_order_id": "TEXT",
+                "variant": "TEXT",
+                "entry_order_id": "TEXT",
+                "bars_held": "INTEGER DEFAULT 0",
+            },
+        )
+        self._ensure_columns(
+            "trades",
+            {
+                "variant": "TEXT",
+            },
+        )
         self._ensure_columns(
             "setup_candidates",
             {
@@ -250,13 +269,17 @@ class TradingDatabase:
                   notional: float = None, order_type: str = "market",
                   status: str = "submitted", filled_qty: float = 0,
                   filled_price: float = None, order_id: str = None,
-                  signal_id: int = None, reasoning: str = "") -> int:
+                  signal_id: int = None, reasoning: str = "",
+                  variant: Optional[str] = None) -> int:
+        if variant is None:
+            variant = self.default_variant
         cur = self.conn.execute(
             """INSERT INTO trades (symbol, side, qty, notional, order_type,
-               status, filled_qty, filled_price, order_id, signal_id, reasoning)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               status, filled_qty, filled_price, order_id, signal_id, reasoning,
+               variant)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (symbol, side, qty, notional, order_type, status,
-             filled_qty, filled_price, order_id, signal_id, reasoning),
+             filled_qty, filled_price, order_id, signal_id, reasoning, variant),
         )
         self.conn.commit()
         return cur.lastrowid
@@ -534,19 +557,29 @@ class TradingDatabase:
         return state
 
     def upsert_position_state(self, symbol: str, state: Dict):
+        # Merge with existing row so v1 callers (passing only core fields) don't
+        # overwrite v2-populated columns like stop_order_id / bars_held / variant.
+        existing = self.get_position_state(symbol) or {}
+        merged = {**existing, **state}
         self.conn.execute(
             """INSERT OR REPLACE INTO position_states
                (symbol, entry_price, entry_date, highest_close, current_stop,
-                partial_taken, stop_type, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))""",
+                partial_taken, stop_type, stop_order_id, tp_order_id,
+                entry_order_id, variant, bars_held, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))""",
             (
                 symbol,
-                state["entry_price"],
-                state["entry_date"],
-                state["highest_close"],
-                state["current_stop"],
-                1 if state.get("partial_taken") else 0,
-                state.get("stop_type", "initial"),
+                merged["entry_price"],
+                merged["entry_date"],
+                merged["highest_close"],
+                merged["current_stop"],
+                1 if merged.get("partial_taken") else 0,
+                merged.get("stop_type", "initial"),
+                merged.get("stop_order_id"),
+                merged.get("tp_order_id"),
+                merged.get("entry_order_id"),
+                merged.get("variant"),
+                int(merged.get("bars_held") or 0),
             ),
         )
         self.conn.commit()
