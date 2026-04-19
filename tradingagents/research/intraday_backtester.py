@@ -111,6 +111,17 @@ class IntradayBreakoutBacktester:
     def __init__(self, config: IntradayBacktestConfig | None = None):
         self.config = config or IntradayBacktestConfig()
 
+    def prepare_signals(self, frame: pd.DataFrame) -> pd.DataFrame:
+        """Public wrapper for feature + signal computation on a single symbol.
+
+        Input: OHLCV DataFrame indexed by timestamp (regular-session bars).
+        Output: the same frame annotated with `entry_signal`, `setup_family`,
+        and the supporting feature columns the main loop uses. Intended for
+        live orchestrators that need the same signal logic as the backtester
+        but do not want to depend on its DuckDB load path.
+        """
+        return self._prepare_symbol_features(frame)
+
     def _apply_execution_cost(
         self,
         price: float,

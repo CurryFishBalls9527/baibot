@@ -23,6 +23,9 @@ def _build_orchestrator(variant_config: dict):
     if strategy_type == "chan":
         from tradingagents.automation.chan_orchestrator import ChanOrchestrator
         return ChanOrchestrator(variant_config)
+    if strategy_type == "intraday_mechanical":
+        from tradingagents.automation.intraday_orchestrator import IntradayOrchestrator
+        return IntradayOrchestrator(variant_config)
     return Orchestrator(variant_config)
 
 
@@ -30,8 +33,10 @@ def _shared_writer_key(orch) -> str:
     """Identify the DuckDB writer path a variant contends on, if any.
 
     Variants returning the same key serialize against each other; variants
-    with distinct keys run in parallel. Non-chan orchestrators have no
-    shared DuckDB writer today so each one gets a unique key.
+    with distinct keys run in parallel. Only Chan orchestrators share a
+    DuckDB writer today (intraday_30m_broad.duckdb between chan + chan_v2).
+    Intraday mechanical fetches bars per-scan directly from Alpaca so it has
+    no shared writer.
     """
     from tradingagents.automation.chan_orchestrator import ChanOrchestrator
     if isinstance(orch, ChanOrchestrator):
@@ -100,15 +105,45 @@ class ABRunner:
         )
 
     def run_intraday_scan(self) -> Dict[str, Dict]:
-        """Run intraday scans (Chan: 30m signals; others: entry price checks)."""
+        """Run intraday scans (Chan: 30m signals; intraday_mechanical: 15m NR4 scan;
+        others: Minervini entry price checks)."""
         from tradingagents.automation.chan_orchestrator import ChanOrchestrator
+        from tradingagents.automation.intraday_orchestrator import IntradayOrchestrator
 
         def _dispatch(_name: str, orch) -> Dict:
             if isinstance(orch, ChanOrchestrator):
                 return orch.run_daily_analysis()
+            if isinstance(orch, IntradayOrchestrator):
+                return orch.scan()
             return orch.run_intraday_entry_scan()
 
         return self._grouped_parallel(_dispatch, "intraday scan")
+
+    def flatten_all_intraday(self) -> Dict[str, Dict]:
+        """EOD flatten hook for intraday_mechanical variants (15:55 ET job).
+
+        Non-intraday variants return {"status": "not_applicable"}. This runs
+        sequentially across intraday variants because the flatten path makes
+        Alpaca position-close calls; if multiple intraday variants are ever
+        added they're on different accounts anyway, so we could parallelize
+        later — today there's one intraday variant so sequential is fine.
+        """
+        from tradingagents.automation.intraday_orchestrator import IntradayOrchestrator
+
+        results: Dict[str, Dict] = {}
+        for name, orch in self.orchestrators.items():
+            if not isinstance(orch, IntradayOrchestrator):
+                results[name] = {"status": "not_applicable"}
+                continue
+            logger.info("Intraday EOD flatten: variant '%s'", name)
+            try:
+                results[name] = orch.flatten_all()
+            except Exception as e:
+                logger.error(
+                    "Variant '%s' flatten failed: %s", name, e, exc_info=True
+                )
+                results[name] = {"error": str(e)}
+        return results
 
     def run_daily_reflection(self) -> Dict[str, Dict]:
         """Run reflection for all variants."""

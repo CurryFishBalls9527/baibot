@@ -201,6 +201,32 @@ class ABRunnerParallelismTests(unittest.TestCase):
         self.assertEqual(results["mech"]["label"], "intraday_entry_scan")
         self.assertEqual(results["chan"]["label"], "daily_analysis")
 
+    def test_flatten_all_intraday_only_targets_intraday_variants(self):
+        """Non-intraday variants must get a not_applicable status; intraday
+        variants must have their flatten_all() called."""
+        class _FakeIntraday:
+            def __init__(self, name):
+                self.name = name
+                self.flatten_calls = 0
+            def flatten_all(self):
+                self.flatten_calls += 1
+                return {"closed": [], "positions_closed": 0, "dry_run": True}
+
+        intraday = _FakeIntraday("intraday_mechanical")
+        runner = _build_runner({
+            "mech": _FakeMechanical("mech"),
+            "intraday_mechanical": intraday,
+        })
+        with patch(
+            "tradingagents.automation.intraday_orchestrator.IntradayOrchestrator",
+            _FakeIntraday,
+        ):
+            results = runner.flatten_all_intraday()
+
+        self.assertEqual(results["mech"]["status"], "not_applicable")
+        self.assertEqual(results["intraday_mechanical"]["positions_closed"], 0)
+        self.assertEqual(intraday.flatten_calls, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

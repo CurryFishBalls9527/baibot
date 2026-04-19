@@ -153,6 +153,30 @@ class TradingScheduler:
                 scan_interval,
             )
 
+        # Intraday mechanical EOD flatten — close any open intraday positions
+        # before market close. Runs only when ab_runner is configured (the
+        # variant lives inside the A/B framework).
+        if self.ab_runner:
+            flatten_time = self.config.get("intraday_flatten_time", "15:55")
+            hour, minute = flatten_time.split(":")
+            self.scheduler.add_job(
+                self._run_with_logging,
+                args=[self.ab_runner.flatten_all_intraday, "Intraday EOD Flatten"],
+                trigger=CronTrigger(
+                    day_of_week="mon-fri",
+                    hour=int(hour),
+                    minute=int(minute),
+                    timezone="US/Eastern",
+                ),
+                id="intraday_eod_flatten",
+                name="Intraday EOD Flatten",
+                misfire_grace_time=60,
+            )
+            logger.info(
+                "Scheduled intraday EOD flatten at %s ET (Mon-Fri)",
+                flatten_time,
+            )
+
         # Order reconciliation (Track P-SYNC) — sync local DB against broker.
         # Off by default; enable via `reconciler_enabled: true` in config.
         if self.config.get("reconciler_enabled", False):
