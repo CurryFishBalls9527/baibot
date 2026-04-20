@@ -28,29 +28,23 @@ log = logging.getLogger("chan_portfolio")
 
 
 def _load_regime(db_path: str, begin: str, end: str) -> pd.DataFrame | None:
-    """Load regime data from daily warehouse if available."""
+    """Load regime data using MarketDataWarehouse (same as live system)."""
+    from tradingagents.research import MarketDataWarehouse
+
     daily_db = Path("research_data/market_data.duckdb")
     if not daily_db.exists():
         log.warning("No daily warehouse found, running without regime gating")
         return None
 
     try:
-        import duckdb
-        conn = duckdb.connect(str(daily_db), read_only=True)
-        data_by_symbol = {}
-        for sym in ["SPY", "QQQ", "IWM"]:
-            rows = conn.execute(
-                "SELECT date, open, high, low, close, volume FROM daily_bars "
-                "WHERE symbol = ? AND date >= ? AND date <= ? ORDER BY date",
-                [sym, begin, end],
-            ).fetchdf()
-            if not rows.empty:
-                rows["date"] = pd.to_datetime(rows["date"])
-                rows = rows.set_index("date")
-                data_by_symbol[sym] = rows
-        conn.close()
-        if data_by_symbol:
-            return build_market_context(data_by_symbol)
+        symbols = ["SPY", "QQQ", "IWM", "SMH", "^VIX"]
+        warehouse = MarketDataWarehouse(str(daily_db))
+        try:
+            frames = {s: warehouse.get_daily_bars(s, begin, end) for s in symbols}
+        finally:
+            warehouse.close()
+        if frames:
+            return build_market_context(frames)
     except Exception as e:
         log.warning("Failed to load regime data: %s", e)
     return None
@@ -64,6 +58,8 @@ def parse_args():
     p.add_argument("--begin", default="2023-01-01")
     p.add_argument("--end", default="2025-12-30")
     p.add_argument("--db", default="research_data/intraday_30m.duckdb")
+    p.add_argument("--interval", type=int, choices=[5, 15, 30], default=30,
+                   help="Intraday bar interval in minutes (default: 30)")
     p.add_argument("--cash", type=float, default=100_000)
     p.add_argument("--max-positions", type=int, default=8)
     p.add_argument("--exit-mode", default="zs_structural",
@@ -78,6 +74,32 @@ def parse_args():
                     help="DuckDB path for daily bars")
     p.add_argument("--sepa-filter", action="store_true",
                     help="Only enter when stock passes SEPA trend template")
+    p.add_argument("--dead-money-bars", type=int, default=0,
+                    help="Exit if held >= N bars with < min-gain (0=off)")
+    p.add_argument("--dead-money-min-gain", type=float, default=0.05,
+                    help="Min unrealized gain to avoid dead-money exit")
+    p.add_argument("--ma-trend-filter", action="store_true",
+                    help="Only buy when close > MA20 > MA60 on 30m bars")
+    p.add_argument("--regime-gate", action="store_true",
+                    help="Suppress entries when market_score <= regime-min-score")
+    p.add_argument("--regime-min-score", type=int, default=4,
+                    help="Minimum market_score to allow entries")
+    p.add_argument("--seg-bsp-boost", action="store_true",
+                    help="Size up 1.5x when segment BSP confirms bi BSP")
+    p.add_argument("--seg-bsp-boost-factor", type=float, default=1.5,
+                    help="Position size multiplier for segment-confirmed entries")
+    p.add_argument("--vol-divergence-filter", action="store_true",
+                    help="Require volume divergence for T1 buys")
+    p.add_argument("--hub-peak-exit", action="store_true",
+                    help="Tighten stop to zs.high when price > zs.peak_high")
+    p.add_argument("--daily-zs-filter", action="store_true",
+                    help="Only enter when price is above nearest daily ZS high")
+    p.add_argument("--daily-bsp-confirm", action="store_true",
+                    help="Boost size 1.5x when 30m buy aligns with daily buy BSP")
+    p.add_argument("--bs-type", default="1,1p,2,2s",
+                    help="Chan BSP types to compute (e.g. '1,2,2s,3a')")
+    p.add_argument("--buy-types", default="T1,T2,T2S",
+                    help="BSP types to accept as buy signals (e.g. 'T1,T2,T2S,T3A')")
     p.add_argument("--out", default="results/chan_portfolio/backtest.json")
     return p.parse_args()
 
@@ -96,12 +118,26 @@ def main():
 
     config = ChanBacktestConfig(
         initial_cash=args.cash,
+        intraday_interval_minutes=args.interval,
         max_positions=args.max_positions,
         exit_mode=args.exit_mode,
         daily_filter=args.daily_filter,
         daily_filter_mode=args.daily_filter_mode,
         daily_db_path=args.daily_db,
         sepa_filter=args.sepa_filter,
+        dead_money_bars=args.dead_money_bars,
+        dead_money_min_gain=args.dead_money_min_gain,
+        ma_trend_filter=args.ma_trend_filter,
+        regime_gate=args.regime_gate,
+        regime_min_score=args.regime_min_score,
+        seg_bsp_boost=args.seg_bsp_boost,
+        seg_bsp_boost_factor=args.seg_bsp_boost_factor,
+        vol_divergence_filter=args.vol_divergence_filter,
+        hub_peak_exit=args.hub_peak_exit,
+        daily_zs_filter=args.daily_zs_filter,
+        daily_bsp_confirm=args.daily_bsp_confirm,
+        chan_bs_type=args.bs_type,
+        buy_types=tuple(args.buy_types.split(",")),
     )
 
     regime_df = None

@@ -1,9 +1,9 @@
-"""chan.py custom DataAPI backed by our DuckDB 30-min warehouse.
+"""chan.py custom DataAPI backed by our DuckDB intraday warehouse.
 
 chan.py expects data via a class that inherits CCommonStockApi and yields
 CKLine_Unit objects from get_kl_data(). This adapter:
 
-1. Queries research_data/intraday_30m.duckdb for a single symbol
+1. Queries a DuckDB intraday warehouse for a single symbol
 2. Filters to regular trading hours (14:30 - 21:00 UTC = 9:30-16:00 EST)
 3. Yields bars in ascending time order as CKLine_Unit
 
@@ -34,6 +34,12 @@ from KLine.KLine_Unit import CKLine_Unit  # noqa: E402
 
 DEFAULT_DB_PATH = "research_data/intraday_30m.duckdb"
 
+INTRADAY_TABLES = {
+    KL_TYPE.K_5M: "bars_5m",
+    KL_TYPE.K_15M: "bars_15m",
+    KL_TYPE.K_30M: "bars_30m",
+}
+
 
 def _hours_filter_for_level(k_type: KL_TYPE) -> tuple[int, int] | None:
     """Return (start_hour_utc, end_hour_utc) window or None for daily+."""
@@ -45,10 +51,10 @@ def _hours_filter_for_level(k_type: KL_TYPE) -> tuple[int, int] | None:
 
 
 class DuckDBIntradayAPI(CCommonStockApi):
-    """Feed chan.py from our 30-min DuckDB warehouse.
+    """Feed chan.py from our intraday DuckDB warehouse.
 
     `code` is the stock ticker (e.g. 'AAPL').
-    `k_type` must match the granularity you're reading — for now, K_30M only.
+    `k_type` must match the granularity you're reading.
     `begin_date` / `end_date` are 'YYYY-MM-DD' strings (chan.py convention).
     """
 
@@ -58,9 +64,11 @@ class DuckDBIntradayAPI(CCommonStockApi):
         super().__init__(code, k_type, begin_date, end_date, autype)
 
     def get_kl_data(self) -> Iterator[CKLine_Unit]:
-        if self.k_type != KL_TYPE.K_30M:
+        table_name = INTRADAY_TABLES.get(self.k_type)
+        if table_name is None:
             raise ValueError(
-                f"DuckDBIntradayAPI only supports K_30M (got {self.k_type})"
+                "DuckDBIntradayAPI only supports intraday levels "
+                f"{tuple(INTRADAY_TABLES.keys())} (got {self.k_type})"
             )
         if not Path(self.DB_PATH).exists():
             raise FileNotFoundError(
@@ -70,9 +78,9 @@ class DuckDBIntradayAPI(CCommonStockApi):
 
         conn = duckdb.connect(self.DB_PATH, read_only=True)
         try:
-            sql = """
+            sql = f"""
                 SELECT ts, open, high, low, close, volume
-                FROM bars_30m
+                FROM {table_name}
                 WHERE symbol = ?
             """
             params: list = [self.code]

@@ -99,6 +99,10 @@ class ChanOrchestrator:
         self._seen_buy_keys: Set[str] = set()
         self._seen_sell_keys: Dict[str, Set[str]] = {}
 
+        self.dead_money_bars = config.get("chan_dead_money_bars", 0)
+        self.dead_money_min_gain = config.get("chan_dead_money_min_gain", 0.05)
+        self.ma_trend_filter = config.get("chan_ma_trend_filter", False)
+
         # C3 regime gate. Off by default to preserve existing chan variant
         # behavior. Set chan_regime_gate_enabled: true + chan_regime_min_score
         # to activate.
@@ -175,6 +179,18 @@ class ChanOrchestrator:
                         account=account, positions=positions,
                     )
                     exit_results.append(result)
+                elif self.dead_money_bars > 0:
+                    dm_signal = self._check_dead_money(pos)
+                    if dm_signal:
+                        result = self._execute_signal(
+                            symbol=symbol, action="SELL",
+                            confidence=0.65,
+                            reasoning=dm_signal,
+                            account=account, positions=positions,
+                        )
+                        exit_results.append(result)
+                    else:
+                        logger.info("%s: HOLD — no sell signal", symbol)
                 else:
                     logger.info("%s: HOLD — no sell signal", symbol)
             except Exception as e:
@@ -246,7 +262,10 @@ class ChanOrchestrator:
                     return entry_results
 
         DuckDBIntradayAPI.DB_PATH = self.intraday_db
-        chan_cfg = CChanConfig(DEFAULT_CHAN_CONFIG.copy())
+        cfg_dict = DEFAULT_CHAN_CONFIG.copy()
+        if self.ma_trend_filter:
+            cfg_dict["mean_metrics"] = [20, 60]
+        chan_cfg = CChanConfig(cfg_dict)
         candidates = sorted(rs_qualifying - held_symbols)
         logger.info("Scanning %d candidates for buy signals...", len(candidates))
 
@@ -637,6 +656,21 @@ class ChanOrchestrator:
             except (KeyError, TypeError):
                 pass
 
+        if self.ma_trend_filter:
+            try:
+                from Common.CEnum import TREND_TYPE
+                last_klu = bars[-1]
+                trend = getattr(last_klu, "trend", {})
+                mean_dict = trend.get(TREND_TYPE.MEAN, {})
+                ma20 = mean_dict.get(20)
+                ma60 = mean_dict.get(60)
+                if ma20 is not None and ma60 is not None:
+                    last_close_val = float(last_klu.close)
+                    if not (last_close_val > ma20 > ma60):
+                        return None
+            except Exception:
+                pass
+
         bi_low = float(latest_bsp.bi.get_begin_val())
         last_close = float(bars[-1].close)
         stop_dist = (last_close - bi_low) / last_close if last_close > bi_low else 0.05
@@ -839,6 +873,31 @@ class ChanOrchestrator:
             "symbol": symbol, "action": action, "traded": True,
             "qty": order_request.qty, "status": order_result.status,
         }
+
+    def _check_dead_money(self, pos: Position) -> Optional[str]:
+        """Return exit reason if position is stale (held too long with weak gain)."""
+        trades = self.db.get_trades_for_symbol(pos.symbol)
+        buy_trades = [t for t in trades if t.get("side") == "buy"]
+        if not buy_trades:
+            return None
+        entry_time_str = buy_trades[0].get("timestamp")
+        if not entry_time_str:
+            return None
+        try:
+            entry_dt = datetime.fromisoformat(str(entry_time_str))
+        except (ValueError, TypeError):
+            return None
+        now = datetime.now()
+        bars_approx = int((now - entry_dt).total_seconds() / 1800)
+        if bars_approx < self.dead_money_bars:
+            return None
+        gain = (pos.current_price - pos.avg_entry_price) / pos.avg_entry_price
+        if gain < self.dead_money_min_gain:
+            return (
+                f"Dead money: held ~{bars_approx} bars "
+                f"({gain:.1%} gain < {self.dead_money_min_gain:.0%} threshold)"
+            )
+        return None
 
     def _find_existing_open_order(self, symbol: str, side: Optional[str] = None):
         getter = getattr(self.broker, "get_open_orders", None)

@@ -39,6 +39,7 @@ log = logging.getLogger("chan_portfolio")
 @dataclass
 class ChanBacktestConfig:
     initial_cash: float = 100_000.0
+    intraday_interval_minutes: int = 30
     max_positions: int = 8
     max_position_pct: float = 0.12
     risk_per_trade: float = 0.01
@@ -52,9 +53,11 @@ class ChanBacktestConfig:
     trail_tighten_atr: float = 0.0  # switch to tight trail after +N ATR (0=off)
     trail_tighten_mult: float = 2.0  # tight trailing stop multiplier (N × ATR from high)
 
+    # Regime-based exposure scaling (1.0 = no throttling).
+    # Use regime_gate for binary entry gating instead (matches live system).
     target_exposure_confirmed_uptrend: float = 1.0
-    target_exposure_uptrend_under_pressure: float = 0.60
-    target_exposure_market_correction: float = 0.0
+    target_exposure_uptrend_under_pressure: float = 1.0
+    target_exposure_market_correction: float = 1.0
 
     chan_divergence_rate: float = 0.8
     chan_macd_algo: str = "area"
@@ -88,6 +91,28 @@ class ChanBacktestConfig:
     rs_lookback_days: int = 126       # ~6 months for RS calculation
     rs_rebalance_days: int = 21       # re-rank every ~1 month
 
+    dead_money_bars: int = 0          # exit if held >= N bars with < min_gain (0=off)
+    dead_money_min_gain: float = 0.05
+
+    ma_trend_filter: bool = False     # only buy when close > MA20 > MA60 on the intraday bar set
+
+    regime_gate: bool = False         # suppress new entries when market_score <= regime_min_score
+    regime_min_score: int = 4
+
+    # P1: Segment BSP boost — size up when bi buy is confirmed by segment buy
+    seg_bsp_boost: bool = False
+    seg_bsp_boost_factor: float = 1.5  # multiply position size by this factor
+
+    # P1: Volume divergence — require volume divergence for T1 buys
+    vol_divergence_filter: bool = False
+
+    # P1: Hub peak exit — tighten stop to zs.high when price exceeds zs.peak_high
+    hub_peak_exit: bool = False
+
+    # P2: Enhanced daily filter — use daily ZS structure instead of simple bi direction
+    daily_zs_filter: bool = False     # require price above nearest daily ZS low
+    daily_bsp_confirm: bool = False   # boost when intraday buy aligns with daily buy BSP
+
 
 @dataclass
 class ChanPortfolioResult:
@@ -119,6 +144,8 @@ class _PendingEntry:
     zs_list: list
     atr: float
     signal_time: str
+    seg_confirmed: bool = False
+    daily_bsp_confirmed: bool = False
 
 
 @dataclass
@@ -131,6 +158,20 @@ class PortfolioChanBacktester:
 
     def __init__(self, config: ChanBacktestConfig | None = None):
         self.config = config or ChanBacktestConfig()
+
+    @staticmethod
+    def _intraday_k_type(interval_minutes: int) -> KL_TYPE:
+        mapping = {
+            5: KL_TYPE.K_5M,
+            15: KL_TYPE.K_15M,
+            30: KL_TYPE.K_30M,
+        }
+        try:
+            return mapping[int(interval_minutes)]
+        except (KeyError, ValueError):
+            raise ValueError(
+                f"Unsupported intraday interval: {interval_minutes}. Expected one of {tuple(mapping)}."
+            )
 
     def backtest_portfolio(
         self,
@@ -158,12 +199,14 @@ class PortfolioChanBacktester:
             "max_bs2_rate": cfg.chan_max_bs2_rate,
             "print_warning": False,
             "zs_algo": "normal",
+            "mean_metrics": [20, 60] if cfg.ma_trend_filter else [],
         })
 
         buy_types_set = set(cfg.buy_types)
 
         daily_directions: dict[str, dict[str, str]] = {}
-        if cfg.daily_filter:
+        need_daily = cfg.daily_filter or cfg.daily_zs_filter or cfg.daily_bsp_confirm
+        if need_daily:
             log.info("Pre-loading daily Chan direction for %d symbols...", len(symbols))
             t0d = time.perf_counter()
             daily_directions = self._preload_daily_direction(symbols, begin, end, cfg)
@@ -187,14 +230,17 @@ class PortfolioChanBacktester:
 
         log.info("Pre-loading %d symbols via step_load()...", len(symbols))
         t0 = time.perf_counter()
-        events = self._preload_events(symbols, begin, end, chan_cfg)
+        events = self._preload_events(symbols, begin, end, chan_cfg, cfg)
         log.info("Pre-loaded %d events in %.1fs", len(events), time.perf_counter() - t0)
 
         regime_dates = None
         regime_values = None
+        regime_scores = None
         if regime_df is not None and not regime_df.empty:
             regime_dates = list(regime_df.index)
             regime_values = list(regime_df["market_regime"])
+            if "market_score" in regime_df.columns:
+                regime_scores = list(regime_df["market_score"])
 
         cash = cfg.initial_cash
         positions: dict[str, _Position] = {}
@@ -220,6 +266,7 @@ class PortfolioChanBacktester:
             cur_time = snapshot_data["time_str"]
             bsp_list = snapshot_data["bsp_list"]
             zs_list = snapshot_data["zs_list"]
+            seg_bsp_list = snapshot_data.get("seg_bsp_list", [])
             atr = snapshot_data["atr"]
 
             last_prices[symbol] = cur_close
@@ -293,11 +340,25 @@ class PortfolioChanBacktester:
                         pending_exits[symbol] = _PendingExit(
                             reason="time_stop", signal_time=cur_time,
                         )
+                    elif (
+                        cfg.dead_money_bars > 0
+                        and pos.bars_held >= cfg.dead_money_bars
+                        and (cur_close - pos.entry_price) / pos.entry_price < cfg.dead_money_min_gain
+                    ):
+                        pending_exits[symbol] = _PendingExit(
+                            reason="dead_money", signal_time=cur_time,
+                        )
 
             # --- Check buy signals → queue for NEXT bar execution ---
             if symbol not in positions and symbol not in pending_entries:
                 daily_ok = True
-                if daily_directions:
+
+                if cfg.regime_gate and regime_scores is not None:
+                    score = self._get_regime_score(ts, regime_dates, regime_scores)
+                    if score is not None and score <= cfg.regime_min_score:
+                        daily_ok = False
+
+                if daily_ok and daily_directions:
                     daily_dir = self._get_daily_direction(daily_directions, symbol, cur_day)
                     if cfg.daily_filter_mode == "bullish_only":
                         if daily_dir != "bullish":
@@ -314,9 +375,29 @@ class PortfolioChanBacktester:
                     if not self._check_rs_pass(rs_data, symbol, cur_day):
                         daily_ok = False
 
+                if daily_ok and cfg.ma_trend_filter:
+                    _ma20 = snapshot_data.get("ma20")
+                    _ma60 = snapshot_data.get("ma60")
+                    if _ma20 is not None and _ma60 is not None:
+                        if not (cur_close > _ma20 > _ma60):
+                            daily_ok = False
+
+                # P2: Daily ZS filter — require price above nearest daily ZS low
+                if daily_ok and cfg.daily_zs_filter and daily_directions:
+                    dd = self._get_daily_data(daily_directions, symbol, cur_day)
+                    if isinstance(dd, dict):
+                        d_zs_list = dd.get("daily_zs", [])
+                        if d_zs_list:
+                            # Price must be above the high of the nearest daily ZS
+                            # (i.e., broken out above the daily consolidation zone)
+                            nearest_dzs = d_zs_list[-1]  # most recent daily ZS
+                            if cur_close < nearest_dzs["high"]:
+                                daily_ok = False
+
                 if daily_ok:
                     buy_sig = self._check_buy_signal(
                         bsp_list, buy_types_set, seen_buy, cfg,
+                        seg_bsp_list=seg_bsp_list,
                     )
                     if buy_sig and cfg.filter_zs_min_bi_cnt > 0:
                         nearest_zs = None
@@ -333,6 +414,13 @@ class PortfolioChanBacktester:
                         if stop > 0 and (cur_close - stop) / cur_close < cfg.min_stop_pct:
                             buy_sig = None
                     if buy_sig:
+                        # P2: Check daily BSP confirmation
+                        _daily_bsp = False
+                        if cfg.daily_bsp_confirm and daily_directions:
+                            dd = self._get_daily_data(daily_directions, symbol, cur_day)
+                            if isinstance(dd, dict) and dd.get("has_daily_buy"):
+                                _daily_bsp = True
+
                         pending_entries[symbol] = _PendingEntry(
                             symbol=symbol,
                             bsp_types=buy_sig["types_str"],
@@ -340,6 +428,8 @@ class PortfolioChanBacktester:
                             zs_list=zs_list,
                             atr=atr,
                             signal_time=cur_time,
+                            seg_confirmed=buy_sig.get("seg_confirmed", False),
+                            daily_bsp_confirmed=_daily_bsp,
                         )
 
             # --- Daily snapshot ---
@@ -387,14 +477,18 @@ class PortfolioChanBacktester:
 
     def _preload_events(
         self, symbols: list[str], begin: str, end: str, chan_cfg: CChanConfig,
+        cfg: ChanBacktestConfig | None = None,
     ) -> list[tuple[datetime, str, dict]]:
+        if cfg is None:
+            cfg = ChanBacktestConfig()
+        intraday_k_type = self._intraday_k_type(cfg.intraday_interval_minutes)
         events = []
         for sym in symbols:
             try:
                 chan = CChan(
                     code=sym, begin_time=begin, end_time=end,
                     data_src="custom:DuckDBAPI.DuckDB30mAPI",
-                    lv_list=[KL_TYPE.K_30M], config=chan_cfg, autype=AUTYPE.QFQ,
+                    lv_list=[intraday_k_type], config=chan_cfg, autype=AUTYPE.QFQ,
                 )
                 hlc_history: list[tuple[float, float, float]] = []
                 bar_idx = 0
@@ -425,11 +519,15 @@ class PortfolioChanBacktester:
                     zs_data = []
                     try:
                         for zs in lvl.zs_list:
-                            zs_data.append({
+                            zsd = {
                                 "low": float(zs.low),
                                 "high": float(zs.high),
                                 "bi_cnt": len(zs.bi_lst),
-                            })
+                            }
+                            if cfg.hub_peak_exit:
+                                zsd["peak_high"] = float(zs.peak_high)
+                                zsd["peak_low"] = float(zs.peak_low)
+                            zs_data.append(zsd)
                     except Exception:
                         pass
 
@@ -445,6 +543,14 @@ class PortfolioChanBacktester:
                             _div_rate = float(bsp.features['divergence_rate'])
                         except (KeyError, TypeError):
                             _div_rate = None
+                        # P1: Volume divergence metric (only compute when needed)
+                        _vol_metric = None
+                        if cfg.vol_divergence_filter:
+                            try:
+                                from Common.CEnum import MACD_ALGO
+                                _vol_metric = float(bsp.bi.cal_macd_metric(MACD_ALGO.VOLUMN, is_reverse=bsp.is_buy))
+                            except Exception:
+                                pass
                         bsp_data.append({
                             "is_buy": bsp.is_buy,
                             "is_sure": bsp.bi.is_sure,
@@ -455,7 +561,39 @@ class PortfolioChanBacktester:
                             "macd_dea": _macd_dea,
                             "bi_klu_cnt": bsp.bi.get_klu_cnt(),
                             "divergence_rate": _div_rate,
+                            "vol_metric": _vol_metric,
                         })
+
+                    # P1: Extract segment-level BSPs (only when needed)
+                    seg_bsp_data = []
+                    if cfg.seg_bsp_boost:
+                        try:
+                            _seg_bsp_obj = lvl.seg_bs_point_lst
+                            for seg_bsp in _seg_bsp_obj.bsp1_list:
+                                seg_bsp_data.append({
+                                    "is_buy": seg_bsp.is_buy,
+                                    "klu_idx": seg_bsp.klu.idx,
+                                })
+                            for klu_idx, seg_bsp in _seg_bsp_obj.bsp_store_flat_dict.items():
+                                if klu_idx not in {s["klu_idx"] for s in seg_bsp_data}:
+                                    seg_bsp_data.append({
+                                        "is_buy": seg_bsp.is_buy,
+                                        "klu_idx": seg_bsp.klu.idx,
+                                    })
+                        except Exception:
+                            pass
+
+                    # Extract MA trend values if computed
+                    ma20 = None
+                    ma60 = None
+                    try:
+                        from Common.CEnum import TREND_TYPE
+                        trend = getattr(cur_klu, "trend", {})
+                        mean_dict = trend.get(TREND_TYPE.MEAN, {})
+                        ma20 = mean_dict.get(20)
+                        ma60 = mean_dict.get(60)
+                    except Exception:
+                        pass
 
                     ct = cur_klu.time
                     ts = datetime(ct.year, ct.month, ct.day, ct.hour, ct.minute)
@@ -468,8 +606,11 @@ class PortfolioChanBacktester:
                         "time_str": cur_time_str,
                         "bsp_list": bsp_data,
                         "zs_list": zs_data,
+                        "seg_bsp_list": seg_bsp_data,
                         "atr": atr,
                         "bar_idx": bar_idx,
+                        "ma20": ma20,
+                        "ma60": ma60,
                     }))
             except Exception as e:
                 log.warning("Failed to load %s: %s", sym, e)
@@ -513,7 +654,14 @@ class PortfolioChanBacktester:
                 zs_stop = None
                 for zs in reversed(zs_list):
                     if zs["low"] < pos.entry_price:
-                        zs_stop = zs["low"]
+                        # P1: Hub peak exit — if price has exceeded peak_high,
+                        # tighten stop to zs.high (hub ceiling) instead of zs.low
+                        if (cfg.hub_peak_exit
+                                and "peak_high" in zs
+                                and pos.high_since_entry > zs["peak_high"]):
+                            zs_stop = zs["high"]
+                        else:
+                            zs_stop = zs["low"]
                         break
                 bi_stop = pos.entry_bi_low if pos.entry_bi_low > 0 else None
 
@@ -616,6 +764,7 @@ class PortfolioChanBacktester:
     def _check_buy_signal(
         bsp_list: list[dict], buy_types_set: set, seen_buy: set,
         cfg: ChanBacktestConfig,
+        seg_bsp_list: list[dict] | None = None,
     ) -> dict | None:
         for bsp in bsp_list:
             if not bsp["is_buy"]:
@@ -647,9 +796,27 @@ class PortfolioChanBacktester:
                 if div is not None and div > cfg.filter_divergence_max:
                     continue
 
+            # P1: Volume divergence — for T1, require vol_metric < 0
+            # (volume declining = bearish exhaustion = valid reversal)
+            if cfg.vol_divergence_filter and is_t1:
+                vol = bsp.get("vol_metric")
+                if vol is not None and vol >= 0:
+                    continue
+
+            # P1: Check if a segment buy BSP confirms this bi buy
+            seg_confirmed = False
+            if seg_bsp_list:
+                bsp_klu_idx = bsp["klu_idx"]
+                for seg_bsp in seg_bsp_list:
+                    if seg_bsp["is_buy"] and abs(seg_bsp["klu_idx"] - bsp_klu_idx) <= 5:
+                        seg_confirmed = True
+                        break
+
             return {
                 "types_str": ",".join(sorted(types_set)),
                 "bi_low": bsp["bi_low"],
+                "seg_confirmed": seg_confirmed,
+                "vol_metric": bsp.get("vol_metric"),
             }
         return None
 
@@ -680,6 +847,16 @@ class PortfolioChanBacktester:
             vol_scale = min(1.0, cfg.vol_target_atr_pct / atr_pct)
             per_position_cap *= vol_scale
         risk_budget = portfolio_value * cfg.risk_per_trade
+
+        # P1: Segment BSP boost — increase allocation when confirmed
+        if cfg.seg_bsp_boost and pending.seg_confirmed:
+            per_position_cap *= cfg.seg_bsp_boost_factor
+            risk_budget *= cfg.seg_bsp_boost_factor
+
+        # P2: Daily BSP confirmation boost — 1.5x when daily BSP aligns
+        if cfg.daily_bsp_confirm and pending.daily_bsp_confirmed:
+            per_position_cap *= 1.5
+            risk_budget *= 1.5
 
         max_shares_cap = int(per_position_cap / actual_entry)
         max_shares_risk = int(risk_budget / risk_per_share)
@@ -740,6 +917,19 @@ class PortfolioChanBacktester:
         return regime_values[idx]
 
     @staticmethod
+    def _get_regime_score(
+        ts: datetime, regime_dates: list | None, regime_scores: list | None,
+    ) -> int | None:
+        if regime_dates is None or regime_scores is None:
+            return None
+        date = pd.Timestamp(ts.date())
+        idx = bisect_right(regime_dates, date) - 1
+        if idx < 0:
+            return None
+        val = regime_scores[idx]
+        return int(val) if pd.notna(val) else None
+
+    @staticmethod
     def _target_exposure(regime: str, cfg: ChanBacktestConfig) -> float:
         mapping = {
             "confirmed_uptrend": cfg.target_exposure_confirmed_uptrend,
@@ -765,6 +955,8 @@ class PortfolioChanBacktester:
             "print_warning": False,
             "zs_algo": "normal",
         })
+
+        extract_zs = cfg.daily_zs_filter or cfg.daily_bsp_confirm
 
         result: dict[str, dict[str, str]] = {}
         for sym in symbols:
@@ -797,11 +989,39 @@ class PortfolioChanBacktester:
                                 break
 
                     if last_sure_dir == BI_DIR.UP:
-                        sym_dir[date_str] = "bullish"
+                        direction = "bullish"
                     elif last_sure_dir == BI_DIR.DOWN:
-                        sym_dir[date_str] = "bearish"
+                        direction = "bearish"
                     else:
-                        sym_dir[date_str] = "neutral"
+                        direction = "neutral"
+
+                    if extract_zs:
+                        # Extract daily ZS levels and BSPs
+                        daily_zs = []
+                        for zs in lvl.zs_list:
+                            daily_zs.append({
+                                "low": float(zs.low),
+                                "high": float(zs.high),
+                            })
+                        close = float(cur_klu.close)
+                        # Check if latest BSP is a buy (within last 5 daily bars)
+                        has_daily_buy = False
+                        try:
+                            bsp_list = snapshot.get_latest_bsp(idx=0, number=10)
+                            for bsp in bsp_list:
+                                if bsp.is_buy and bsp.bi.is_sure:
+                                    has_daily_buy = True
+                                    break
+                        except Exception:
+                            pass
+                        sym_dir[date_str] = {
+                            "direction": direction,
+                            "daily_zs": daily_zs,
+                            "close": close,
+                            "has_daily_buy": has_daily_buy,
+                        }
+                    else:
+                        sym_dir[date_str] = direction
 
                 result[sym] = sym_dir
             except Exception as e:
@@ -810,12 +1030,13 @@ class PortfolioChanBacktester:
         return result
 
     @staticmethod
-    def _get_daily_direction(
-        daily_directions: dict[str, dict[str, str]], symbol: str, bar_date: str,
-    ) -> str:
-        """Look up daily direction for a symbol on a given date.
+    def _get_daily_data(
+        daily_directions: dict, symbol: str, bar_date: str,
+    ):
+        """Look up daily data for a symbol on a given date.
 
-        If exact date not found (weekends, gaps), use the most recent prior date.
+        Returns either a string ("bullish"/"bearish"/"neutral") or a dict
+        with rich daily structure, depending on the preload mode.
         """
         sym_dir = daily_directions.get(symbol)
         if not sym_dir:
@@ -827,6 +1048,18 @@ class PortfolioChanBacktester:
         if idx < 0:
             return "neutral"
         return sym_dir[dates[idx]]
+
+    @staticmethod
+    def _get_daily_direction(
+        daily_directions: dict, symbol: str, bar_date: str,
+    ) -> str:
+        """Look up daily direction string for a symbol on a given date."""
+        data = PortfolioChanBacktester._get_daily_data(
+            daily_directions, symbol, bar_date,
+        )
+        if isinstance(data, dict):
+            return data.get("direction", "neutral")
+        return data
 
     def _preload_sepa_trend(
         self, symbols: list[str], begin: str, end: str, cfg: ChanBacktestConfig,

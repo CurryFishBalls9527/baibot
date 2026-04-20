@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class WalkForwardConfig:
-    rebalance_frequency: str = "weekly"  # "weekly" or "monthly"
+    rebalance_frequency: str = "weekly"  # "daily", "weekly", or "monthly"
     min_template_score: int = 6
     min_rs_percentile: float = 70.0
     min_data_bars: int = 252  # require 1yr history for indicators
@@ -212,7 +212,9 @@ class WalkForwardBacktester:
     ) -> list[pd.Timestamp]:
         """Generate rebalance dates based on frequency config."""
         freq = self.wf_config.rebalance_frequency
-        if freq == "weekly":
+        if freq == "daily":
+            dates = pd.date_range(start, end, freq="B")
+        elif freq == "weekly":
             dates = pd.date_range(start, end, freq="W-FRI")
         elif freq == "monthly":
             dates = pd.date_range(start, end, freq="BMS")
