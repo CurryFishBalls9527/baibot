@@ -121,6 +121,37 @@ class ABRunnerParallelismTests(unittest.TestCase):
         self.assertGreaterEqual(elapsed, 0.55,
                                 f"expected serialized (>=0.55s), got {elapsed:.2f}s")
 
+    def test_minervini_variants_serialize_on_shared_market_data_db(self):
+        """Minervini variants sharing market_data.duckdb must run sequentially.
+
+        Prevents the `TransactionContext Error: Conflict on tuple deletion!` /
+        `Cannot set a DataFrame with multiple columns to the single column
+        adj_close` regression where mechanical + llm + mechanical_v2 all raced
+        to write to the shared DuckDB warehouse during preflight.
+        """
+        with patch(
+            "tradingagents.automation.orchestrator.Orchestrator",
+            _FakeMechanical,
+        ):
+            m1 = _FakeMechanical("mech1",         sleep_s=0.3)
+            m2 = _FakeMechanical("mech_llm",      sleep_s=0.3)
+            m3 = _FakeMechanical("mechanical_v2", sleep_s=0.3)
+            # _shared_writer_key reads orch.config for the minervini_db_path;
+            # give each the same default so they group together.
+            shared_config = {"minervini_db_path": "research_data/market_data.duckdb"}
+            m1.config = shared_config
+            m2.config = shared_config
+            m3.config = shared_config
+            runner = _build_runner({"mech1": m1, "llm": m2, "mechanical_v2": m3})
+            start = time.perf_counter()
+            results = runner.run_daily_analysis()
+            elapsed = time.perf_counter() - start
+
+        self.assertEqual(set(results.keys()), {"mech1", "llm", "mechanical_v2"})
+        # Three 0.3s jobs serialized on the same writer → at least 0.85s
+        self.assertGreaterEqual(elapsed, 0.85,
+                                f"expected serialized (>=0.85s), got {elapsed:.2f}s")
+
     def test_mixed_variants_serialize_chan_group_only(self):
         """Chan+chan_v2 serialize; mechanical runs in parallel with the group."""
         with self._patch_chan_isinstance():

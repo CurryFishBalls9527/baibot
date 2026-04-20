@@ -33,14 +33,25 @@ def _shared_writer_key(orch) -> str:
     """Identify the DuckDB writer path a variant contends on, if any.
 
     Variants returning the same key serialize against each other; variants
-    with distinct keys run in parallel. Only Chan orchestrators share a
-    DuckDB writer today (intraday_30m_broad.duckdb between chan + chan_v2).
-    Intraday mechanical fetches bars per-scan directly from Alpaca so it has
-    no shared writer.
+    with distinct keys run in parallel.
+
+    Chan variants (chan, chan_v2) contend on intraday_30m_broad.duckdb.
+    Minervini variants (mechanical, llm, mechanical_v2) contend on
+    market_data.duckdb during preflight's fetch_and_store_daily_bars —
+    concurrent writers produce DuckDB transaction conflicts and corrupt
+    the yfinance shared session state (surfaces as "Cannot set a DataFrame
+    with multiple columns to the single column adj_close"). IntradayOrchestrator
+    fetches bars per-scan directly from Alpaca so it has no shared writer.
     """
     from tradingagents.automation.chan_orchestrator import ChanOrchestrator
+    from tradingagents.automation.orchestrator import Orchestrator
     if isinstance(orch, ChanOrchestrator):
         return f"chan_intraday:{orch.intraday_db}"
+    if isinstance(orch, Orchestrator):
+        db_path = orch.config.get(
+            "minervini_db_path", "research_data/market_data.duckdb"
+        )
+        return f"minervini:{db_path}"
     return f"indep:{id(orch)}"
 
 
