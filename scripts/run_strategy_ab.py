@@ -52,6 +52,20 @@ from scripts.freeze_baseline import build_current_live_config, build_research_co
 # Registered changes: each is a dict of BacktestConfig field overrides.
 # New changes added here as the rollout progresses (#2, #3, ...).
 CHANGES = {
+    # Post-B4L cleanup sweep: change timing of candidate admission rather than
+    # tightening screens. Hypothesis: weekly snapshots may miss fast-moving
+    # breakout/leader-continuation setups that age out before Friday.
+    "rebalance_daily": {"rebalance_frequency": "daily"},
+    "rebalance_monthly": {"rebalance_frequency": "monthly"},
+    # Post-B4L regime-dependent entries/exposure: align the research posture in
+    # "uptrend under pressure" with the live automation setting (0.48 instead
+    # of the backtester default 0.60). This reduces aggression in the regime
+    # where false breakouts are most common without adding more entry filters.
+    "pressure_exposure_48": {"target_exposure_uptrend_under_pressure": 0.48},
+    # Post-B4L sizing test: use the dormant realized-vol targeting machinery to
+    # scale the whole strategy's exposure inversely with recent realized vol.
+    # This changes sizing, not entry selection.
+    "vol_target_15": {"vol_target_enabled": True, "vol_target_annual": 0.15},
     "chandelier_exit": {"use_chandelier_exit": True, "chandelier_atr_multiple": 3.0},
     "chandelier_2_5x": {"use_chandelier_exit": True, "chandelier_atr_multiple": 2.5},
     "chandelier_3_5x": {"use_chandelier_exit": True, "chandelier_atr_multiple": 3.5},
