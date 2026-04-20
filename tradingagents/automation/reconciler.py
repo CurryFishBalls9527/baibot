@@ -95,6 +95,151 @@ class OrderReconciler:
         ).fetchall()
         return [dict(r) for r in rows if _is_open(r["status"])]
 
+    def _fetch_recent_buys(self) -> List[dict]:
+        cutoff = (datetime.utcnow() - timedelta(days=self.lookback_days)).isoformat()
+        rows = self.db.conn.execute(
+            """
+            SELECT id, symbol, qty, order_id, timestamp
+            FROM trades
+            WHERE side = 'buy' AND order_id IS NOT NULL AND timestamp >= ?
+            ORDER BY timestamp DESC
+            """,
+            (cutoff,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def _leg_already_logged(self, order_id: str) -> bool:
+        row = self.db.conn.execute(
+            "SELECT 1 FROM trades WHERE order_id = ? LIMIT 1", (order_id,)
+        ).fetchone()
+        return row is not None
+
+    def _insert_leg_fill(
+        self, parent_symbol: str, label: str, leg, parent_variant: str | None
+    ) -> None:
+        """Insert a SELL row for a filled bracket leg.
+
+        `label` is 'stop_loss' or 'take_profit'. Uses the leg's filled_at as
+        timestamp when available so trade history reflects actual fill time,
+        not reconcile time. Strips the 'OrderStatus.' enum prefix for consistency
+        with how the orchestrator writes the field.
+        """
+        filled_qty = float(leg.filled_qty or 0)
+        filled_price = (
+            float(leg.filled_avg_price) if leg.filled_avg_price is not None else None
+        )
+        status_str = str(leg.status)
+        if status_str.startswith("OrderStatus."):
+            status_str = status_str.split(".", 1)[1].lower()
+        ts = getattr(leg, "filled_at", None)
+        timestamp = (
+            ts.isoformat() if hasattr(ts, "isoformat") else datetime.utcnow().isoformat()
+        )
+        self.db.conn.execute(
+            """
+            INSERT INTO trades (
+                timestamp, symbol, side, qty, notional, order_type, status,
+                filled_qty, filled_price, order_id, signal_id, reasoning, variant
+            ) VALUES (?, ?, 'sell', ?, NULL, ?, ?, ?, ?, ?, NULL, ?, ?)
+            """,
+            (
+                timestamp,
+                parent_symbol,
+                float(leg.qty) if leg.qty else filled_qty,
+                "stop" if label == "stop_loss" else "limit",
+                status_str,
+                filled_qty,
+                filled_price,
+                str(leg.order_id),
+                f"bracket_{label}",
+                parent_variant or self.variant,
+            ),
+        )
+        self.db.conn.commit()
+
+    def _sweep_bracket_legs(self) -> dict:
+        """Pull bracket child fills into the local DB.
+
+        Entry orders record the parent order_id only; SL/TP legs fire
+        broker-side under their own order_ids and never reach SQLite. Without
+        this sweep, the trades table shows buys only and the dashboard history
+        is misleading. Pass is idempotent — skips any leg_id already logged.
+        """
+        checked = 0
+        inserted = 0
+        errors = 0
+        for parent in self._fetch_recent_buys():
+            try:
+                remote = self.broker.get_order(parent["order_id"])
+            except Exception as e:
+                errors += 1
+                logger.debug(
+                    "reconciler: sweep get_order(%s) failed: %s",
+                    parent["order_id"],
+                    e,
+                )
+                continue
+            for label, leg_id in (
+                ("stop_loss", remote.stop_order_id),
+                ("take_profit", remote.tp_order_id),
+            ):
+                # Defensive: broker adapters should return str or None, but
+                # mocks / unexpected types shouldn't reach the sqlite bind.
+                if not isinstance(leg_id, str) or not leg_id:
+                    continue
+                if self._leg_already_logged(leg_id):
+                    continue
+                try:
+                    leg = self.broker.get_order(leg_id)
+                except Exception as e:
+                    errors += 1
+                    logger.debug(
+                        "reconciler: sweep get_order(leg %s) failed: %s", leg_id, e
+                    )
+                    continue
+                checked += 1
+                status_l = (leg.status or "").lower()
+                is_terminal = (
+                    ("filled" in status_l and "partially" not in status_l)
+                    or any(
+                        t in status_l
+                        for t in ("canceled", "cancelled", "expired", "rejected")
+                    )
+                )
+                if not is_terminal:
+                    continue
+                # Skip zero-fill cancellations (losing side of OCO / replaced
+                # legs). They didn't move shares and clutter the history.
+                if float(leg.filled_qty or 0) == 0 and (
+                    "canceled" in status_l or "cancelled" in status_l
+                ):
+                    continue
+                try:
+                    # Use the parent row's variant to stay consistent across
+                    # multi-variant DBs, falling back to reconciler-level default.
+                    parent_variant = self.db.conn.execute(
+                        "SELECT variant FROM trades WHERE id = ?", (parent["id"],)
+                    ).fetchone()
+                    variant = parent_variant[0] if parent_variant else None
+                    self._insert_leg_fill(parent["symbol"], label, leg, variant)
+                    inserted += 1
+                    logger.info(
+                        "reconciler[%s] bracket leg backfilled: %s %s %s "
+                        "qty=%s @ %s",
+                        self.variant or "-",
+                        parent["symbol"],
+                        label,
+                        leg_id[:8],
+                        leg.filled_qty,
+                        leg.filled_avg_price,
+                    )
+                except Exception as e:
+                    errors += 1
+                    logger.warning(
+                        "reconciler: insert leg fill (%s) failed: %s", leg_id, e
+                    )
+        return {"checked_legs": checked, "inserted": inserted, "errors": errors}
+
     def reconcile_once(self) -> dict:
         """Single reconciliation pass. Returns summary dict."""
         rows = self._fetch_open_trades()
@@ -184,20 +329,27 @@ class OrderReconciler:
                 except Exception:
                     pass
 
+        leg_summary = self._sweep_bracket_legs()
+
         summary = {
             "variant": self.variant,
             "checked": checked,
             "drifted": drifted,
             "updated": updated,
-            "errors": errors,
+            "errors": errors + leg_summary["errors"],
+            "leg_checked": leg_summary["checked_legs"],
+            "leg_inserted": leg_summary["inserted"],
         }
-        if checked:
+        if checked or leg_summary["inserted"]:
             logger.info(
-                "reconciler[%s] summary: checked=%d drifted=%d updated=%d errors=%d",
+                "reconciler[%s] summary: checked=%d drifted=%d updated=%d "
+                "errors=%d leg_checked=%d leg_inserted=%d",
                 self.variant or "-",
                 checked,
                 drifted,
                 updated,
-                errors,
+                summary["errors"],
+                leg_summary["checked_legs"],
+                leg_summary["inserted"],
             )
         return summary

@@ -83,11 +83,14 @@ def test_reconcile_no_drift_no_update(tmp_path):
         order_id="ok-999",
     )
     broker = MagicMock()
+    # Mock order has MagicMock stop/tp_order_id; sweep must skip non-str legs.
     rec = OrderReconciler(broker=broker, db=db, variant="mechanical")
     result = rec.reconcile_once()
-    # Filled already → not in open set; broker should never be called.
+    # Filled already → not in drift-pass open set.
     assert result["checked"] == 0
-    broker.get_order.assert_not_called()
+    # Bracket-leg sweep still probes the filled parent, but MagicMock leg_ids
+    # are rejected defensively and no sell rows are inserted.
+    assert result["leg_inserted"] == 0
 
 
 def test_reconcile_skips_rows_without_order_id(tmp_path):
@@ -121,7 +124,8 @@ def test_reconcile_handles_broker_error(tmp_path):
     rec = OrderReconciler(broker=broker, db=db, variant="mechanical")
     result = rec.reconcile_once()
     assert result["checked"] == 1
-    assert result["errors"] == 1
+    # Broker error hits both drift pass and sweep pass (same symbol) → 2 errs.
+    assert result["errors"] == 2
     assert result["updated"] == 0
     # Local row untouched.
     row = db.conn.execute(

@@ -169,18 +169,7 @@ class AlpacaBroker(BaseBroker):
             f"Bracket order: BUY {order.qty} {order.symbol} "
             f"SL=${stop_loss_price:.2f} TP=${take_profit_price:.2f} -> {result.status}"
         )
-        out = self._to_order_result(result)
-        # Alpaca returns child orders on the parent response's `legs` attribute.
-        # Stop leg has stop_price; take-profit leg has limit_price and no stop_price.
-        legs = getattr(result, "legs", None) or []
-        for leg in legs:
-            leg_stop = getattr(leg, "stop_price", None)
-            leg_limit = getattr(leg, "limit_price", None)
-            if leg_stop and out.stop_order_id is None:
-                out.stop_order_id = str(leg.id)
-            elif leg_limit and out.tp_order_id is None:
-                out.tp_order_id = str(leg.id)
-        return out
+        return self._to_order_result(result)
 
     def cancel_order(self, order_id: str) -> None:
         self.trading_client.cancel_order_by_id(order_id)
@@ -230,7 +219,7 @@ class AlpacaBroker(BaseBroker):
 
     @staticmethod
     def _to_order_result(o) -> OrderResult:
-        return OrderResult(
+        out = OrderResult(
             order_id=str(o.id),
             symbol=o.symbol,
             side=str(o.side),
@@ -243,6 +232,14 @@ class AlpacaBroker(BaseBroker):
             submitted_at=o.submitted_at,
             filled_at=o.filled_at,
         )
+        for leg in getattr(o, "legs", None) or []:
+            leg_stop = getattr(leg, "stop_price", None)
+            leg_limit = getattr(leg, "limit_price", None)
+            if leg_stop and out.stop_order_id is None:
+                out.stop_order_id = str(leg.id)
+            elif leg_limit and out.tp_order_id is None:
+                out.tp_order_id = str(leg.id)
+        return out
 
     # ── Close Positions ──────────────────────────────────────────────
 
