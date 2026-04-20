@@ -59,6 +59,11 @@ def parse_args():
     p.add_argument("--max-position-pct", type=float, default=0.10)
     p.add_argument("--stop-loss-pct", type=float, default=0.03)
     p.add_argument("--trail-stop-pct", type=float, default=0.04)
+    p.add_argument("--use-atr-stops", action="store_true",
+                   help="Use ATR-based stop and trail instead of fixed % stops.")
+    p.add_argument("--atr-period-bars", type=int, default=14)
+    p.add_argument("--atr-stop-multiplier", type=float, default=1.0)
+    p.add_argument("--atr-trail-multiplier", type=float, default=2.0)
     p.add_argument("--opening-range-bars", type=int, default=1)
     p.add_argument("--min-opening-range-pct", type=float, default=0.0)
     p.add_argument("--min-breakout-distance-pct", type=float, default=0.0)
@@ -164,6 +169,10 @@ def build_config(args) -> IntradayBacktestConfig:
         max_position_pct=args.max_position_pct,
         stop_loss_pct=args.stop_loss_pct,
         trail_stop_pct=args.trail_stop_pct,
+        use_atr_stops=args.use_atr_stops,
+        atr_period_bars=args.atr_period_bars,
+        atr_stop_multiplier=args.atr_stop_multiplier,
+        atr_trail_multiplier=args.atr_trail_multiplier,
         opening_range_bars=args.opening_range_bars,
         min_opening_range_pct=args.min_opening_range_pct,
         min_breakout_distance_pct=args.min_breakout_distance_pct,

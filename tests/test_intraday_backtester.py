@@ -1651,3 +1651,165 @@ def test_backtest_execution_cost_shrinks_pnl(monkeypatch):
     )
     assert zero_cost > 0
     assert with_cost < zero_cost
+
+
+def test_backtest_atr_stop_triggers_when_low_pierces_atr_band(monkeypatch):
+    """With use_atr_stops=True, a bar whose low dips below entry - 1*ATR exits."""
+    config = IntradayBacktestConfig(
+        min_volume_ratio=0.0,
+        require_above_vwap=False,
+        stop_loss_pct=0.50,  # very loose % stop — forces ATR path to be the binding one
+        use_atr_stops=True,
+        atr_stop_multiplier=1.0,
+        atr_trail_multiplier=5.0,
+    )
+    backtester = IntradayBreakoutBacktester(config)
+    index = pd.to_datetime(
+        [
+            "2026-04-01 08:30:00",
+            "2026-04-01 09:00:00",
+            "2026-04-01 09:30:00",
+            "2026-04-01 10:00:00",
+        ]
+    )
+    frame = pd.DataFrame({"open": [100.0, 100.0, 100.0, 99.5]}, index=index)
+    prepared = pd.DataFrame(
+        {
+            "open":  [100.0, 100.0, 100.0, 99.5],   # open above stop so exit fills at stop
+            "high":  [100.5, 100.5, 100.2, 99.6],
+            "low":   [99.5,  99.8,  99.9,  98.3],   # bar 3 low 98.3 < (100 - 1*1.0) = 99
+            "close": [100.0, 100.2, 100.0, 98.8],
+            "volume": [1000, 1000, 1000, 1000],
+            "atr":   [1.0,   1.0,   1.0,   1.0],    # $1 ATR per bar
+            "session_date": [index[0].date()] * 4,
+            "bar_in_session": [0, 1, 2, 3],
+            "next_open": [100.0, 100.0, 98.0, pd.NA],
+            "next_ts":   [index[1], index[2], index[3], pd.NaT],
+            "is_last_bar": [False, False, False, True],
+            "opening_range_high": [100.5] * 4,
+            "opening_range_low":  [99.5] * 4,
+            "opening_range_pct":  [0.01] * 4,
+            "breakout_distance_pct":   [0.0, 0.0, 0.0, -0.02],
+            "distance_from_vwap_pct":  [0.0, 0.002, 0.0, -0.02],
+            "prior_bar_high": [pd.NA, 100.5, 100.5, 100.2],
+            "prior_bar_low":  [pd.NA, 99.5,  99.8,  99.9],
+            "vwap":           [100.0, 100.0, 100.0, 99.5],
+            "avg_volume_20":  [1000.0] * 4,
+            "volume_ratio":   [1.0, 1.0, 1.0, 1.0],
+            "entry_signal":   [False, True, False, False],
+            "setup_family":   ["none", "opening_drive_continuation", "none", "none"],
+            "candidate_score": [0.0, 2.0, 0.0, 0.0],
+        },
+        index=index,
+    )
+
+    monkeypatch.setattr(backtester, "_load_intraday_bars", lambda db_path, symbols, begin, end: {"AAA": frame})
+    monkeypatch.setattr(backtester, "_load_daily_trend_filter", lambda symbols, begin, end: {})
+    monkeypatch.setattr(backtester, "_prepare_symbol_features", lambda df: prepared)
+
+    result = backtester.backtest_portfolio(["AAA"], "2026-04-01", "2026-04-01", "dummy.duckdb")
+
+    assert len(result.trades) == 1
+    trade = result.trades.iloc[0]
+    assert trade["exit_reason"] == "stop"
+    # Entry fills at next bar open = $100; ATR=1; stop = 99. Bar 3 low = 98.3 pierces it.
+    assert abs(float(trade["entry_price"]) - 100.0) < 1e-6
+    assert abs(float(trade["exit_price"]) - 99.0) < 1e-6
+
+
+def test_backtest_atr_falls_back_to_pct_when_atr_missing(monkeypatch):
+    """If the atr column is NaN at entry, stop placement falls back to stop_loss_pct."""
+    config = IntradayBacktestConfig(
+        min_volume_ratio=0.0,
+        require_above_vwap=False,
+        stop_loss_pct=0.03,
+        use_atr_stops=True,
+        atr_stop_multiplier=1.0,
+    )
+    backtester = IntradayBreakoutBacktester(config)
+    index = pd.to_datetime(
+        [
+            "2026-04-01 08:30:00",
+            "2026-04-01 09:00:00",
+            "2026-04-01 09:30:00",
+            "2026-04-01 10:00:00",
+        ]
+    )
+    frame = pd.DataFrame({"open": [100.0, 100.0, 100.0, 99.0]}, index=index)
+    prepared = pd.DataFrame(
+        {
+            "open":  [100.0, 100.0, 100.0, 99.0],
+            "high":  [100.5, 100.5, 100.2, 99.2],
+            "low":   [99.5,  99.8,  99.9,  96.4],   # bar 3 low 96.4 < 97 (3% stop from 100)
+            "close": [100.0, 100.2, 100.0, 96.9],
+            "volume": [1000, 1000, 1000, 1000],
+            "atr":   [pd.NA, pd.NA, pd.NA, pd.NA],  # ATR not yet defined
+            "session_date": [index[0].date()] * 4,
+            "bar_in_session": [0, 1, 2, 3],
+            "next_open": [100.0, 100.0, 96.5, pd.NA],
+            "next_ts":   [index[1], index[2], index[3], pd.NaT],
+            "is_last_bar": [False, False, False, True],
+            "opening_range_high": [100.5] * 4,
+            "opening_range_low":  [99.5] * 4,
+            "opening_range_pct":  [0.01] * 4,
+            "breakout_distance_pct":   [0.0, 0.0, 0.0, -0.035],
+            "distance_from_vwap_pct":  [0.0, 0.002, 0.0, -0.03],
+            "prior_bar_high": [pd.NA, 100.5, 100.5, 100.2],
+            "prior_bar_low":  [pd.NA, 99.5,  99.8,  99.9],
+            "vwap":           [100.0, 100.0, 100.0, 99.5],
+            "avg_volume_20":  [1000.0] * 4,
+            "volume_ratio":   [1.0, 1.0, 1.0, 1.0],
+            "entry_signal":   [False, True, False, False],
+            "setup_family":   ["none", "opening_drive_continuation", "none", "none"],
+            "candidate_score": [0.0, 2.0, 0.0, 0.0],
+        },
+        index=index,
+    )
+
+    monkeypatch.setattr(backtester, "_load_intraday_bars", lambda db_path, symbols, begin, end: {"AAA": frame})
+    monkeypatch.setattr(backtester, "_load_daily_trend_filter", lambda symbols, begin, end: {})
+    monkeypatch.setattr(backtester, "_prepare_symbol_features", lambda df: prepared)
+
+    result = backtester.backtest_portfolio(["AAA"], "2026-04-01", "2026-04-01", "dummy.duckdb")
+
+    assert len(result.trades) == 1
+    trade = result.trades.iloc[0]
+    assert trade["exit_reason"] == "stop"
+    # Fallback: 3% stop from entry 100 = 97.
+    assert abs(float(trade["exit_price"]) - 97.0) < 1e-6
+
+
+def test_prepare_symbol_features_computes_atr_column():
+    """ATR is a rolling mean of true range; verifiable on a hand-built frame."""
+    config = IntradayBacktestConfig(atr_period_bars=3)
+    bt = IntradayBreakoutBacktester(config)
+    # 6 bars, same session. TR = max(H-L, |H-prev_close|, |L-prev_close|).
+    index = pd.to_datetime([
+        "2026-04-01 09:00:00",
+        "2026-04-01 09:30:00",
+        "2026-04-01 10:00:00",
+        "2026-04-01 10:30:00",
+        "2026-04-01 11:00:00",
+        "2026-04-01 11:30:00",
+    ])
+    frame = pd.DataFrame(
+        {
+            "open":   [100.0, 100.5, 101.0, 101.5, 102.0, 101.5],
+            "high":   [100.5, 101.0, 101.5, 102.0, 102.5, 102.0],
+            "low":    [ 99.5, 100.0, 100.5, 101.0, 101.5, 101.0],
+            "close":  [100.0, 100.5, 101.0, 101.5, 102.0, 101.5],
+            "volume": [1000] * 6,
+            "vwap":   [100.0] * 6,
+        },
+        index=index,
+    )
+    out = bt._prepare_symbol_features(frame)
+    assert "atr" in out.columns
+    # First two rows: insufficient history (min_periods=3) → NaN
+    assert pd.isna(out["atr"].iloc[0])
+    assert pd.isna(out["atr"].iloc[1])
+    # Bar 2 (index 2) — TR values: bar 0 = H-L = 1.0 (no prev close),
+    #   bar 1 TR = max(1.0, |101-100|, |100-100|) = 1.0
+    #   bar 2 TR = max(1.0, |101.5-100.5|, |100.5-100.5|) = 1.0
+    # Mean = 1.0
+    assert abs(float(out["atr"].iloc[2]) - 1.0) < 1e-9

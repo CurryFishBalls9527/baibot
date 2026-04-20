@@ -23,6 +23,14 @@ class IntradayBacktestConfig:
     max_position_pct: float = 0.10
     stop_loss_pct: float = 0.03
     trail_stop_pct: float = 0.04
+    # ATR-based stops (Reddit-bot inspired). When use_atr_stops=True the initial
+    # stop is `entry - atr_stop_multiplier * ATR(atr_period_bars)` and the trail
+    # is `high_since_entry - atr_trail_multiplier * ATR`. Falls back to the %
+    # stops on bars where ATR is not yet defined.
+    use_atr_stops: bool = False
+    atr_period_bars: int = 14
+    atr_stop_multiplier: float = 1.0
+    atr_trail_multiplier: float = 2.0
     opening_range_bars: int = 1
     min_opening_range_pct: float = 0.0
     min_breakout_distance_pct: float = 0.0
@@ -312,6 +320,21 @@ class IntradayBreakoutBacktester:
         ) if "vwap" in frame.columns else pd.NA
         frame["prior_bar_high"] = frame["high"].shift(1)
         frame["prior_bar_low"] = frame["low"].shift(1)
+
+        # ATR on the same bars the strategy trades on — used when the runner
+        # passes use_atr_stops=True. Kept always-computed because the cost is
+        # negligible and it keeps the feature frame shape stable across runs.
+        prev_close = frame["close"].shift(1)
+        true_range = pd.concat(
+            [
+                frame["high"] - frame["low"],
+                (frame["high"] - prev_close).abs(),
+                (frame["low"] - prev_close).abs(),
+            ],
+            axis=1,
+        ).max(axis=1)
+        atr_period = max(2, int(self.config.atr_period_bars))
+        frame["atr"] = true_range.rolling(atr_period, min_periods=atr_period).mean()
 
         pv = frame["close"] * frame["volume"]
         frame["vwap"] = pv.groupby(frame["session_date"]).cumsum() / frame["volume"].groupby(frame["session_date"]).cumsum().replace(0, pd.NA)
@@ -916,12 +939,23 @@ class IntradayBreakoutBacktester:
                 bar_volume = float(row["volume"]) if "volume" in row.index and pd.notna(row["volume"]) else None
                 fill_price = self._apply_execution_cost(price, "buy", None, shares, bar_volume)
                 cash -= shares * fill_price
+                atr_at_entry: Optional[float] = None
+                if "atr" in row.index and pd.notna(row["atr"]) and float(row["atr"]) > 0:
+                    atr_at_entry = float(row["atr"])
+                if (
+                    self.config.use_atr_stops
+                    and atr_at_entry is not None
+                ):
+                    initial_stop = fill_price - self.config.atr_stop_multiplier * atr_at_entry
+                else:
+                    initial_stop = fill_price * (1.0 - self.config.stop_loss_pct)
                 positions[symbol] = {
                     "entry_time": ts,
                     "entry_price": fill_price,
                     "shares": shares,
                     "high_since_entry": fill_price,
-                    "stop_price": fill_price * (1.0 - self.config.stop_loss_pct),
+                    "stop_price": initial_stop,
+                    "atr_at_entry": atr_at_entry,
                     "setup_family": entry.get("setup_family", "unknown"),
                     "signal_time": entry.get("signal_time"),
                     "candidate_score": entry.get("candidate_score"),
@@ -942,12 +976,10 @@ class IntradayBreakoutBacktester:
                 if symbol in positions:
                     pos = positions[symbol]
                     pos["high_since_entry"] = max(pos["high_since_entry"], float(row["high"]))
-                    trail_stop_pct = self.config.trail_stop_pct
-                    if (
-                        pos["setup_family"] == "gap_reclaim_long"
-                        and self.config.gap_reclaim_trail_stop_pct is not None
-                    ):
-                        trail_stop_pct = self.config.gap_reclaim_trail_stop_pct
+                    use_atr = (
+                        self.config.use_atr_stops
+                        and pos.get("atr_at_entry") is not None
+                    )
                     activate_trail = True
                     if (
                         pos["setup_family"] == "gap_reclaim_long"
@@ -956,7 +988,19 @@ class IntradayBreakoutBacktester:
                         best_return = (pos["high_since_entry"] / pos["entry_price"]) - 1.0
                         activate_trail = best_return >= self.config.gap_reclaim_trail_activation_return_pct
                     if activate_trail:
-                        trail_stop = pos["high_since_entry"] * (1.0 - trail_stop_pct)
+                        if use_atr:
+                            trail_stop = (
+                                pos["high_since_entry"]
+                                - self.config.atr_trail_multiplier * pos["atr_at_entry"]
+                            )
+                        else:
+                            trail_stop_pct = self.config.trail_stop_pct
+                            if (
+                                pos["setup_family"] == "gap_reclaim_long"
+                                and self.config.gap_reclaim_trail_stop_pct is not None
+                            ):
+                                trail_stop_pct = self.config.gap_reclaim_trail_stop_pct
+                            trail_stop = pos["high_since_entry"] * (1.0 - trail_stop_pct)
                         pos["stop_price"] = max(pos["stop_price"], trail_stop)
 
                     exit_price = None
