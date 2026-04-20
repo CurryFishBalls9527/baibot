@@ -27,6 +27,12 @@ class TradingScheduler:
             self.experiment = load_experiment(config["experiment_config_path"])
             self.ab_runner = ABRunner(self.experiment, config)
             self.orchestrator = None
+            if self.experiment.reconciler_enabled:
+                self.config.setdefault("reconciler_enabled", True)
+                self.config.setdefault(
+                    "reconciler_interval_minutes",
+                    self.experiment.reconciler_interval_minutes,
+                )
         else:
             self.orchestrator = Orchestrator(config)
         self.social_monitor = SocialFeedMonitor(config)

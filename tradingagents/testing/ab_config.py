@@ -82,6 +82,8 @@ def load_experiment(yaml_path: str) -> Experiment:
         min_days=data.get("min_days", 20),
         primary_metric=data.get("primary_metric", "sharpe_ratio"),
         status=data.get("status", "running"),
+        reconciler_enabled=bool(data.get("reconciler_enabled", False)),
+        reconciler_interval_minutes=int(data.get("reconciler_interval_minutes", 5)),
     )
 
 

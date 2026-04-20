@@ -5,6 +5,12 @@ min_trades: 20
 min_days: 15
 status: running
 
+# Track P-SYNC: reconcile local SQLite trades against broker every 5 min
+# during market hours. Fixes the drift where live fills / broker-side
+# state updates weren't making it back into the per-variant SQLite.
+reconciler_enabled: true
+reconciler_interval_minutes: 5
+
 # Six-variant paper trading:
 #   mechanical         — pure Minervini rule-based entries, ExitManager v1 (existing)
 #   llm                — full agent pipeline, ExitManager v1 (existing)

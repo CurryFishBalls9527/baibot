@@ -27,6 +27,8 @@ class Experiment:
     min_days: int = 20
     primary_metric: str = "sharpe_ratio"
     status: str = "running"  # running | paused | completed | promoted
+    reconciler_enabled: bool = False
+    reconciler_interval_minutes: int = 5
 
 
 @dataclass
