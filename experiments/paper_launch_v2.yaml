@@ -117,9 +117,7 @@ variants:
     db_path: trading_intraday_mechanical.db
     config_overrides:
       strategy_type: intraday_mechanical
-      # Launch in dry-run: log would-be orders, skip broker submission.
-      # Flip to false after parity inspection.
-      intraday_dry_run: true
+      intraday_dry_run: false
       intraday_universe_path: research_data/spike_universe.json
       intraday_lookback_days: 7
       intraday_allowed_families:
@@ -129,8 +127,8 @@ variants:
       # (see memory/project_nr4_finding.md — OOS validated on 2020/2018).
       intraday_backtest_config:
         initial_cash: 100000
-        max_positions: 4
-        max_position_pct: 0.08
+        max_positions: 6
+        max_position_pct: 0.20
         stop_loss_pct: 0.03
         trail_stop_pct: 0.04
         opening_range_bars: 2
@@ -165,6 +163,6 @@ variants:
         execution_half_spread_bps: 1.0
         execution_stop_slippage_bps: 5.0
       # Sizer/risk parameters for the orchestrator layer
-      max_positions: 4
+      max_positions: 6
       default_stop_loss_pct: 0.03
       default_take_profit_pct: 1.0
