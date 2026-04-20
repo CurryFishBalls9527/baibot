@@ -61,6 +61,13 @@ def _naive_local_timestamp(ts: pd.Timestamp) -> pd.Timestamp:
     return ts.tz_convert("America/Chicago").tz_localize(None)
 
 
+def _to_alpaca_symbol(symbol: str) -> str:
+    """Alpaca uses `.` for share class separators where universe files use `-`
+    (e.g., `BRK-B` → `BRK.B`). A single bad symbol rejects the whole batch, so
+    normalize before the API call."""
+    return symbol.replace("-", ".")
+
+
 class IntradayOrchestrator:
     """Mechanical intraday breakout orchestrator (NR4 + gap-reclaim)."""
 
@@ -140,12 +147,18 @@ class IntradayOrchestrator:
         if not symbols:
             return {}
         try:
+            from alpaca.data.enums import DataFeed
             from alpaca.data.historical import StockHistoricalDataClient
             from alpaca.data.requests import StockBarsRequest
             from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
         except ImportError:
             logger.warning("alpaca-py not installed — cannot fetch intraday bars")
             return {}
+
+        # Free Alpaca paper subscriptions cannot query recent SIP data; fall
+        # back to IEX unless the variant config explicitly requests SIP.
+        feed_name = str(self.config.get("alpaca_data_feed", "iex")).lower()
+        feed = DataFeed.SIP if feed_name == "sip" else DataFeed.IEX
 
         client = StockHistoricalDataClient(
             self.config["alpaca_api_key"], self.config["alpaca_secret_key"]
@@ -155,16 +168,22 @@ class IntradayOrchestrator:
 
         frames: Dict[str, pd.DataFrame] = {}
         # Alpaca batch API accepts a list; a single request per 100 symbols
-        # is plenty for a 52-symbol universe.
+        # is plenty for a 52-symbol universe. Normalize BRK-B → BRK.B etc so
+        # a single bad symbol doesn't reject the whole batch.
+        alpaca_to_universe: Dict[str, str] = {
+            _to_alpaca_symbol(s): s for s in symbols
+        }
+        alpaca_symbols = list(alpaca_to_universe.keys())
         batch_size = 100
-        for i in range(0, len(symbols), batch_size):
-            batch = symbols[i : i + batch_size]
+        for i in range(0, len(alpaca_symbols), batch_size):
+            batch = alpaca_symbols[i : i + batch_size]
             try:
                 request = StockBarsRequest(
                     symbol_or_symbols=batch,
                     timeframe=TimeFrame(self.interval_minutes, TimeFrameUnit.Minute),
                     start=start,
                     end=end,
+                    feed=feed,
                 )
                 bars = client.get_stock_bars(request)
             except Exception as e:
@@ -178,7 +197,11 @@ class IntradayOrchestrator:
                 continue
             df = df.reset_index()
             df["ts"] = df["timestamp"].apply(_naive_local_timestamp)
-            for sym, group in df.groupby("symbol"):
+            for alpaca_sym, group in df.groupby("symbol"):
+                # Map back to the universe-file form so downstream dedup /
+                # position-tracking keys line up with what the rest of the
+                # codebase uses.
+                universe_sym = alpaca_to_universe.get(alpaca_sym, alpaca_sym)
                 sym_df = (
                     group[["ts", "open", "high", "low", "close", "volume"]]
                     .set_index("ts")
@@ -186,7 +209,7 @@ class IntradayOrchestrator:
                 )
                 sym_df = self.backtester._filter_regular_session(sym_df)
                 if not sym_df.empty:
-                    frames[sym] = sym_df
+                    frames[universe_sym] = sym_df
         return frames
 
     # ------------------------------------------------------------------ scan
