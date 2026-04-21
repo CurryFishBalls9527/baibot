@@ -69,6 +69,10 @@ class TelegramNotifier:
     ) -> bool:
         if not self.enabled:
             return False
+        # Namespace dedupe by strategy so multi-variant runs (mechanical/llm/chan/...)
+        # don't silence each other when they share results_dir/telegram_state.json.
+        if dedupe_key and self.strategy_tag:
+            dedupe_key = f"{self.strategy_tag}:{dedupe_key}"
         if dedupe_key and self._already_sent(dedupe_key):
             return False
 

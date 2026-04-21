@@ -294,14 +294,30 @@ class TradingScheduler:
         logger.info("=" * 60)
 
         # Take initial snapshot
-        try:
-            if self.orchestrator:
-                self.orchestrator.tracker.take_daily_snapshot()
-            elif self.ab_runner:
-                for orch in self.ab_runner.orchestrators.values():
-                    orch.tracker.take_daily_snapshot()
-        except Exception as e:
-            logger.warning(f"Could not take initial snapshot: {e}")
+        if self.orchestrator:
+            try:
+                tracker = getattr(self.orchestrator, "tracker", None)
+                if tracker is not None:
+                    tracker.take_daily_snapshot()
+            except Exception as e:
+                logger.warning(f"Could not take initial snapshot: {e}")
+        elif self.ab_runner:
+            for name, orch in self.ab_runner.orchestrators.items():
+                tracker = getattr(orch, "tracker", None)
+                if tracker is None:
+                    logger.debug(
+                        "Skipping initial snapshot for variant '%s': no tracker",
+                        name,
+                    )
+                    continue
+                try:
+                    tracker.take_daily_snapshot()
+                except Exception as e:
+                    logger.warning(
+                        "Could not take initial snapshot for variant '%s': %s",
+                        name,
+                        e,
+                    )
 
         # Print upcoming jobs
         jobs = self.scheduler.get_jobs()

@@ -20,6 +20,7 @@ class NtfyNotifier:
         self.enabled = bool(config.get("ntfy_enabled", False) and topic)
         self.server = str(config.get("ntfy_server", "https://ntfy.sh")).rstrip("/")
         self.topic = topic
+        self.strategy_tag = str(config.get("strategy_tag", "") or "").strip()
         self.default_priority = str(config.get("ntfy_priority", "default"))
         raw_tags = config.get("ntfy_tags", [])
         if isinstance(raw_tags, str):
@@ -46,6 +47,10 @@ class NtfyNotifier:
     ) -> bool:
         if not self.enabled:
             return False
+        # Namespace dedupe by strategy so multi-variant runs (mechanical/llm/chan/...)
+        # don't silence each other when they share results_dir/ntfy_state.json.
+        if dedupe_key and self.strategy_tag:
+            dedupe_key = f"{self.strategy_tag}:{dedupe_key}"
         if dedupe_key and self._already_sent(dedupe_key):
             return False
 

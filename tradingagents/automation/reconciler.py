@@ -322,7 +322,7 @@ class OrderReconciler:
                                 f"{order_id[:8]} {local_status} -> {remote_status} "
                                 f"(local stale {age})"
                             ),
-                            priority="normal",
+                            priority="default",
                             tags=["warning"],
                             dedupe_key=f"reconcile-drift:{order_id}",
                         )

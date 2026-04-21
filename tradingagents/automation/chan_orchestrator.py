@@ -42,6 +42,8 @@ from tradingagents.research import MarketDataWarehouse, build_market_context
 
 logger = logging.getLogger(__name__)
 
+_ALPACA_UNSUPPORTED_SYMBOL_PREFIXES = ("^",)
+
 
 DEFAULT_CHAN_CONFIG = {
     "trigger_step": True,
@@ -377,7 +379,11 @@ class ChanOrchestrator:
             logger.warning("Daily DB not found for bulk refresh: %s", self.daily_db)
             return {"status": "no_daily_db"}
 
-        daily_conn = duckdb.connect(self.daily_db, read_only=True)
+        # NOTE: connect RW (not read_only) to match MarketDataWarehouse,
+        # which other variants (mechanical/llm/...) open on this same file
+        # in the same process. DuckDB rejects mixed RO/RW configs → chan_v2
+        # scans fail with "different configuration than existing connections".
+        daily_conn = duckdb.connect(self.daily_db)
         try:
             freshness_cutoff = (date.today() - timedelta(days=10)).isoformat()
             fresh_symbols = [r[0] for r in daily_conn.execute(
@@ -389,6 +395,12 @@ class ChanOrchestrator:
             ).fetchall()]
         finally:
             daily_conn.close()
+
+        fresh_symbols = [
+            sym
+            for sym in fresh_symbols
+            if sym and not sym.startswith(_ALPACA_UNSUPPORTED_SYMBOL_PREFIXES)
+        ]
 
         if not fresh_symbols:
             logger.warning("No fresh daily symbols found for bulk 30m refresh")
@@ -502,7 +514,8 @@ class ChanOrchestrator:
             logger.warning("Daily DB not found: %s", self.daily_db)
             return set()
 
-        conn = duckdb.connect(self.daily_db, read_only=True)
+        # RW to match MarketDataWarehouse — see note at bulk_refresh_30m_data.
+        conn = duckdb.connect(self.daily_db)
         today = date.today()
         lookback_start = today - timedelta(days=int(self.rs_lookback_days * 1.6) + 30)
 
