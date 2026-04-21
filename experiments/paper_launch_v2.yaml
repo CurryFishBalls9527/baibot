@@ -111,71 +111,13 @@ variants:
       chan_dead_money_min_gain: 0.05
 
   - name: intraday_mechanical
-    description: NR4 + gap-reclaim 15m breakout, EOD flatten (dry-run default)
+    description: ORB + NR4 + gap-reclaim 15m breakout on broad250, EOD flatten
     alpaca_api_key: "${ALPACA_V2_INTRADAY_API_KEY}"
     alpaca_secret_key: "${ALPACA_V2_INTRADAY_SECRET_KEY}"
     db_path: trading_intraday_mechanical.db
     config_overrides:
       strategy_type: intraday_mechanical
       intraday_dry_run: false
-      intraday_universe_path: research_data/spike_universe.json
-      intraday_lookback_days: 7
-      intraday_allowed_families:
-        - gap_reclaim_long
-        - nr4_breakout
-      # Exact config of the winning gap12 + NR4 vol=2.0 combo
-      # (see memory/project_nr4_finding.md — OOS validated on 2020/2018).
-      intraday_backtest_config:
-        initial_cash: 100000
-        max_positions: 6
-        max_position_pct: 0.20
-        stop_loss_pct: 0.03
-        trail_stop_pct: 0.04
-        opening_range_bars: 2
-        require_above_prior_high: true
-        latest_entry_bar_in_session: 20
-        max_trades_per_symbol_per_day: 1
-        min_volume_ratio: 1.5
-        continuation_min_volume_ratio: 2.0
-        continuation_max_distance_from_vwap_pct: 0.005
-        continuation_latest_entry_bar_in_session: 8
-        allow_continuation_setup: false
-        allow_overextended_setup: true
-        allow_expansion_setup: true
-        allow_gap_reclaim_long: true
-        gap_reclaim_min_gap_down_pct: 0.012
-        gap_reclaim_max_gap_down_pct: 0.06
-        gap_reclaim_min_reclaim_fraction: 0.5
-        gap_reclaim_min_volume_ratio: 1.3
-        gap_reclaim_earliest_entry_bar: 2
-        gap_reclaim_latest_entry_bar: 8
-        allow_nr4_breakout: true
-        nr4_lookback_days: 4
-        nr4_earliest_entry_bar: 1
-        nr4_latest_entry_bar: 12
-        nr4_min_volume_ratio: 1.3
-        require_above_vwap: true
-        flatten_at_close: true
-        interval_minutes: 15
-        daily_trend_filter: true
-        daily_trend_sma: 20
-        # 1/5 bps is the realistic cost floor we validated against
-        execution_half_spread_bps: 1.0
-        execution_stop_slippage_bps: 5.0
-      # Sizer/risk parameters for the orchestrator layer
-      max_positions: 6
-      default_stop_loss_pct: 0.03
-      default_take_profit_pct: 1.0
-
-  - name: intraday_orb
-    description: ORB breakout (orb_vol_2.5) alongside NR4+gap on broad250 — dry-run shadow
-    alpaca_api_key: "${ALPACA_V2_INTRADAY_ORB_API_KEY}"
-    alpaca_secret_key: "${ALPACA_V2_INTRADAY_ORB_SECRET_KEY}"
-    db_path: trading_intraday_orb.db
-    config_overrides:
-      strategy_type: intraday_mechanical
-      strategy_tag: intraday_orb
-      intraday_dry_run: true
       intraday_universe_path: research_data/intraday_top250_universe.json
       intraday_lookback_days: 7
       intraday_allowed_families:
@@ -227,8 +169,10 @@ variants:
         interval_minutes: 15
         daily_trend_filter: true
         daily_trend_sma: 20
+        # 1/5 bps is the realistic cost floor we validated against
         execution_half_spread_bps: 1.0
         execution_stop_slippage_bps: 5.0
+      # Sizer/risk parameters for the orchestrator layer
       max_positions: 6
       default_stop_loss_pct: 0.03
       default_take_profit_pct: 1.0
