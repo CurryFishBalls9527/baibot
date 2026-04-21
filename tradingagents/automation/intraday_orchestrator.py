@@ -415,7 +415,10 @@ class IntradayOrchestrator:
             order_request,
             stop_loss_price=sl_price,
             take_profit_price=tp_price,
+            anchor_price=current_price,
         )
+        sl_price = order_result.effective_stop_price or sl_price
+        tp_price = order_result.effective_take_profit_price or tp_price
         self.risk_engine.record_trade()
         self.db.log_trade(
             symbol=symbol,

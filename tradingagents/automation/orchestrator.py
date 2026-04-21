@@ -1027,8 +1027,13 @@ class Orchestrator:
                     current_price, structured.get("take_profit_pct")
                 )
             order_result = self.broker.submit_bracket_order(
-                order_request, stop_loss_price=sl_price, take_profit_price=tp_price
+                order_request,
+                stop_loss_price=sl_price,
+                take_profit_price=tp_price,
+                anchor_price=current_price,
             )
+            sl_price = order_result.effective_stop_price or sl_price
+            tp_price = order_result.effective_take_profit_price or tp_price
             logger.info(f"{symbol}: Bracket order SL=${sl_price:.2f} TP=${tp_price:.2f}")
         else:
             order_result = self.broker.submit_order(order_request)

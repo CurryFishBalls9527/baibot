@@ -39,6 +39,7 @@ def _build_orchestrator(dry_run=True, universe=None, extra_config=None):
         broker.submit_bracket_order.return_value = MagicMock(
             status="filled", filled_qty=10, filled_avg_price=100.0,
             order_id="oid-1",
+            effective_stop_price=None, effective_take_profit_price=None,
         )
         broker.close_position.return_value = MagicMock(
             status="submitted", filled_qty=0, filled_avg_price=None, order_id="cid-1",

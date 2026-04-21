@@ -35,6 +35,10 @@ class OrderResult:
     # a BRACKET parent. Populated only for bracket parent responses.
     stop_order_id: Optional[str] = None
     tp_order_id: Optional[str] = None
+    # Effective bracket leg prices after any post-fill re-anchoring. Equal to
+    # the originally submitted prices if no correction happened. Bracket only.
+    effective_stop_price: Optional[float] = None
+    effective_take_profit_price: Optional[float] = None
 
 
 @dataclass

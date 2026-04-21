@@ -851,8 +851,13 @@ class ChanOrchestrator:
             sl_price = round(current_price * (1 - stop_loss_pct), 2)
             tp_price = round(current_price * (1 + take_profit_pct), 2)
             order_result = self.broker.submit_bracket_order(
-                order_request, stop_loss_price=sl_price, take_profit_price=tp_price,
+                order_request,
+                stop_loss_price=sl_price,
+                take_profit_price=tp_price,
+                anchor_price=current_price,
             )
+            sl_price = order_result.effective_stop_price or sl_price
+            tp_price = order_result.effective_take_profit_price or tp_price
             logger.info("%s: Bracket order SL=$%.2f TP=$%.2f", symbol, sl_price, tp_price)
         else:
             order_result = self.broker.submit_order(order_request)

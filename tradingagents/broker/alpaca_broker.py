@@ -141,6 +141,7 @@ class AlpacaBroker(BaseBroker):
         order: OrderRequest,
         stop_loss_price: float,
         take_profit_price: float,
+        anchor_price: Optional[float] = None,
     ) -> OrderResult:
         """Submit a bracket order: main entry + automatic stop-loss + take-profit.
 
@@ -148,11 +149,21 @@ class AlpacaBroker(BaseBroker):
         - A stop order at stop_loss_price (sells if price drops)
         - A limit order at take_profit_price (sells if price rises)
         Whichever triggers first cancels the other (OCO).
+
+        ``anchor_price``: the quote the caller used to derive ``stop_loss_price``
+        and ``take_profit_price``. When provided AND the parent fills at a price
+        that drifts >10 bps from this anchor, the SL/TP child legs are replaced
+        in place to preserve the caller's intended distance (e.g. SL=−3%) from
+        the actual fill rather than from a stale quote. This eliminates silent
+        bracket miscalibration in fast markets and on stale IEX quotes.
         """
         if order.side != "buy":
             return self.submit_order(order)
 
         tif = TIF_MAP.get(order.time_in_force, TimeInForce.DAY)
+
+        sl_submit = round(stop_loss_price, 2)
+        tp_submit = round(take_profit_price, 2)
 
         req = MarketOrderRequest(
             symbol=order.symbol,
@@ -160,16 +171,43 @@ class AlpacaBroker(BaseBroker):
             qty=order.qty,
             time_in_force=TimeInForce.GTC,
             order_class=OrderClass.BRACKET,
-            stop_loss={"stop_price": round(stop_loss_price, 2)},
-            take_profit={"limit_price": round(take_profit_price, 2)},
+            stop_loss={"stop_price": sl_submit},
+            take_profit={"limit_price": tp_submit},
         )
 
         result = self.trading_client.submit_order(req)
         logger.info(
             f"Bracket order: BUY {order.qty} {order.symbol} "
-            f"SL=${stop_loss_price:.2f} TP=${take_profit_price:.2f} -> {result.status}"
+            f"SL=${sl_submit:.2f} TP=${tp_submit:.2f} -> {result.status}"
         )
-        return self._to_order_result(result)
+        out = self._to_order_result(result)
+        out.effective_stop_price = sl_submit
+        out.effective_take_profit_price = tp_submit
+
+        if anchor_price and anchor_price > 0 and out.filled_avg_price:
+            fill = float(out.filled_avg_price)
+            drift_bps = abs(fill - anchor_price) / anchor_price * 1e4
+            if drift_bps > 10.0:
+                sl_pct = (anchor_price - stop_loss_price) / anchor_price
+                tp_pct = (take_profit_price - anchor_price) / anchor_price
+                new_sl = round(fill * (1 - sl_pct), 2)
+                new_tp = round(fill * (1 + tp_pct), 2)
+                logger.info(
+                    f"{order.symbol}: re-anchoring bracket legs (anchor=${anchor_price:.2f} "
+                    f"fill=${fill:.2f} drift={drift_bps:.1f}bps) "
+                    f"SL=${sl_submit:.2f}->${new_sl:.2f} TP=${tp_submit:.2f}->${new_tp:.2f}"
+                )
+                if out.stop_order_id:
+                    rep = self.replace_order(out.stop_order_id, stop_price=new_sl)
+                    if rep is not None:
+                        out.stop_order_id = rep.order_id
+                        out.effective_stop_price = new_sl
+                if out.tp_order_id:
+                    rep = self.replace_order(out.tp_order_id, limit_price=new_tp)
+                    if rep is not None:
+                        out.tp_order_id = rep.order_id
+                        out.effective_take_profit_price = new_tp
+        return out
 
     def cancel_order(self, order_id: str) -> None:
         self.trading_client.cancel_order_by_id(order_id)
