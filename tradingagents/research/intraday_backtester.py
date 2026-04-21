@@ -37,7 +37,11 @@ class IntradayBacktestConfig:
     max_breakout_distance_pct: Optional[float] = None
     require_above_prior_high: bool = False
     latest_entry_bar_in_session: Optional[int] = None
+    use_midday_entry_window: bool = False
+    midday_entry_earliest_bar: int = 1
+    midday_entry_latest_bar: int = 9
     max_trades_per_symbol_per_day: int = 1
+    max_new_positions_per_day: Optional[int] = None
     min_volume_ratio: float = 1.5
     continuation_min_volume_ratio: Optional[float] = None
     continuation_max_distance_from_vwap_pct: Optional[float] = None
@@ -420,6 +424,28 @@ class IntradayBreakoutBacktester:
             frame = self._apply_orb_breakout(frame)
         if self.config.use_expansion_confirmation_entry:
             frame = self._apply_expansion_confirmation_entry(frame)
+        if self.config.use_midday_entry_window:
+            midday_ok = (
+                (frame["bar_in_session"] >= int(self.config.midday_entry_earliest_bar))
+                & (frame["bar_in_session"] <= int(self.config.midday_entry_latest_bar))
+            )
+            frame.loc[frame["entry_signal"] & (~midday_ok), "entry_signal"] = False
+            frame.loc[
+                frame["setup_family"].isin(
+                    {
+                        "opening_drive_continuation",
+                        "opening_drive_expansion",
+                        "opening_drive_overextended",
+                        "pullback_vwap",
+                        "gap_reclaim_long",
+                        "nr4_breakout",
+                        "orb_breakout",
+                        "opening_drive_expansion_confirmation",
+                    }
+                )
+                & (~midday_ok),
+                "setup_family",
+            ] = "filtered_midday_window"
         return frame
 
     def _apply_pullback_vwap(self, frame: pd.DataFrame) -> pd.DataFrame:
@@ -893,6 +919,7 @@ class IntradayBreakoutBacktester:
         max_drawdown = 0.0
         last_day = None
         trades_per_symbol_day: dict[tuple[str, str], int] = {}
+        new_entries_per_day: dict[str, int] = {}
 
         for ts in all_ts:
             # Execute pending entries at this bar's open.
@@ -928,6 +955,23 @@ class IntradayBreakoutBacktester:
                             "candidate_score": entry.get("candidate_score"),
                             "selection_score": entry.get("selection_score"),
                             "drop_reason": "max_positions",
+                        }
+                    )
+                    continue
+                day_key = str(ts.date())
+                if (
+                    self.config.max_new_positions_per_day is not None
+                    and new_entries_per_day.get(day_key, 0)
+                    >= self.config.max_new_positions_per_day
+                ):
+                    dropped_entries.append(
+                        {
+                            "ts": ts.isoformat(),
+                            "symbol": symbol,
+                            "setup_family": entry.get("setup_family", "unknown"),
+                            "candidate_score": entry.get("candidate_score"),
+                            "selection_score": entry.get("selection_score"),
+                            "drop_reason": "max_new_positions_per_day",
                         }
                     )
                     continue
@@ -1034,6 +1078,7 @@ class IntradayBreakoutBacktester:
                     "selection_score": entry.get("selection_score"),
                 }
                 trades_per_symbol_day[trade_key] = trades_per_symbol_day.get(trade_key, 0) + 1
+                new_entries_per_day[trade_day] = new_entries_per_day.get(trade_day, 0) + 1
 
             # Process exits and new signals for symbols that have a bar at ts.
             for symbol, frame in prepared.items():

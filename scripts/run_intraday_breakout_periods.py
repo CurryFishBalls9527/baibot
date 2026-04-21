@@ -72,6 +72,9 @@ def parse_args():
     p.add_argument("--min-breakout-distance-pct", type=float, default=0.0)
     p.add_argument("--require-above-prior-high", action="store_true")
     p.add_argument("--latest-entry-bar", type=int, default=None)
+    p.add_argument("--use-midday-entry-window", action="store_true")
+    p.add_argument("--midday-entry-earliest-bar", type=int, default=1)
+    p.add_argument("--midday-entry-latest-bar", type=int, default=9)
     p.add_argument("--max-trades-per-symbol-day", type=int, default=1)
     p.add_argument("--min-volume-ratio", type=float, default=1.5)
     p.add_argument("--continuation-min-volume-ratio", type=float, default=None)
@@ -188,6 +191,9 @@ def build_config(args) -> IntradayBacktestConfig:
         min_breakout_distance_pct=args.min_breakout_distance_pct,
         require_above_prior_high=args.require_above_prior_high,
         latest_entry_bar_in_session=args.latest_entry_bar,
+        use_midday_entry_window=args.use_midday_entry_window,
+        midday_entry_earliest_bar=args.midday_entry_earliest_bar,
+        midday_entry_latest_bar=args.midday_entry_latest_bar,
         max_trades_per_symbol_per_day=args.max_trades_per_symbol_day,
         min_volume_ratio=args.min_volume_ratio,
         continuation_min_volume_ratio=args.continuation_min_volume_ratio,
