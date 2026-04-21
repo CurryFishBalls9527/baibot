@@ -30,18 +30,21 @@ PERIODS = {
         "end": "2025-12-30",
         "db": "research_data/intraday_30m.duckdb",
         "db_broad": "research_data/intraday_30m_broad.duckdb",
+        "db_15m": "research_data/intraday_15m.duckdb",
     },
     "2020": {
         "begin": "2020-01-01",
         "end": "2020-12-31",
         "db": "research_data/intraday_30m_2020.duckdb",
         "db_broad": "research_data/intraday_30m_broad_2020.duckdb",
+        "db_15m": "research_data/intraday_15m_2020.duckdb",
     },
     "2018": {
         "begin": "2018-01-01",
         "end": "2018-12-31",
         "db": "research_data/intraday_30m_2018.duckdb",
         "db_broad": "research_data/intraday_30m_broad_2018.duckdb",
+        "db_15m": "research_data/intraday_15m_2018.duckdb",
     },
 }
 
@@ -115,6 +118,13 @@ def parse_args():
     p.add_argument("--nr4-min-volume-ratio", type=float, default=1.3)
     p.add_argument("--nr4-min-breakout-distance-pct", type=float, default=0.0)
     p.add_argument("--nr4-max-position-pct", type=float, default=None)
+    p.add_argument("--allow-orb-breakout", action="store_true")
+    p.add_argument("--orb-range-bars", type=int, default=2)
+    p.add_argument("--orb-min-volume-ratio", type=float, default=1.5)
+    p.add_argument("--orb-min-breakout-distance-pct", type=float, default=0.001)
+    p.add_argument("--orb-earliest-entry-bar", type=int, default=2)
+    p.add_argument("--orb-latest-entry-bar", type=int, default=10)
+    p.add_argument("--orb-disable-above-vwap", action="store_true")
     p.add_argument("--execution-half-spread-bps", type=float, default=0.0)
     p.add_argument("--execution-stop-slippage-bps", type=float, default=0.0)
     p.add_argument("--execution-impact-coeff-bps", type=float, default=0.0)
@@ -224,6 +234,13 @@ def build_config(args) -> IntradayBacktestConfig:
         nr4_min_volume_ratio=args.nr4_min_volume_ratio,
         nr4_min_breakout_distance_pct=args.nr4_min_breakout_distance_pct,
         nr4_max_position_pct=args.nr4_max_position_pct,
+        allow_orb_breakout=args.allow_orb_breakout,
+        orb_range_bars=args.orb_range_bars,
+        orb_min_volume_ratio=args.orb_min_volume_ratio,
+        orb_min_breakout_distance_pct=args.orb_min_breakout_distance_pct,
+        orb_earliest_entry_bar=args.orb_earliest_entry_bar,
+        orb_latest_entry_bar=args.orb_latest_entry_bar,
+        orb_require_above_vwap=not args.orb_disable_above_vwap,
         execution_half_spread_bps=args.execution_half_spread_bps,
         execution_stop_slippage_bps=args.execution_stop_slippage_bps,
         execution_impact_coeff_bps=args.execution_impact_coeff_bps,
@@ -271,6 +288,8 @@ def main():
             tradability_diagnostics = diagnostics.to_dict("records") if not diagnostics.empty else []
         if args.db_override:
             db_path = args.db_override
+        elif args.interval == 15 and "db_15m" in period:
+            db_path = period["db_15m"]
         elif args.broad:
             db_path = period["db_broad"]
         else:

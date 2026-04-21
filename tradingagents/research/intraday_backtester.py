@@ -83,6 +83,13 @@ class IntradayBacktestConfig:
     nr4_min_volume_ratio: float = 1.3
     nr4_min_breakout_distance_pct: float = 0.0
     nr4_max_position_pct: Optional[float] = None
+    allow_orb_breakout: bool = False
+    orb_range_bars: int = 2
+    orb_min_volume_ratio: float = 1.5
+    orb_min_breakout_distance_pct: float = 0.001
+    orb_earliest_entry_bar: int = 2
+    orb_latest_entry_bar: int = 10
+    orb_require_above_vwap: bool = True
     execution_half_spread_bps: float = 0.0
     execution_stop_slippage_bps: float = 0.0
     execution_impact_coeff_bps: float = 0.0
@@ -158,6 +165,7 @@ class IntradayBreakoutBacktester:
             "pullback_vwap": 5,
             "gap_reclaim_long": 4,
             "nr4_breakout": 3,
+            "orb_breakout": 3,
             "opening_drive_overextended": 2,
             "opening_drive_continuation": 1,
         }
@@ -408,6 +416,8 @@ class IntradayBreakoutBacktester:
             frame = self._apply_gap_reclaim_long(frame)
         if self.config.allow_nr4_breakout:
             frame = self._apply_nr4_breakout(frame)
+        if self.config.allow_orb_breakout:
+            frame = self._apply_orb_breakout(frame)
         if self.config.use_expansion_confirmation_entry:
             frame = self._apply_expansion_confirmation_entry(frame)
         return frame
@@ -579,6 +589,68 @@ class IntradayBreakoutBacktester:
 
         frame.loc[nr4_mask, "entry_signal"] = True
         frame.loc[nr4_mask, "setup_family"] = "nr4_breakout"
+        return frame
+
+    def _apply_orb_breakout(self, frame: pd.DataFrame) -> pd.DataFrame:
+        range_bars = max(1, int(self.config.orb_range_bars))
+        min_vol = float(self.config.orb_min_volume_ratio)
+        earliest = max(range_bars, int(self.config.orb_earliest_entry_bar))
+        latest = int(self.config.orb_latest_entry_bar)
+        min_breakout = float(self.config.orb_min_breakout_distance_pct)
+        require_above_vwap = bool(self.config.orb_require_above_vwap)
+
+        or_window = frame["bar_in_session"] < range_bars
+        session_orh_by_date = (
+            frame["high"].where(or_window).groupby(frame["session_date"]).max()
+        )
+        session_orh = frame["session_date"].map(session_orh_by_date)
+
+        valid = session_orh.notna() & (session_orh > 0)
+        breakout_dist_pct = (frame["close"] - session_orh) / session_orh.where(valid)
+        breakout_ok = (
+            valid
+            & (frame["close"] > session_orh)
+            & (breakout_dist_pct >= min_breakout)
+        )
+
+        prior_bar_close = frame["close"].shift(1)
+        prior_orh = session_orh.shift(1)
+        same_session_as_prior = frame["session_date"] == frame["session_date"].shift(1)
+        prior_below_break = (
+            prior_bar_close.notna()
+            & same_session_as_prior
+            & (prior_bar_close <= prior_orh)
+        )
+
+        volume_ok = frame["volume_ratio"].fillna(0) >= min_vol
+        bar_ok = (frame["bar_in_session"] >= earliest) & (frame["bar_in_session"] <= latest)
+        if require_above_vwap and "vwap" in frame.columns:
+            vwap_ok = frame["close"] > frame["vwap"]
+        else:
+            vwap_ok = pd.Series(True, index=frame.index)
+
+        already_assigned = frame["setup_family"].isin(
+            {
+                "opening_drive_continuation",
+                "opening_drive_expansion",
+                "opening_drive_overextended",
+                "pullback_vwap",
+                "gap_reclaim_long",
+                "nr4_breakout",
+            }
+        )
+
+        orb_mask = (
+            breakout_ok
+            & prior_below_break
+            & volume_ok
+            & bar_ok
+            & vwap_ok
+            & (~already_assigned)
+        ).fillna(False)
+
+        frame.loc[orb_mask, "entry_signal"] = True
+        frame.loc[orb_mask, "setup_family"] = "orb_breakout"
         return frame
 
     def _build_relative_volume_universe(
