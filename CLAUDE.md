@@ -112,3 +112,41 @@ With 7 watchlist stocks: ~70-105 LLM calls per daily analysis cycle.
 pip install -e .              # Install in dev mode
 python -m pytest tests/       # Run tests
 ```
+
+## Strategy edge claims — MANDATORY before reporting any backtest result
+
+A one-character lookahead (`<=` vs `<`) in `intraday_backtester.py:1235`
+turned a no-edge strategy into a 2.14 R/DD apparent winner. We almost
+shipped it live. See `memory/project_intraday_lookahead_blowup.md`.
+
+Before claiming a strategy has edge — i.e., before reporting any backtest
+return, R/DD, win rate, or Sharpe — you MUST:
+
+1. **Enumerate filters before auditing.** When asked "are there biases?",
+   first `grep -n "shift\|<=\|<.*ts\|loc\[.*index\|as_of\|trend_day"` in
+   the relevant backtester. Produce an exhaustive list of every place
+   the simulation consults a time-indexed series. THEN check each one.
+   Do not extrapolate from spot-checks of feature math to a clean bill
+   of health on the whole pipeline.
+
+2. **State scope explicitly.** When reporting on bias, list what you
+   checked AND what you did not check. "I checked feature math; I did
+   NOT check filter applications in the selection loop or universe
+   construction" beats "the code looks clean."
+
+3. **Run the future-blanked probe before reporting edge.** Re-run the
+   backtest with the current bar's daily/weekly/external data blanked
+   (set to NaN). If returns drop by more than ~2pp, the apparent edge
+   is lookahead — find the leak before reporting numbers.
+
+4. **Treat suspicious R/DD as a bug, not a feature.** A mechanical
+   intraday strategy with R/DD > 2.0 on multi-year IS data is, by prior,
+   far more likely to be lookahead than to be a real edge. When you see
+   one, dig harder, not less.
+
+5. **When the user asks "are we sure?" twice, treat it as evidence you
+   are wrong.** Re-audit from scratch with stronger scope.
+
+These rules apply to every backtester in the repo (`intraday_backtester`,
+`backtest.py`, `chan_backtester`, `strategy_ab_runner`, etc.), not just
+intraday.
