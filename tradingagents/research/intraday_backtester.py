@@ -1232,7 +1232,9 @@ class IntradayBreakoutBacktester:
                             candidate_log.append(candidate)
                             continue
                         trend_day = pd.Timestamp(ts.date())
-                        valid = trend_series.loc[trend_series.index <= trend_day]
+                        # Use prior session's regime: today's daily close is
+                        # not yet available to a 10:30 ET intraday signal.
+                        valid = trend_series.loc[trend_series.index < trend_day]
                         if valid.empty or not bool(valid.iloc[-1]):
                             candidate["filter_reason"] = "daily_trend_filter"
                             candidate_log.append(candidate)

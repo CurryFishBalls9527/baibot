@@ -282,7 +282,9 @@ def main():
         if args.apply_tradability_filter:
             run_symbols, diagnostics = filter_symbols_by_tradability(
                 run_symbols,
-                as_of_date=period["end"],
+                # Use period START, not end — selecting on liquidity/survival
+                # at period end is a survivorship leak.
+                as_of_date=period["begin"],
                 config=IntradayUniverseFilterConfig(
                     daily_db_path=args.daily_db,
                     lookback_days=args.tradability_lookback_days,

@@ -850,6 +850,9 @@ class ChanOrchestrator:
         if order_request.side == "buy":
             sl_price = round(current_price * (1 - stop_loss_pct), 2)
             tp_price = round(current_price * (1 + take_profit_pct), 2)
+            # Chan holds positions overnight — bracket children must persist
+            # past today's close (parent + OCO inherit the same TIF).
+            order_request.time_in_force = "gtc"
             order_result = self.broker.submit_bracket_order(
                 order_request,
                 stop_loss_price=sl_price,

@@ -169,7 +169,9 @@ class AlpacaBroker(BaseBroker):
             symbol=order.symbol,
             side=OrderSide.BUY,
             qty=order.qty,
-            time_in_force=TimeInForce.GTC,
+            # Respect caller's TIF — intraday wants DAY (auto-cancel unfilled
+            # parent at EOD); daily/chan want GTC (children persist past today).
+            time_in_force=tif,
             order_class=OrderClass.BRACKET,
             stop_loss={"stop_price": sl_submit},
             take_profit={"limit_price": tp_submit},

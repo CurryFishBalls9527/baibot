@@ -117,7 +117,11 @@ variants:
     db_path: trading_intraday_mechanical.db
     config_overrides:
       strategy_type: intraday_mechanical
-      intraday_dry_run: false
+      # FLIPPED 2026-04-21: lookahead bug in daily_trend_filter (`<=` not `<`)
+      # was the entire R/DD edge. Post-fix backtest: -7%/-18%/-4% across
+      # IS/2020/2018 with R/DD 0.15-0.52. Stay in dry-run while we re-design.
+      # See memory/project_intraday_lookahead_blowup.md.
+      intraday_dry_run: true
       intraday_universe_path: research_data/intraday_top250_universe.json
       intraday_lookback_days: 7
       intraday_allowed_families:

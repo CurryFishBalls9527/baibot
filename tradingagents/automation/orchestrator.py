@@ -1026,6 +1026,9 @@ class Orchestrator:
                 tp_price = self.risk_engine.get_take_profit_price(
                     current_price, structured.get("take_profit_pct")
                 )
+            # Daily strategy holds positions overnight — bracket children must
+            # persist past today's close (parent + OCO inherit the same TIF).
+            order_request.time_in_force = "gtc"
             order_result = self.broker.submit_bracket_order(
                 order_request,
                 stop_loss_price=sl_price,
