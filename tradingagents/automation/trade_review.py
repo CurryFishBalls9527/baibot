@@ -761,6 +761,122 @@ def _compose_markdown(
     )
 
 
+def run_held_position_review(
+    *,
+    db,
+    broker,
+    variant_name: str,
+    config: dict,
+    review_date: Optional[date] = None,
+    features_fn=None,
+) -> dict:
+    """Produce a short health-check markdown for each held position today.
+
+    One small LLM call per held symbol, output to
+    `results/daily_reviews/YYYY-MM-DD/{variant}_{symbol}_HELD.md`. Parallel
+    to `run_daily_review` (which covers CLOSED trades). Kill-switched by
+    `held_position_review_enabled` (default True).
+
+    `features_fn` is an optional callable `(symbol) -> dict` that the
+    orchestrator supplies (it has Minervini preflight cache etc). If
+    omitted the health read degrades gracefully — no RS-now / SMA-50.
+    """
+    if not config.get("held_position_review_enabled", True):
+        return {"variant": variant_name, "status": "disabled"}
+
+    from tradingagents.automation.position_health import (
+        collect_position_snapshot,
+        render_health_prompt,
+        compose_health_markdown,
+    )
+
+    review_date = review_date or date.today()
+    iso_day = review_date.isoformat()
+    dry_run = bool(config.get("held_position_review_dry_run", False))
+    base_dir = Path("results/daily_reviews_dryrun" if dry_run else "results/daily_reviews")
+    out_dir = base_dir / iso_day
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    budget = int(config.get("held_review_max_calls", 30))
+
+    try:
+        positions = broker.get_positions()
+    except Exception as e:
+        logger.error("held_position_review[%s] get_positions failed: %s",
+                     variant_name, e)
+        return {"variant": variant_name, "status": "error", "error": str(e)}
+
+    # Only stock positions — skip SPY overlay / options / cash equivalents.
+    stock_positions = [
+        p for p in positions
+        if getattr(p, "qty", 0) and str(getattr(p, "side", "")).lower() == "long"
+    ]
+
+    if not stock_positions:
+        logger.info("held_position_review[%s] %s: no held positions",
+                    variant_name, iso_day)
+        return {"variant": variant_name, "date": iso_day, "held": 0,
+                "analyzed": 0, "dry_run": dry_run}
+
+    from tradingagents.llm_clients.factory import create_llm_client
+    llm_client = create_llm_client(
+        provider=config.get("llm_provider", "openai"),
+        model=config.get("quick_think_llm", "gpt-4o-mini"),
+    )
+    llm = llm_client.get_llm()
+
+    analyzed = 0
+    failed_llm = 0
+    skipped_budget = 0
+    errors = 0
+
+    for pos in stock_positions:
+        if analyzed >= budget:
+            skipped_budget += 1
+            continue
+        try:
+            snapshot = collect_position_snapshot(
+                db=db, symbol=pos.symbol, position=pos,
+                variant=variant_name, features_fn=features_fn,
+            )
+            prompt = render_health_prompt(snapshot)
+            try:
+                body = llm.invoke(prompt).content
+            except Exception as e:
+                failed_llm += 1
+                body = f"*LLM health read failed: {e}*"
+                logger.warning(
+                    "held_position_review[%s] %s LLM failed: %s",
+                    variant_name, pos.symbol, e,
+                )
+            md = compose_health_markdown(snapshot, body)
+            md_path = out_dir / f"{variant_name}_{pos.symbol}_HELD.md"
+            md_path.write_text(md, encoding="utf-8")
+            analyzed += 1
+        except Exception as e:
+            errors += 1
+            logger.error(
+                "held_position_review[%s] %s failed: %s",
+                variant_name, pos.symbol, e, exc_info=True,
+            )
+
+    summary = {
+        "variant": variant_name, "date": iso_day,
+        "held": len(stock_positions),
+        "analyzed": analyzed,
+        "failed_llm": failed_llm,
+        "skipped_budget": skipped_budget,
+        "errors": errors,
+        "dry_run": dry_run,
+        "out_dir": str(out_dir),
+    }
+    logger.info(
+        "held_position_review[%s] %s: %d held, %d analyzed, %d errors",
+        variant_name, iso_day, len(stock_positions), analyzed, errors,
+    )
+    return summary
+
+
 def _write_day_summary(out_dir: Path, variant: str, iso_day: str,
                       outcomes: list, results: list) -> None:
     wins = sum(1 for o in outcomes if (o.get("return_pct") or 0) > 0)

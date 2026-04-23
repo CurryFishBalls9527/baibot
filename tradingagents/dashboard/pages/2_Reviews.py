@@ -85,33 +85,39 @@ if mode == "Daily per-trade":
     md_files = sorted(directory.glob("*.md"))
     # Exclude per-day summaries.
     md_files = [p for p in md_files if not p.name.endswith("_summary.md")]
-    # Group by variant prefix.
-    by_variant: dict[str, list[Path]] = {}
-    for p in md_files:
-        # Expect VARIANT_SYMBOL.md; split on the LAST underscore would misparse
-        # variants that contain underscores (e.g. mechanical_v2). Prefer a
-        # known variant-prefix match.
-        KNOWN = [
-            "mechanical_v2", "chan_v2", "mechanical", "chan",
-            "llm", "intraday_mechanical",
-        ]
-        matched = None
-        for v in KNOWN:
-            if p.name.startswith(f"{v}_"):
-                matched = v
-                break
-        if matched is None:
-            # Fallback: first token.
-            matched = p.name.split("_", 1)[0]
-        by_variant.setdefault(matched, []).append(p)
+    # Partition: *_HELD.md are the daily health checks for still-open
+    # positions; everything else is a closed-trade review.
+    held_files = [p for p in md_files if p.stem.endswith("_HELD")]
+    closed_files = [p for p in md_files if not p.stem.endswith("_HELD")]
+    # Group by variant prefix (shared logic for both partitions).
+    KNOWN = [
+        "mechanical_v2", "chan_v2", "mechanical", "chan",
+        "llm", "intraday_mechanical",
+    ]
 
-    variants = sorted(by_variant.keys())
+    def _variant_of(fname: str) -> str:
+        for v in KNOWN:
+            if fname.startswith(f"{v}_"):
+                return v
+        return fname.split("_", 1)[0]
+
+    by_variant: dict[str, list[Path]] = {}
+    held_by_variant: dict[str, list[Path]] = {}
+    for p in closed_files:
+        by_variant.setdefault(_variant_of(p.name), []).append(p)
+    for p in held_files:
+        held_by_variant.setdefault(_variant_of(p.name), []).append(p)
+
+    # Union variant set — a variant might have HELD files but no closed
+    # trades, or vice versa.
+    variants = sorted(set(by_variant.keys()) | set(held_by_variant.keys()))
     if not variants:
         st.info("No variant files found.")
         st.stop()
 
     chosen_variant = st.sidebar.selectbox("Variant", variants)
-    files = sorted(by_variant[chosen_variant])
+    files = sorted(by_variant.get(chosen_variant, []))
+    held = sorted(held_by_variant.get(chosen_variant, []))
 
     # Summary banner.
     summary_path = directory / f"{chosen_variant}_summary.md"
@@ -119,33 +125,81 @@ if mode == "Daily per-trade":
         with st.expander("Daily summary", expanded=True):
             st.markdown(_read_md(str(summary_path)))
 
-    if not files:
-        st.info("No per-trade reviews for this variant on this date.")
-        st.stop()
+    st.subheader(
+        f"{chosen_variant} — {chosen_date} — "
+        f"{len(files)} closed · {len(held)} held"
+    )
 
-    st.subheader(f"{chosen_variant} — {chosen_date} — {len(files)} trades")
-    for md_path in files:
-        # symbol = filename after the variant prefix, minus .md
-        stem = md_path.stem
-        if stem.startswith(f"{chosen_variant}_"):
-            symbol = stem[len(chosen_variant) + 1 :]
-        else:
-            symbol = stem
-        md = _read_md(str(md_path))
-        # Pull out the top-line headline (first H1) so the expander is skimmable.
-        headline = symbol
-        for line in md.splitlines():
-            if line.startswith("# "):
-                headline = line[2:].strip()
-                break
-        with st.expander(headline, expanded=False):
-            chart_path = directory / "charts" / f"{chosen_variant}_{symbol}.html"
-            if chart_path.exists():
-                html = _read_html(str(chart_path))
-                components.html(html, height=620, scrolling=True)
+    if files:
+        st.markdown("### Closed today")
+        for md_path in files:
+            stem = md_path.stem
+            if stem.startswith(f"{chosen_variant}_"):
+                symbol = stem[len(chosen_variant) + 1:]
             else:
-                st.caption("No chart available for this trade.")
-            st.markdown(md)
+                symbol = stem
+            md = _read_md(str(md_path))
+            headline = symbol
+            for line in md.splitlines():
+                if line.startswith("# "):
+                    headline = line[2:].strip()
+                    break
+            with st.expander(headline, expanded=False):
+                chart_path = directory / "charts" / f"{chosen_variant}_{symbol}.html"
+                if chart_path.exists():
+                    html = _read_html(str(chart_path))
+                    components.html(html, height=620, scrolling=True)
+                else:
+                    st.caption("No chart available for this trade.")
+                st.markdown(md)
+
+    if held:
+        st.markdown("### Held positions (open)")
+        _health_colors = {
+            "HEALTHY": "#66bb6a",
+            "WATCH": "#ffa726",
+            "WARNING": "#ef5350",
+        }
+        for md_path in held:
+            stem = md_path.stem  # ends with "_HELD"
+            inner = stem[: -len("_HELD")]
+            if inner.startswith(f"{chosen_variant}_"):
+                symbol = inner[len(chosen_variant) + 1:]
+            else:
+                symbol = inner
+            md = _read_md(str(md_path))
+
+            # Extract `### Health: X` line for the badge.
+            health = None
+            for line in md.splitlines():
+                if line.startswith("### Health:"):
+                    health = line.split(":", 1)[1].strip()
+                    break
+            headline = symbol
+            for line in md.splitlines():
+                if line.startswith("# "):
+                    headline = line[2:].strip()
+                    break
+
+            header_parts = [headline]
+            if health:
+                color = _health_colors.get(health.upper(), "#888")
+                header_parts.append(
+                    f":material/circle: {health}"
+                )  # streamlit ignores unknown icons but keeps text
+            with st.expander(" · ".join(header_parts), expanded=False):
+                if health:
+                    color = _health_colors.get(health.upper(), "#888")
+                    st.markdown(
+                        f"<span style='background:{color};color:#000;"
+                        f"padding:2px 10px;border-radius:4px;font-weight:600;"
+                        f"font-size:12px;'>{health}</span>",
+                        unsafe_allow_html=True,
+                    )
+                st.markdown(md)
+
+    if not files and not held:
+        st.info("No trades or held-position reviews for this variant on this date.")
 
 elif mode == "Weekly strategy":
     chosen_date = st.sidebar.date_input("Week of", value=today, max_value=today)

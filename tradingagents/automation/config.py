@@ -248,6 +248,18 @@ def build_config(overrides: dict = None) -> dict:
         # as a "## Red-Team Counter-Review" section ending with a single
         # RED-TEAM VERDICT line that the dashboard surfaces as a badge.
         "weekly_red_team_enabled": True,
+        # Held-position daily health check: 17:15 ET Mon-Fri, one small
+        # gpt-4o-mini call per open position. No trade actions, just
+        # markdown output alongside the daily closed-trade reviews.
+        "held_position_review_enabled": True,
+        "held_position_review_time": "17:15",
+        "held_review_max_calls": 30,
+        # Scheduler heartbeats: alert when the daily / weekly review cron
+        # was supposed to fire but didn't (launchd died, silent crash).
+        "daily_review_heartbeat_enabled": True,
+        "daily_review_heartbeat_time": "18:00",
+        "weekly_review_heartbeat_enabled": True,
+        "weekly_review_heartbeat_time": "11:00",
         # Kill-switches for the per-variant trade_outcome hook. Default On
         # (safe additive; all writes wrapped in try/except). Flip off if
         # a specific variant's exit path starts producing spurious warnings.

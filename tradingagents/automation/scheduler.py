@@ -317,6 +317,83 @@ class TradingScheduler:
         )
         logger.info(f"Scheduled daily reflection at {reflection_time} ET (Mon-Fri)")
 
+        # Held-position health check — Mon-Fri 17:15 ET (after the 17:00
+        # closed-trade review runs, so both sets of files land together
+        # in results/daily_reviews/YYYY-MM-DD/). Gated by
+        # `held_position_review_enabled` (default True).
+        if self.config.get("held_position_review_enabled", True) and mode in ("swing", "both"):
+            held_time = self.config.get("held_position_review_time", "17:15")
+            hour, minute = held_time.split(":")
+            held_func = (
+                self.ab_runner.run_held_position_review
+                if self.ab_runner
+                else self.orchestrator.run_held_position_review
+            )
+            self.scheduler.add_job(
+                self._run_with_logging,
+                args=[held_func, "Held Position Review"],
+                trigger=CronTrigger(
+                    day_of_week="mon-fri",
+                    hour=int(hour),
+                    minute=int(minute),
+                    timezone="US/Eastern",
+                ),
+                id="held_position_review",
+                name="Held Position Review",
+                misfire_grace_time=1800,
+            )
+            logger.info(
+                "Scheduled held-position review at %s ET (Mon-Fri)", held_time,
+            )
+
+        # Heartbeats — alert when the daily / weekly review cron was
+        # supposed to fire but didn't (launchd died, scheduler crashed
+        # silently). `_run_with_logging` already alerts on raises; this
+        # covers the complementary silent-skip case.
+        if self.config.get("daily_review_heartbeat_enabled", True) and mode in ("swing", "both"):
+            from tradingagents.automation.heartbeat import check_daily_review_ran
+            heartbeat_time = self.config.get("daily_review_heartbeat_time", "18:00")
+            hour, minute = heartbeat_time.split(":")
+            self.scheduler.add_job(
+                self._run_with_logging,
+                args=[lambda: check_daily_review_ran(self.config), "Daily Review Heartbeat"],
+                trigger=CronTrigger(
+                    day_of_week="mon-fri",
+                    hour=int(hour),
+                    minute=int(minute),
+                    timezone="US/Eastern",
+                ),
+                id="daily_review_heartbeat",
+                name="Daily Review Heartbeat",
+                misfire_grace_time=1800,
+            )
+            logger.info(
+                "Scheduled daily review heartbeat at %s ET (Mon-Fri)",
+                heartbeat_time,
+            )
+
+        if self.config.get("weekly_review_heartbeat_enabled", True) and self.ab_runner:
+            from tradingagents.automation.heartbeat import check_weekly_review_ran
+            weekly_hb_time = self.config.get("weekly_review_heartbeat_time", "11:00")
+            hour, minute = weekly_hb_time.split(":")
+            self.scheduler.add_job(
+                self._run_with_logging,
+                args=[lambda: check_weekly_review_ran(self.config), "Weekly Review Heartbeat"],
+                trigger=CronTrigger(
+                    day_of_week="sat",
+                    hour=int(hour),
+                    minute=int(minute),
+                    timezone="US/Eastern",
+                ),
+                id="weekly_review_heartbeat",
+                name="Weekly Review Heartbeat",
+                misfire_grace_time=3600,
+            )
+            logger.info(
+                "Scheduled weekly review heartbeat at %s ET (Saturday)",
+                weekly_hb_time,
+            )
+
         if self.config.get("social_monitor_enabled", False):
             interval = max(int(self.config.get("social_check_interval_minutes", 30)), 1)
             self.scheduler.add_job(
@@ -377,6 +454,15 @@ class TradingScheduler:
         logger.info(f"Paper: {self.config.get('paper_trading', True)}")
         logger.info(f"Watchlist: {self.config.get('watchlist', [])}")
         logger.info("=" * 60)
+
+        # Log which notifier backends have credentials — without this line,
+        # a misconfigured notifier sends job-failure alerts to the void and
+        # the user has no visibility that alerts are silently dropping.
+        try:
+            from tradingagents.automation.heartbeat import log_notifier_banner
+            log_notifier_banner(self.config)
+        except Exception as e:
+            logger.debug(f"Notifier banner failed: {e}")
 
         # Take initial snapshot
         if self.orchestrator:

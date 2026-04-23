@@ -149,6 +149,21 @@ class ABRunner:
             return {"status": "not_applicable"}
         return self._grouped_parallel(_dispatch, "daily trade review")
 
+    def run_held_position_review(self) -> Dict[str, Dict]:
+        """Fan out the held-position daily health check across variants."""
+        def _dispatch(_name: str, orch) -> Dict:
+            if hasattr(orch, "run_held_position_review"):
+                try:
+                    return orch.run_held_position_review()
+                except Exception as e:
+                    logger.error(
+                        "Variant '%s' held_position_review failed: %s",
+                        _name, e, exc_info=True,
+                    )
+                    return {"error": str(e)}
+            return {"status": "not_applicable"}
+        return self._grouped_parallel(_dispatch, "held position review")
+
     def run_exit_check_pass(self) -> Dict[str, Dict]:
         """Run exit-manager check across swing variants on 5-min cadence.
 

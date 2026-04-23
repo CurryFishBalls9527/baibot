@@ -596,6 +596,24 @@ class Orchestrator:
             config=self.config,
         )
 
+    def run_held_position_review(self) -> Dict:
+        """Health-check markdown per open position (daily).
+
+        Parallel to `run_daily_trade_review` but for positions that are
+        STILL HELD. Passes our `_get_latest_features` as the feature
+        provider so the health prompt sees current SMA-50, RS, ADX from
+        the cached Minervini preflight.
+        """
+        from tradingagents.automation.trade_review import run_held_position_review
+
+        return run_held_position_review(
+            db=self.db,
+            broker=self.broker,
+            variant_name=self.config.get("variant_name", "unknown"),
+            config=self.config,
+            features_fn=self._get_latest_features,
+        )
+
     def run_exit_check_pass(
         self,
         preflight=None,

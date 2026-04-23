@@ -825,6 +825,23 @@ class TradingDatabase:
         )
         self.conn.commit()
 
+    def update_trade_outcome_base_pattern(
+        self,
+        outcome_id: int,
+        base_pattern: Optional[str],
+    ) -> None:
+        """Patch base_pattern on an existing trade outcome row.
+
+        Used by `scripts/backfill_chan_base_pattern.py` to populate
+        historical Chan trades whose T-type was captured on the entry
+        signal but never copied into trade_outcomes.
+        """
+        self.conn.execute(
+            "UPDATE trade_outcomes SET base_pattern = ? WHERE id = ?",
+            (base_pattern, outcome_id),
+        )
+        self.conn.commit()
+
     # ── Proposals (weekly-review feedback loop) ───────────────────────
 
     def insert_proposal(

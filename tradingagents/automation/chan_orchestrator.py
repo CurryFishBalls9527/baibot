@@ -1221,6 +1221,23 @@ class ChanOrchestrator:
             config=self.config,
         )
 
+    def run_held_position_review(self) -> Dict:
+        """Health-check per held Chan position (daily).
+
+        Chan doesn't have a Minervini-style preflight cache, so
+        features_fn stays None. The prompt degrades gracefully — no
+        SMA-50/RS-now — but the core stats (entry, current, MFE,
+        distance-to-stop, hold days, T-type, regime at entry) all work.
+        """
+        from tradingagents.automation.trade_review import run_held_position_review
+
+        return run_held_position_review(
+            db=self.db,
+            broker=self.broker,
+            variant_name=self.config.get("variant_name", "chan"),
+            config=self.config,
+        )
+
     def reconcile_orders(self) -> Dict:
         """Sync local `trades` rows against broker state (Track P-SYNC)."""
         from .reconciler import OrderReconciler
