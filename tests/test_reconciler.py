@@ -134,6 +134,159 @@ def test_reconcile_handles_broker_error(tmp_path):
     assert row["status"] == "OrderStatus.NEW"
 
 
+def _mk_filled_leg(order_id, status="OrderStatus.FILLED", filled_qty=10,
+                   filled_price=95.0, qty=10):
+    leg = MagicMock()
+    leg.order_id = order_id
+    leg.status = status
+    leg.filled_qty = filled_qty
+    leg.filled_avg_price = filled_price
+    leg.qty = qty
+    leg.filled_at = None
+    return leg
+
+
+def test_bracket_fill_logs_trade_outcome(tmp_path):
+    """Regression: bracket leg fill must write a trade_outcomes row.
+
+    Closes Gap A — _insert_leg_fill used to write trades but not outcomes,
+    so the daily review silently missed every bracket-fired exit.
+    """
+    db = _mkdb(tmp_path, variant="llm")
+    # Simulate an open position: buy row + position_state.
+    db.log_trade(
+        symbol="AAOI", side="buy", qty=67,
+        status="OrderStatus.FILLED", filled_qty=67, filled_price=151.80,
+        order_id="parent-oid",
+    )
+    db.upsert_position_state("AAOI", {
+        "entry_price": 151.80,
+        "entry_date": "2026-04-13",
+        "highest_close": 165.0,
+        "current_stop": 151.80,
+        "partial_taken": False,
+        "variant": "llm",
+        "base_pattern": "leader_continuation",
+        "regime_at_entry": "confirmed_uptrend",
+    })
+
+    parent = OrderResult(
+        order_id="parent-oid", symbol="AAOI", side="buy", qty=67,
+        notional=None, order_type="market", status="OrderStatus.FILLED",
+        filled_qty=67, filled_avg_price=151.80,
+        stop_order_id="sl-oid", tp_order_id="tp-oid",
+    )
+    broker = MagicMock()
+    broker.data_client = None  # skip excursion network call
+    broker.get_order.side_effect = lambda oid: {
+        "parent-oid": parent,
+        "sl-oid": _mk_filled_leg("sl-oid", filled_price=151.71, qty=67),
+        "tp-oid": _mk_filled_leg(
+            "tp-oid", status="OrderStatus.CANCELED", filled_qty=0,
+            filled_price=None, qty=67,
+        ),
+    }[oid]
+
+    rec = OrderReconciler(broker=broker, db=db, variant="llm")
+    result = rec.reconcile_once()
+
+    # Trade row inserted for the stop fill
+    assert result["leg_inserted"] == 1
+    # trade_outcomes row materialized
+    outcomes = db.conn.execute(
+        "SELECT symbol, exit_reason, return_pct, entry_price, exit_price "
+        "FROM trade_outcomes WHERE symbol='AAOI'"
+    ).fetchall()
+    assert len(outcomes) == 1
+    row = outcomes[0]
+    assert row["exit_reason"] == "bracket_stop_loss"
+    assert row["entry_price"] == 151.80
+    assert row["exit_price"] == 151.71
+    # Return: (151.71 - 151.80) / 151.80 ≈ -0.000593
+    assert row["return_pct"] < 0
+    assert row["return_pct"] > -0.01
+
+
+def test_bracket_fill_outcome_idempotent(tmp_path):
+    """Re-running reconcile on the same fill must not duplicate the outcome."""
+    db = _mkdb(tmp_path, variant="llm")
+    db.log_trade(
+        symbol="AAOI", side="buy", qty=67,
+        status="OrderStatus.FILLED", filled_qty=67, filled_price=151.80,
+        order_id="parent-oid",
+    )
+    db.upsert_position_state("AAOI", {
+        "entry_price": 151.80, "entry_date": "2026-04-13",
+        "highest_close": 151.80, "current_stop": 151.80,
+        "partial_taken": False, "variant": "llm",
+    })
+    # Pre-existing outcome — simulates the backfill script already ran.
+    db.log_trade_outcome({
+        "symbol": "AAOI", "entry_date": "2026-04-13", "exit_date": "2026-04-23",
+        "entry_price": 151.80, "exit_price": 151.71,
+        "return_pct": -0.0006, "hold_days": 10,
+        "exit_reason": "bracket_stop_loss",
+    })
+    parent = OrderResult(
+        order_id="parent-oid", symbol="AAOI", side="buy", qty=67,
+        notional=None, order_type="market", status="OrderStatus.FILLED",
+        filled_qty=67, filled_avg_price=151.80,
+        stop_order_id="sl-oid", tp_order_id="tp-oid",
+    )
+    broker = MagicMock()
+    broker.data_client = None
+    broker.get_order.side_effect = lambda oid: {
+        "parent-oid": parent,
+        "sl-oid": _mk_filled_leg("sl-oid", filled_price=151.71, qty=67),
+        "tp-oid": _mk_filled_leg(
+            "tp-oid", status="OrderStatus.CANCELED", filled_qty=0,
+            filled_price=None, qty=67,
+        ),
+    }[oid]
+
+    rec = OrderReconciler(broker=broker, db=db, variant="llm")
+    rec.reconcile_once()
+
+    outcomes = db.conn.execute(
+        "SELECT COUNT(*) c FROM trade_outcomes WHERE symbol='AAOI'"
+    ).fetchone()
+    assert outcomes["c"] == 1  # still just the one, no duplicate
+
+
+def test_bracket_fill_no_outcome_when_state_missing(tmp_path):
+    """If position_state is already gone, skip silently (no crash)."""
+    db = _mkdb(tmp_path, variant="llm")
+    db.log_trade(
+        symbol="AAOI", side="buy", qty=67,
+        status="OrderStatus.FILLED", filled_qty=67, filled_price=151.80,
+        order_id="parent-oid",
+    )
+    # NOTE: no position_state row.
+    parent = OrderResult(
+        order_id="parent-oid", symbol="AAOI", side="buy", qty=67,
+        notional=None, order_type="market", status="OrderStatus.FILLED",
+        filled_qty=67, filled_avg_price=151.80,
+        stop_order_id="sl-oid", tp_order_id="tp-oid",
+    )
+    broker = MagicMock()
+    broker.data_client = None
+    broker.get_order.side_effect = lambda oid: {
+        "parent-oid": parent,
+        "sl-oid": _mk_filled_leg("sl-oid", filled_price=151.71, qty=67),
+        "tp-oid": _mk_filled_leg(
+            "tp-oid", status="OrderStatus.CANCELED", filled_qty=0,
+            filled_price=None, qty=67,
+        ),
+    }[oid]
+    rec = OrderReconciler(broker=broker, db=db, variant="llm")
+    rec.reconcile_once()  # must not raise
+
+    outcomes = db.conn.execute(
+        "SELECT COUNT(*) c FROM trade_outcomes"
+    ).fetchone()
+    assert outcomes["c"] == 0
+
+
 def test_reconcile_respects_lookback(tmp_path):
     db = _mkdb(tmp_path)
     db.log_trade(

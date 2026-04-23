@@ -79,6 +79,7 @@ class OrderReconciler:
         lookback_days: int = 30,
         drift_alert_hours: int = 1,
         notifier=None,
+        config: dict | None = None,
     ):
         self.broker = broker
         self.db = db
@@ -86,6 +87,10 @@ class OrderReconciler:
         self.lookback_days = lookback_days
         self.drift_alert_hours = drift_alert_hours
         self.notifier = notifier
+        # config gates the bracket-fire outcome hook (excursion fetch cost +
+        # paper-account IEX feed fallback). Optional so existing tests that
+        # construct OrderReconciler without config keep working.
+        self.config = config or {}
 
     def _fetch_open_trades(self) -> List[dict]:
         cutoff = (datetime.utcnow() - timedelta(days=self.lookback_days)).isoformat()
@@ -163,6 +168,89 @@ class OrderReconciler:
             ),
         )
         self.db.conn.commit()
+        # The trade row is now durable; pair it with a trade_outcomes row
+        # while the entry context in position_states is still available
+        # (the ghost-cleanup phase later in reconcile_once() will delete it).
+        # Without this hook the daily/weekly review silently ignores every
+        # bracket-fired exit — only ExitManager-path SELLs get outcomes.
+        self._maybe_log_bracket_outcome(parent_symbol, label, leg, filled_price)
+
+    def _maybe_log_bracket_outcome(
+        self,
+        parent_symbol: str,
+        label: str,
+        leg,
+        filled_price: float | None,
+    ) -> None:
+        """Write a trade_outcomes row for a just-swept bracket fill.
+
+        Runs in the same reconcile tick that writes the trade row, BEFORE
+        the ghost-cleanup phase deletes position_states. Idempotent: skips
+        if an outcome already exists for (symbol, entry_date, entry_price).
+
+        Fails soft — outcome bookkeeping must never block the trade-row
+        insert or the rest of reconciliation.
+        """
+        if filled_price is None:
+            return
+        try:
+            pos_state = self.db.get_position_state(parent_symbol)
+        except Exception as e:
+            logger.warning(
+                "reconciler[%s]: get_position_state(%s) failed during outcome "
+                "log: %s", self.variant or "-", parent_symbol, e,
+            )
+            return
+        if pos_state is None:
+            # Already cleaned up — entry context is gone. Fall back to the
+            # backfill script if the caller wants an outcome row anyway.
+            return
+        entry_date = pos_state.get("entry_date")
+        entry_price = pos_state.get("entry_price")
+        if entry_price is None:
+            return
+        try:
+            existing = self.db.conn.execute(
+                """
+                SELECT id FROM trade_outcomes
+                WHERE symbol = ? AND entry_date = ? AND entry_price = ?
+                LIMIT 1
+                """,
+                (parent_symbol, entry_date, float(entry_price)),
+            ).fetchone()
+            if existing is not None:
+                return
+        except Exception as e:
+            logger.warning(
+                "reconciler[%s]: outcome idempotence check failed for %s: %s",
+                self.variant or "-", parent_symbol, e,
+            )
+            return
+        try:
+            from tradingagents.automation.trade_outcome import log_closed_trade
+            outcome_id = log_closed_trade(
+                db=self.db,
+                symbol=parent_symbol,
+                pos_state=pos_state,
+                exit_price=float(filled_price),
+                exit_reason=f"bracket_{label}",
+                broker=self.broker,
+                excursion_enabled=bool(
+                    self.config.get("trade_outcome_excursion_enabled", False)
+                ),
+            )
+            if outcome_id is not None:
+                logger.info(
+                    "reconciler[%s] trade_outcome logged: %s bracket_%s "
+                    "entry=$%.2f exit=$%.2f (id=%s)",
+                    self.variant or "-", parent_symbol, label,
+                    float(entry_price), float(filled_price), outcome_id,
+                )
+        except Exception as e:
+            logger.warning(
+                "reconciler[%s]: log_closed_trade(%s) failed: %s",
+                self.variant or "-", parent_symbol, e,
+            )
 
     def _sweep_bracket_legs(self) -> dict:
         """Pull bracket child fills into the local DB.

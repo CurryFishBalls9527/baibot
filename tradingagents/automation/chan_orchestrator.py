@@ -1258,5 +1258,6 @@ class ChanOrchestrator:
             db=self.db,
             variant=self.config.get("variant_name"),
             notifier=self.notifier,
+            config=self.config,
         )
         return reconciler.reconcile_once()
