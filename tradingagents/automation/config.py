@@ -227,6 +227,23 @@ def build_config(overrides: dict = None) -> dict:
         "use_50dma_exit": True,
         "use_ema21_exit": False,
 
+        # Automated feedback loop (PR1–PR4, shipped 2026-04-22).
+        # MFE/MAE compute hook runs inside _log_trade_outcome; kill switch
+        # keeps it off until explicitly enabled. Safe by construction: fails
+        # soft, adds at most one Alpaca hourly-bars call per exit.
+        "trade_outcome_excursion_enabled": True,
+        # Daily trade review: 17:00 ET Mon-Fri, gpt-4o-mini per closed trade,
+        # writes markdown + Plotly chart to results/daily_reviews/.
+        "daily_trade_review_enabled": True,
+        "daily_trade_review_time": "17:00",
+        "daily_review_max_calls": 50,
+        # Weekly strategy review: Sat 09:00 ET, gpt-5.2 per variant, writes
+        # markdown to results/weekly_reviews/.
+        "weekly_strategy_review_enabled": True,
+        "weekly_review_time": "09:00",
+        "weekly_review_max_calls": 10,
+        "weekly_review_model": "gpt-5.2",
+
         # Storage
         "db_path": os.path.join(
             os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),

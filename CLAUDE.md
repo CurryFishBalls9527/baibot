@@ -113,6 +113,40 @@ pip install -e .              # Install in dev mode
 python -m pytest tests/       # Run tests
 ```
 
+## Restart the scheduler after code changes that affect live trading
+
+The scheduler runs under launchd as `com.tradingagents.scheduler`
+(`~/Library/LaunchAgents/com.tradingagents.scheduler.plist`). It loads
+every `tradingagents/` module once at startup and holds the imports in
+memory for the life of the process. Editing code does NOT propagate to
+the running scheduler.
+
+**Standard operation:** whenever a code change is expected to affect
+live behavior — broker integration, orchestrator logic, exit manager,
+risk gates, config schema — the scheduler must be restarted to pick it
+up. Ask the user before restarting.
+
+```bash
+launchctl kickstart -k gui/$UID/com.tradingagents.scheduler
+```
+
+The `-k` flag stops the current process and relaunches it under launchd.
+This is a brief (seconds) gap in the scheduler loop but does not cancel
+open Alpaca orders or clear position state. Confirm the restart took by
+checking the PID changed:
+
+```bash
+launchctl list | grep com.tradingagents.scheduler
+```
+
+Changes that do NOT require a restart:
+- Backtest / research scripts under `scripts/` (not imported by scheduler)
+- Tests under `tests/`
+- DB rows modified out-of-band (scheduler re-reads the DB each tick)
+- `experiments/paper_launch_v2.yaml` (re-read at next scheduler tick)
+
+When in doubt, restart.
+
 ## Strategy edge claims — MANDATORY before reporting any backtest result
 
 A one-character lookahead (`<=` vs `<`) in `intraday_backtester.py:1235`

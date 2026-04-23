@@ -33,6 +33,7 @@ from Common.CEnum import AUTYPE, BI_DIR, KL_TYPE
 
 from tradingagents.broker.alpaca_broker import AlpacaBroker
 from tradingagents.broker.models import Account, OrderRequest, Position
+from tradingagents.portfolio.portfolio_tracker import PortfolioTracker
 from tradingagents.portfolio.position_sizer import PositionSizer
 from tradingagents.risk.risk_engine import RiskEngine
 from tradingagents.storage.database import TradingDatabase
@@ -85,6 +86,11 @@ class ChanOrchestrator:
         risk_config = {**config, "starting_equity": starting_equity}
         self.risk_engine = RiskEngine(risk_config)
         self.sizer = PositionSizer(config)
+        # Parity with the base Orchestrator: without this, the scheduler's
+        # initial snapshot hook and `take_market_snapshot` both no-op'd,
+        # leaving `daily_snapshots` empty for chan/chan_v2 variants — the
+        # dashboard then shows no equity curve for those variants.
+        self.tracker = PortfolioTracker(self.broker, self.db)
 
         self.intraday_db = config.get("chan_intraday_db", "research_data/intraday_30m_broad.duckdb")
         self.daily_db = config.get("chan_daily_db", "research_data/market_data.duckdb")
@@ -249,6 +255,20 @@ class ChanOrchestrator:
             logger.info("At max positions (%d), skipping entry scan", self.max_positions)
             return entry_results
 
+        # Fail-closed freshness: sync broker → DB so the same-day-stop guard below
+        # reads the latest bracket leg fills. Entry scans run every 10 min but the
+        # reconciler cron fires every 5 min; a stop that fills between ticks would
+        # otherwise be invisible here.
+        try:
+            self.reconcile_orders()
+        except Exception as e:
+            logger.warning(
+                "Chan entry scan aborted: pre-scan reconcile failed (%s). "
+                "Skipping this tick rather than entering against a stale DB.",
+                e,
+            )
+            return entry_results
+
         # C3: regime gate — suppress new entries in weak markets when enabled.
         if self.regime_gate_enabled:
             regime = self._load_market_regime()
@@ -269,6 +289,13 @@ class ChanOrchestrator:
             cfg_dict["mean_metrics"] = [20, 60]
         chan_cfg = CChanConfig(cfg_dict)
         candidates = sorted(rs_qualifying - held_symbols)
+        blocked_whipsaw = [s for s in candidates if self.db.was_stopped_today(s)]
+        if blocked_whipsaw:
+            logger.info(
+                "Chan whipsaw guard: skipping %d symbols stopped today: %s",
+                len(blocked_whipsaw), ",".join(blocked_whipsaw),
+            )
+            candidates = [s for s in candidates if s not in set(blocked_whipsaw)]
         logger.info("Scanning %d candidates for buy signals...", len(candidates))
 
         for symbol in candidates:
@@ -863,7 +890,27 @@ class ChanOrchestrator:
             tp_price = order_result.effective_take_profit_price or tp_price
             logger.info("%s: Bracket order SL=$%.2f TP=$%.2f", symbol, sl_price, tp_price)
         else:
-            order_result = self.broker.submit_order(order_request)
+            # Cancel any open bracket legs pinning the shares, then liquidate.
+            # Plain submit_order on a bracketed position fails with Alpaca 40310000
+            # because the SL/TP OCO legs leave held_for_orders == position qty.
+            try:
+                open_orders = self.broker.get_open_orders(symbol=symbol)
+            except TypeError:
+                open_orders = self.broker.get_open_orders()
+            for o in open_orders or []:
+                if str(getattr(o, "symbol", "")).upper() != symbol.upper():
+                    continue
+                try:
+                    self.broker.cancel_order(o.order_id)
+                except Exception as exc:
+                    logger.debug("cancel_order(%s) failed: %s", o.order_id, exc)
+            try:
+                order_result = self.broker.close_position(symbol)
+            except Exception as exc:
+                logger.error("close_position(%s) failed: %s", symbol, exc)
+                self.db.mark_signal_rejected(signal_id, f"close_position failed: {exc}")
+                return {"symbol": symbol, "action": action, "traded": False,
+                        "error": str(exc)}
 
         self.risk_engine.record_trade()
 
@@ -1059,8 +1106,29 @@ class ChanOrchestrator:
         return {}
 
     def take_market_snapshot(self) -> Dict:
-        """Placeholder — Chan doesn't need a pre-market snapshot."""
-        return {}
+        """Capture account + portfolio state into `daily_snapshots`.
+
+        Previously a `return {}` placeholder, which meant the dashboard's
+        equity curve was empty for chan and chan_v2 variants. Now mirrors
+        the base Orchestrator: writes one row per cron tick.
+        """
+        logger.info("Chan: capturing scheduled market snapshot...")
+        return self.tracker.take_daily_snapshot()
+
+    def run_daily_trade_review(self) -> Dict:
+        """Per-trade post-mortems for trades that closed today.
+
+        Shares the same implementation as `Orchestrator.run_daily_trade_review`.
+        Kill-switched via `daily_trade_review_enabled` config flag.
+        """
+        from tradingagents.automation.trade_review import run_daily_review
+
+        return run_daily_review(
+            db=self.db,
+            broker=self.broker,
+            variant_name=self.config.get("variant_name", "chan"),
+            config=self.config,
+        )
 
     def reconcile_orders(self) -> Dict:
         """Sync local `trades` rows against broker state (Track P-SYNC)."""

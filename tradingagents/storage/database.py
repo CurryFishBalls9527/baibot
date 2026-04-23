@@ -206,6 +206,17 @@ class TradingDatabase:
                 "variant": "TEXT",
             },
         )
+        # Structured entry-signal metadata (intraday ORB levels, NR4 range,
+        # VWAP, Minervini pivot, Chan T-type, etc). JSON blob, NULL for older
+        # rows and for any call that doesn't provide it. Readers MUST tolerate
+        # NULL. See memory/project_bracket_leg_id_bug.md for the analogous
+        # NULL-tolerant pattern around stop_order_id.
+        self._ensure_columns(
+            "signals",
+            {
+                "signal_metadata": "TEXT",
+            },
+        )
         self._ensure_columns(
             "setup_candidates",
             {
@@ -242,13 +253,23 @@ class TradingDatabase:
     def log_signal(self, symbol: str, action: str, confidence: float = 0,
                    reasoning: str = "", stop_loss: float = None,
                    take_profit: float = None, timeframe: str = "",
-                   full_analysis: str = "") -> int:
+                   full_analysis: str = "",
+                   signal_metadata: Optional[str] = None) -> int:
+        """Insert a signal row.
+
+        `signal_metadata` is an optional JSON-encoded string carrying the
+        structured per-strategy entry context (pivot, ORB levels, ZS bounds,
+        T-type, etc). Kept as opaque TEXT so schema stays stable as setups
+        evolve. All readers must tolerate NULL.
+        """
         cur = self.conn.execute(
             """INSERT INTO signals (symbol, action, confidence, reasoning,
-               stop_loss, take_profit, timeframe, full_analysis)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+               stop_loss, take_profit, timeframe, full_analysis,
+               signal_metadata)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (symbol, action, confidence, reasoning,
-             stop_loss, take_profit, timeframe, full_analysis),
+             stop_loss, take_profit, timeframe, full_analysis,
+             signal_metadata),
         )
         self.conn.commit()
         return cur.lastrowid
@@ -465,6 +486,29 @@ class TradingDatabase:
             "SELECT * FROM trades WHERE date(timestamp) = ?", (today,)
         ).fetchall()
         return [dict(r) for r in rows]
+
+    def was_stopped_today(self, symbol: str, as_of: Optional[str] = None) -> bool:
+        """True iff `symbol` had a filled bracket_stop_loss sell on `as_of`.
+
+        Relies on reconciler-populated SELL rows where `reasoning='bracket_stop_loss'`.
+        Callers must reconcile before using this — stop-loss legs fire broker-side and
+        only reach SQLite via `OrderReconciler.reconcile_once()`.
+        """
+        day = as_of or date.today().isoformat()
+        row = self.conn.execute(
+            """
+            SELECT 1 FROM trades
+            WHERE symbol = ?
+              AND side = 'sell'
+              AND LOWER(COALESCE(reasoning, '')) LIKE '%stop_loss%'
+              AND LOWER(status) LIKE '%filled%'
+              AND COALESCE(filled_qty, 0) > 0
+              AND date(timestamp) = ?
+            LIMIT 1
+            """,
+            (symbol, day),
+        ).fetchone()
+        return row is not None
 
     def get_trade_summary(self, trade_date: Optional[str] = None) -> Dict[str, Any]:
         summary_date = trade_date or date.today().isoformat()
@@ -684,6 +728,14 @@ class TradingDatabase:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def get_snapshots_in_range(self, start_date: str, end_date: str) -> List[Dict]:
+        """Daily snapshots in [start_date, end_date] (inclusive), oldest first."""
+        rows = self.conn.execute(
+            "SELECT * FROM daily_snapshots WHERE date BETWEEN ? AND ? ORDER BY date ASC",
+            (start_date, end_date),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
     def get_trades_in_range(self, start_date: str, end_date: str) -> List[Dict]:
         rows = self.conn.execute(
             "SELECT * FROM trades WHERE date(timestamp) BETWEEN ? AND ? ORDER BY timestamp",
@@ -722,6 +774,21 @@ class TradingDatabase:
         self.conn.execute(
             "UPDATE trade_outcomes SET trade_analysis = ? WHERE id = ?",
             (analysis, outcome_id),
+        )
+        self.conn.commit()
+
+    def update_trade_excursion(
+        self,
+        outcome_id: int,
+        mfe: Optional[float],
+        mae: Optional[float],
+    ) -> None:
+        """Patch MFE/MAE onto an existing trade outcome row (used by backfill)."""
+        self.conn.execute(
+            """UPDATE trade_outcomes
+               SET max_favorable_excursion = ?, max_adverse_excursion = ?
+               WHERE id = ?""",
+            (mfe, mae, outcome_id),
         )
         self.conn.commit()
 

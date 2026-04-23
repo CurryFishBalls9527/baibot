@@ -1,6 +1,7 @@
 """Alpaca broker implementation for paper and live trading."""
 
 import logging
+import time
 from typing import List, Optional
 
 from alpaca.trading.client import TradingClient
@@ -183,6 +184,29 @@ class AlpacaBroker(BaseBroker):
             f"SL=${sl_submit:.2f} TP=${tp_submit:.2f} -> {result.status}"
         )
         out = self._to_order_result(result)
+        # Alpaca's initial submit response for a bracket has `legs=[]` — the SL/TP
+        # children only materialize after the parent is accepted/filled. Without
+        # capturing their IDs here, position_states.stop_order_id stays None and
+        # ExitManagerV2._maybe_update_broker_stop silently no-ops (trail ratchet
+        # never propagates to the broker). Refetch the parent by ID to pick the
+        # child IDs up; short retry covers the brief window between parent fill
+        # and child creation on Alpaca's side.
+        if not out.stop_order_id or not out.tp_order_id:
+            refetched = self._refetch_bracket_legs(str(result.id))
+            if refetched is not None:
+                out.stop_order_id = out.stop_order_id or refetched.stop_order_id
+                out.tp_order_id = out.tp_order_id or refetched.tp_order_id
+                # Refetch also has the authoritative fill price once filled.
+                if refetched.filled_avg_price and not out.filled_avg_price:
+                    out.filled_avg_price = refetched.filled_avg_price
+                    out.filled_qty = refetched.filled_qty
+                    out.status = refetched.status
+        if not out.stop_order_id or not out.tp_order_id:
+            logger.warning(
+                f"{order.symbol}: bracket submitted but leg IDs still missing after "
+                f"refetch (stop={out.stop_order_id} tp={out.tp_order_id}). Broker-side "
+                f"stop ratcheting will be disabled for this position until backfill."
+            )
         out.effective_stop_price = sl_submit
         out.effective_take_profit_price = tp_submit
 
@@ -249,6 +273,35 @@ class AlpacaBroker(BaseBroker):
         raw = self.trading_client.get_order_by_id(order_id)
         return self._to_order_result(raw)
 
+    def _refetch_bracket_legs(
+        self,
+        parent_order_id: str,
+        max_attempts: int = 5,
+        delay_seconds: float = 0.3,
+    ) -> Optional[OrderResult]:
+        """Re-query a bracket parent by ID to populate its SL/TP child leg IDs.
+
+        Alpaca's initial submit response for a bracket returns `legs=[]`; the
+        children are created asynchronously after the parent is accepted. This
+        polls briefly so callers can capture both child order IDs.
+        """
+        last: Optional[OrderResult] = None
+        for attempt in range(max_attempts):
+            try:
+                raw = self.trading_client.get_order_by_id(parent_order_id)
+            except Exception as e:
+                logger.warning(
+                    f"_refetch_bracket_legs({parent_order_id}) attempt "
+                    f"{attempt + 1}/{max_attempts} failed: {e}"
+                )
+                time.sleep(delay_seconds)
+                continue
+            last = self._to_order_result(raw)
+            if last.stop_order_id and last.tp_order_id:
+                return last
+            time.sleep(delay_seconds)
+        return last
+
     def get_open_orders(self, symbol: Optional[str] = None) -> List[OrderResult]:
         req = GetOrdersRequest(
             status=QueryOrderStatus.OPEN,
@@ -256,6 +309,38 @@ class AlpacaBroker(BaseBroker):
         )
         raw = self.trading_client.get_orders(filter=req)
         return [self._to_order_result(order) for order in raw]
+
+    # Status values that indicate the order is still alive at the broker.
+    # Alpaca's QueryOrderStatus.OPEN does NOT include HELD — bracket / OCO
+    # stop-loss legs sit in HELD while they wait for their trigger. Reconciler
+    # needs to see them to match DB position_states against live broker state.
+    _LIVE_ORDER_STATUSES = {
+        "new", "accepted", "pending_new", "accepted_for_bidding",
+        "held", "replaced", "pending_replace",
+    }
+
+    def get_live_orders(self, symbol: Optional[str] = None) -> List[OrderResult]:
+        """Return orders still alive at the broker, including HELD stop legs.
+
+        `get_open_orders` uses Alpaca's `OPEN` status filter which excludes
+        HELD — so OCO/bracket stop legs waiting for their trigger don't show
+        up there. Reconciliation needs the wider view.
+        """
+        req = GetOrdersRequest(
+            status=QueryOrderStatus.ALL,
+            symbols=[symbol] if symbol else None,
+            limit=500,
+        )
+        raw = self.trading_client.get_orders(filter=req)
+        out: List[OrderResult] = []
+        for order in raw:
+            status_l = str(order.status).lower()
+            # Normalize "OrderStatus.HELD" → "held"
+            if "." in status_l:
+                status_l = status_l.split(".", 1)[1]
+            if status_l in self._LIVE_ORDER_STATUSES:
+                out.append(self._to_order_result(order))
+        return out
 
     @staticmethod
     def _to_order_result(o) -> OrderResult:
@@ -271,6 +356,8 @@ class AlpacaBroker(BaseBroker):
             filled_avg_price=float(o.filled_avg_price) if o.filled_avg_price else None,
             submitted_at=o.submitted_at,
             filled_at=o.filled_at,
+            stop_price=float(o.stop_price) if getattr(o, "stop_price", None) else None,
+            limit_price=float(o.limit_price) if getattr(o, "limit_price", None) else None,
         )
         for leg in getattr(o, "legs", None) or []:
             leg_stop = getattr(leg, "stop_price", None)

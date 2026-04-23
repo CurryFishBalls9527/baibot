@@ -310,6 +310,35 @@ class IntradayOrchestrator:
         if dedup_key in self._entered_today:
             return None
 
+        # Snapshot the structured setup levels that fired this signal so the
+        # daily trade-review can later annotate a chart with them. Kept as a
+        # plain dict here; serialized to JSON at log_signal time. Each value
+        # is sanitised through `_safe_float` at consumption time so NaN / inf
+        # can't break JSON encoding.
+        def _num(key):
+            try:
+                v = last.get(key)
+                return float(v) if v is not None and v == v else None  # NaN→None
+            except Exception:
+                return None
+
+        metadata = {
+            "setup_family": family,
+            "bar_ts": str(bar_ts),
+            "session_date": session,
+            "entry_close": float(last["close"]),
+            "volume_ratio": _num("volume_ratio"),
+            "breakout_distance_pct": _num("breakout_distance_pct"),
+            "candidate_score": _num("candidate_score"),
+            "vwap": _num("vwap"),
+            "distance_from_vwap_pct": _num("distance_from_vwap_pct"),
+            "opening_range_high": _num("opening_range_high"),
+            "opening_range_low": _num("opening_range_low"),
+            "prior_session_high": _num("prior_session_high"),
+            "prior_session_close": _num("prior_session_close"),
+            "prior_session_is_nr": bool(last.get("prior_session_is_nr")),
+        }
+
         return {
             "symbol": symbol,
             "setup_family": family,
@@ -323,6 +352,7 @@ class IntradayOrchestrator:
             "setup_priority": int(
                 self.backtester._setup_priority(family)
             ),
+            "metadata": metadata,
         }
 
     # ------------------------------------------------------------------ entry
@@ -361,6 +391,22 @@ class IntradayOrchestrator:
             "source": "intraday_mechanical",
         }
 
+        # Serialize structured setup metadata (ORB levels, NR prior-range,
+        # VWAP, etc) for the daily trade review. Wrapped in try/except so a
+        # JSON edge case (NaN, inf, exotic types) can never block entry. The
+        # metadata column is NULL-tolerant on the read side.
+        try:
+            import json, math
+            def _clean(v):
+                if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+                    return None
+                return v
+            cleaned = {k: _clean(v) for k, v in signal.get("metadata", {}).items()}
+            metadata_json = json.dumps(cleaned, default=str)
+        except Exception as e:
+            logger.warning("intraday signal_metadata serialize failed: %s", e)
+            metadata_json = None
+
         signal_id = self.db.log_signal(
             symbol=symbol,
             action="BUY",
@@ -369,6 +415,7 @@ class IntradayOrchestrator:
             stop_loss=stop_pct,
             take_profit=tp_pct,
             timeframe="intraday",
+            signal_metadata=metadata_json,
         )
 
         total_pos_value = sum(p.market_value for p in positions)
@@ -519,6 +566,21 @@ class IntradayOrchestrator:
     def run_daily_reflection(self) -> Dict:
         """Intraday mechanical has no LLM reflection."""
         return {}
+
+    def run_daily_trade_review(self) -> Dict:
+        """Per-trade post-mortems for intraday trades closed today.
+
+        Shares the same implementation as `Orchestrator.run_daily_trade_review`.
+        Kill-switched via `daily_trade_review_enabled` config flag.
+        """
+        from tradingagents.automation.trade_review import run_daily_review
+
+        return run_daily_review(
+            db=self.db,
+            broker=self.broker,
+            variant_name=self.config.get("variant_name", "intraday_mechanical"),
+            config=self.config,
+        )
 
     def take_market_snapshot(self) -> Dict:
         """Intraday mechanical needs no pre-market snapshot."""

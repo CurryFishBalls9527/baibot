@@ -5,15 +5,22 @@ Periodic job that pulls recently-submitted orders from the local SQLite
 If the broker has advanced (e.g., PENDING_NEW → FILLED) and the local row
 is stale, we update the local row in place.
 
-Additive by design: this reads the broker and writes only to the `trades`
-table on confirmed drift. It never submits, cancels, or modifies orders.
+Also reconciles `position_states` against live Alpaca positions — covers
+the DB/broker divergence modes documented in
+`memory/project_bracket_leg_id_bug.md`:
+  - ghost rows (DB says open, Alpaca has no position) → delete
+  - ID mismatch (DB leg IDs point to cancelled orders) → update to live
+  - orphan positions (Alpaca has position, DB has no row) → insert
+
+Additive by design at the broker level: this reads broker state and
+writes ONLY to local SQLite. It never submits, cancels, or modifies orders.
 """
 
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
-from typing import List
+from datetime import date, datetime, timedelta
+from typing import List, Optional
 
 from tradingagents.broker.base_broker import BaseBroker
 from tradingagents.storage.database import TradingDatabase
@@ -69,7 +76,7 @@ class OrderReconciler:
         broker: BaseBroker,
         db: TradingDatabase,
         variant: str | None = None,
-        lookback_days: int = 7,
+        lookback_days: int = 30,
         drift_alert_hours: int = 1,
         notifier=None,
     ):
@@ -240,6 +247,321 @@ class OrderReconciler:
                     )
         return {"checked_legs": checked, "inserted": inserted, "errors": errors}
 
+    def _find_live_sl_tp(self, symbol: str):
+        """Return (sl_order, tp_order) for a symbol from live broker state.
+
+        Uses broker.get_live_orders which includes HELD — the status OCO /
+        bracket stop legs sit in while waiting for their trigger. If the
+        broker adapter doesn't implement it, falls back to get_open_orders.
+        Both orders are filtered to side=sell; most recent submission wins
+        if multiple candidates exist (covers manual OCO resubmissions).
+        """
+        getter = getattr(self.broker, "get_live_orders", None)
+        if getter is None:
+            getter = self.broker.get_open_orders
+        try:
+            orders = getter(symbol)
+        except Exception as e:
+            logger.warning("reconciler: get_live_orders(%s) failed: %s", symbol, e)
+            return (None, None)
+
+        def _sell(o):
+            side = str(getattr(o, "side", "")).lower()
+            return "sell" in side
+
+        def _is_stop(o):
+            t = str(getattr(o, "order_type", "")).lower()
+            return "stop" in t and "limit" not in t
+
+        def _is_limit(o):
+            t = str(getattr(o, "order_type", "")).lower()
+            return "limit" in t and "stop" not in t
+
+        # Stable sort: prefer the most recently submitted order if multiple
+        # active SL/TP orders exist for the same symbol (covers manual OCO
+        # resubmissions that leave the originals cancelled).
+        def _key(o):
+            return getattr(o, "submitted_at", None) or 0
+
+        sls = sorted((o for o in orders if _sell(o) and _is_stop(o)), key=_key, reverse=True)
+        tps = sorted((o for o in orders if _sell(o) and _is_limit(o)), key=_key, reverse=True)
+        return (sls[0] if sls else None, tps[0] if tps else None)
+
+    def _reconcile_position_states(self, dry_run: bool = False) -> dict:
+        """Sync DB `position_states` rows with live Alpaca state.
+
+        Writes to SQLite only (never to the broker). Three actions per pass:
+
+        * **Ghost:** DB has a row but Alpaca reports no position → delete.
+        * **ID drift:** DB row's stop_order_id / tp_order_id don't match the
+          current live SL/TP orders (manual OCO resubmission, re-anchored
+          on fill drift, etc.) → update DB IDs.
+        * **Orphan:** Alpaca has a position but DB has no row → insert a
+          minimal state using broker-side fields so the exit manager can
+          track it going forward.
+
+        `dry_run=True` logs what WOULD happen but doesn't touch the DB.
+        """
+        ghosts = 0
+        id_fixes = 0
+        orphans = 0
+        errors = 0
+
+        try:
+            live_positions = {p.symbol: p for p in self.broker.get_positions()}
+        except Exception as e:
+            logger.warning("reconciler: get_positions() failed: %s", e)
+            return {"ghosts": 0, "id_fixes": 0, "orphans": 0, "errors": 1}
+
+        # Pull all DB position_states rows directly (no helper exists for
+        # "list all symbols", so go raw; reads only).
+        db_symbols = [
+            row[0]
+            for row in self.db.conn.execute(
+                "SELECT symbol FROM position_states"
+            ).fetchall()
+        ]
+
+        # Ghost pass: DB row with no broker position.
+        for sym in db_symbols:
+            if sym in live_positions:
+                continue
+            if dry_run:
+                ghosts += 1
+                logger.info(
+                    "reconciler[%s] DRY-RUN: would delete ghost %s",
+                    self.variant or "-", sym,
+                )
+                continue
+            try:
+                self.db.delete_position_state(sym)
+                ghosts += 1
+                logger.info(
+                    "reconciler[%s]: ghost position_state deleted for %s "
+                    "(no broker position held)",
+                    self.variant or "-", sym,
+                )
+            except Exception as e:
+                errors += 1
+                logger.warning(
+                    "reconciler: delete_position_state(%s) failed: %s", sym, e
+                )
+
+        # ID-drift + orphan passes: per symbol with a live broker position.
+        for sym, pos in live_positions.items():
+            existing = self.db.get_position_state(sym)
+            sl, tp = self._find_live_sl_tp(sym)
+            live_sl_id = getattr(sl, "order_id", None) if sl else None
+            live_tp_id = getattr(tp, "order_id", None) if tp else None
+            live_sl_price = getattr(sl, "stop_price", None) if sl else None
+            # ^ OrderResult model — not every broker populates stop_price.
+            # Fall back below using a second get_order if we actually need it.
+
+            if existing is None:
+                # Orphan: Alpaca has position, DB has nothing. Import using
+                # broker state so future ticks can manage it.
+                entry_price = float(pos.avg_entry_price)
+                # Seed current_stop from the live broker SL price when
+                # available — keeps DB and broker aligned from t=0. Fall back
+                # to 8% below entry only if there's no live SL order at all
+                # (the position is unprotected; ExitManager will ratchet from
+                # here once it sees the row).
+                stop_price = getattr(sl, "stop_price", None) if sl else None
+                if stop_price is None:
+                    stop_price = round(entry_price * 0.92, 2)
+                state = {
+                    "entry_price": entry_price,
+                    "entry_date": date.today().isoformat(),
+                    "highest_close": entry_price,
+                    "current_stop": float(stop_price),
+                    "partial_taken": False,
+                    "stop_type": "imported",
+                    "stop_order_id": live_sl_id,
+                    "tp_order_id": live_tp_id,
+                    "variant": self.variant,
+                    "bars_held": 0,
+                }
+                if dry_run:
+                    orphans += 1
+                    logger.info(
+                        "reconciler[%s] DRY-RUN: would import orphan %s "
+                        "(entry=$%.2f, stop=$%.2f, qty=%s)",
+                        self.variant or "-", sym, entry_price,
+                        float(stop_price), pos.qty,
+                    )
+                    continue
+                try:
+                    self.db.upsert_position_state(sym, state)
+                    orphans += 1
+                    logger.info(
+                        "reconciler[%s]: imported orphan position %s "
+                        "(entry=$%.2f, stop=$%.2f, qty=%s)",
+                        self.variant or "-", sym, entry_price,
+                        float(stop_price), pos.qty,
+                    )
+                except Exception as e:
+                    errors += 1
+                    logger.warning(
+                        "reconciler: upsert orphan %s failed: %s", sym, e
+                    )
+                continue
+
+            # ID-drift pass: DB has row AND position; update leg IDs if they
+            # don't match the live SL/TP orders. Covers:
+            #   (a) pre-fix NULL IDs being populated now
+            #   (b) manual OCO resubmissions overriding bracket IDs
+            #   (c) re-anchor on drift generating new IDs
+            updates = {}
+            if live_sl_id and existing.get("stop_order_id") != live_sl_id:
+                updates["stop_order_id"] = live_sl_id
+            if live_tp_id and existing.get("tp_order_id") != live_tp_id:
+                updates["tp_order_id"] = live_tp_id
+            if updates:
+                if dry_run:
+                    id_fixes += 1
+                    logger.info(
+                        "reconciler[%s] DRY-RUN: would update %s IDs (%s)",
+                        self.variant or "-", sym,
+                        ", ".join(
+                            f"{k}={str(v)[:8]}" for k, v in updates.items()
+                        ),
+                    )
+                else:
+                    try:
+                        self.db.upsert_position_state(sym, updates)
+                        id_fixes += 1
+                        logger.info(
+                            "reconciler[%s]: %s leg IDs updated (%s)",
+                            self.variant or "-", sym,
+                            ", ".join(
+                                f"{k}={str(v)[:8]}" for k, v in updates.items()
+                            ),
+                        )
+                    except Exception as e:
+                        errors += 1
+                        logger.warning(
+                            "reconciler: upsert IDs %s failed: %s", sym, e
+                        )
+
+        return {
+            "ghosts": ghosts,
+            "id_fixes": id_fixes,
+            "orphans": orphans,
+            "errors": errors,
+        }
+
+    def _sync_broker_stops(
+        self,
+        max_tighten_pct: float = 0.30,
+        dry_run: bool = False,
+    ) -> dict:
+        """Push locally-ratcheted DB `current_stop` values up to the broker.
+
+        When ExitManagerV2 couldn't propagate a stop ratchet (e.g. pre-fix
+        when stop_order_id was NULL, or a broker reject), the DB knows the
+        stop moved but Alpaca still holds the old level. This pass detects
+        DB `current_stop > broker stop` and issues `replace_order` to sync.
+
+        Guardrails:
+        * Only tightens (moves stop UP) — never loosens.
+        * Only fires when the new stop is strictly below the current market
+          price (can't set a stop above mkt — would trigger immediately).
+        * Bounded by `max_tighten_pct` vs broker stop; any delta beyond that
+          is logged and skipped as a safety fence against a corrupted DB row.
+        """
+        synced = 0
+        skipped = 0
+        errors = 0
+
+        try:
+            live_positions = {p.symbol: p for p in self.broker.get_positions()}
+        except Exception as e:
+            logger.warning("reconciler: get_positions() failed: %s", e)
+            return {"synced": 0, "skipped": 0, "errors": 1}
+
+        for sym, pos in live_positions.items():
+            state = self.db.get_position_state(sym)
+            if not state:
+                continue
+            db_stop = state.get("current_stop")
+            stop_id = state.get("stop_order_id")
+            if not db_stop or not stop_id:
+                continue
+            sl, _tp = self._find_live_sl_tp(sym)
+            broker_stop = getattr(sl, "stop_price", None) if sl else None
+            if broker_stop is None:
+                continue
+            # Only act when DB is clearly above broker (>0.5%) — avoid
+            # churning the broker stop by a dollar each tick for noise.
+            delta_pct = (float(db_stop) - float(broker_stop)) / float(broker_stop)
+            if delta_pct < 0.005:
+                continue
+            # Safety: don't move stop above current price (would trigger now).
+            current_price = float(pos.current_price)
+            if float(db_stop) >= current_price:
+                logger.warning(
+                    "reconciler[%s]: %s DB stop $%.2f >= current price $%.2f "
+                    "— NOT pushing (would instant-fill). Inspect state.",
+                    self.variant or "-", sym, float(db_stop), current_price,
+                )
+                skipped += 1
+                continue
+            # Safety: reject absurd deltas that suggest corrupt DB.
+            if delta_pct > max_tighten_pct:
+                logger.warning(
+                    "reconciler[%s]: %s DB stop $%.2f is %.1f%% above broker "
+                    "stop $%.2f — exceeds max_tighten_pct=%.0f%%, SKIPPED.",
+                    self.variant or "-", sym, float(db_stop),
+                    delta_pct * 100, float(broker_stop), max_tighten_pct * 100,
+                )
+                skipped += 1
+                continue
+
+            if dry_run:
+                logger.info(
+                    "reconciler[%s] DRY-RUN: would push %s broker stop "
+                    "$%.2f -> $%.2f (order %s)",
+                    self.variant or "-", sym, float(broker_stop),
+                    float(db_stop), str(stop_id)[:8],
+                )
+                synced += 1
+                continue
+
+            try:
+                replaced = self.broker.replace_order(
+                    stop_id, stop_price=round(float(db_stop), 2)
+                )
+                synced += 1
+                new_id = getattr(replaced, "order_id", None) if replaced else None
+                logger.info(
+                    "reconciler[%s]: %s broker stop synced $%.2f -> $%.2f "
+                    "(old=%s new=%s)",
+                    self.variant or "-", sym, float(broker_stop),
+                    float(db_stop), str(stop_id)[:8],
+                    str(new_id)[:8] if new_id else "?",
+                )
+                # Alpaca's replace_order returns a NEW order ID; the old leg
+                # is cancelled. Update DB immediately so subsequent ticks
+                # don't see a stale ID and flag it as drift.
+                if new_id and new_id != stop_id:
+                    try:
+                        self.db.upsert_position_state(sym, {"stop_order_id": new_id})
+                    except Exception as e:
+                        errors += 1
+                        logger.warning(
+                            "reconciler[%s]: %s failed to persist new stop_id "
+                            "%s: %s",
+                            self.variant or "-", sym, str(new_id)[:8], e,
+                        )
+            except Exception as e:
+                errors += 1
+                logger.warning(
+                    "reconciler[%s]: %s replace_order(%s) failed: %s",
+                    self.variant or "-", sym, str(stop_id)[:8], e,
+                )
+
+        return {"synced": synced, "skipped": skipped, "errors": errors}
+
     def reconcile_once(self) -> dict:
         """Single reconciliation pass. Returns summary dict."""
         rows = self._fetch_open_trades()
@@ -330,26 +652,52 @@ class OrderReconciler:
                     pass
 
         leg_summary = self._sweep_bracket_legs()
+        pos_summary = self._reconcile_position_states()
+        # Broker-stop sync runs AFTER position-state reconcile so newly-fixed
+        # leg IDs and freshly-imported orphans participate in this pass.
+        stop_summary = self._sync_broker_stops()
 
         summary = {
             "variant": self.variant,
             "checked": checked,
             "drifted": drifted,
             "updated": updated,
-            "errors": errors + leg_summary["errors"],
+            "errors": (
+                errors
+                + leg_summary["errors"]
+                + pos_summary["errors"]
+                + stop_summary["errors"]
+            ),
             "leg_checked": leg_summary["checked_legs"],
             "leg_inserted": leg_summary["inserted"],
+            "position_ghosts_deleted": pos_summary["ghosts"],
+            "position_id_fixes": pos_summary["id_fixes"],
+            "position_orphans_imported": pos_summary["orphans"],
+            "broker_stops_synced": stop_summary["synced"],
+            "broker_stops_skipped": stop_summary["skipped"],
         }
-        if checked or leg_summary["inserted"]:
+        if (
+            checked
+            or leg_summary["inserted"]
+            or pos_summary["ghosts"]
+            or pos_summary["id_fixes"]
+            or pos_summary["orphans"]
+            or stop_summary["synced"]
+            or stop_summary["skipped"]
+        ):
             logger.info(
                 "reconciler[%s] summary: checked=%d drifted=%d updated=%d "
-                "errors=%d leg_checked=%d leg_inserted=%d",
+                "errors=%d leg_checked=%d leg_inserted=%d ghosts=%d "
+                "id_fixes=%d orphans=%d stops_synced=%d stops_skipped=%d",
                 self.variant or "-",
-                checked,
-                drifted,
-                updated,
+                checked, drifted, updated,
                 summary["errors"],
                 leg_summary["checked_legs"],
                 leg_summary["inserted"],
+                pos_summary["ghosts"],
+                pos_summary["id_fixes"],
+                pos_summary["orphans"],
+                stop_summary["synced"],
+                stop_summary["skipped"],
             )
         return summary

@@ -39,6 +39,12 @@ class OrderResult:
     # the originally submitted prices if no correction happened. Bracket only.
     effective_stop_price: Optional[float] = None
     effective_take_profit_price: Optional[float] = None
+    # Raw resting-order trigger prices as seen at the broker. Populated for
+    # any order that carries them (STOP / STOP_LIMIT / LIMIT), not just
+    # bracket parents. Used by the reconciler to reconcile live SL/TP prices
+    # back into position_states without a second API call.
+    stop_price: Optional[float] = None
+    limit_price: Optional[float] = None
 
 
 @dataclass

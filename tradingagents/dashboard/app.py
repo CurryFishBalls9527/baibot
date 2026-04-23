@@ -112,9 +112,11 @@ def _service_pill() -> str:
 
 _CSS = """
 <style>
-#MainMenu, footer, header { visibility: hidden; }
+#MainMenu, footer { visibility: hidden; }
 .stDeployButton { display: none; }
-section[data-testid="stSidebar"] { display: none; }
+/* Sidebar kept visible so multi-page nav (Performance / Trade Journal /
+   Reviews) is reachable. The built-in header stays visible too — without
+   it, Streamlit's sidebar-toggle chevron is invisible. */
 .block-container { padding: 1rem 1.25rem; max-width: 1500px; }
 .stApp { background: #0a0e14; }
 html, body, [class*="st-"] { font-family: 'IBM Plex Mono', 'Menlo', 'Consolas', monospace; }
@@ -315,13 +317,9 @@ def main():
     st.set_page_config(
         page_title="Trading Bot Dashboard",
         layout="wide",
-        initial_sidebar_state="collapsed",
+        initial_sidebar_state="expanded",
     )
     st.markdown(_CSS, unsafe_allow_html=True)
-    st.markdown(
-        '<meta http-equiv="refresh" content="30">',
-        unsafe_allow_html=True,
-    )
 
     orchestrators = _load_variant_orchestrators()
     if not orchestrators:

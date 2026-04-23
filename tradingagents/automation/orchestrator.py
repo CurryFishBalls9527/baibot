@@ -515,6 +515,19 @@ class Orchestrator:
         if not self.broker.is_market_open():
             return {"status": "market_closed"}
 
+        # Fail-closed freshness: sync broker → DB so the whipsaw guard below
+        # sees the latest bracket_stop_loss fills. Entry scan cadence (10 min)
+        # is shorter than the reconciler cron (5 min); without this call a
+        # mid-interval stop is invisible.
+        try:
+            self.reconcile_orders()
+        except Exception as e:
+            logger.warning(
+                "Intraday entry scan aborted: pre-scan reconcile failed (%s). "
+                "Skipping rather than entering against a stale DB.", e,
+            )
+            return {"status": "reconcile_failed", "error": str(e)}
+
         preflight = self._latest_minervini_preflight
         if preflight is None or preflight.screen_df is None or preflight.screen_df.empty:
             try:
@@ -538,6 +551,13 @@ class Orchestrator:
         for symbol in candidate_symbols:
             if symbol in held_symbols:
                 continue
+            if self.db.was_stopped_today(symbol):
+                logger.info("Whipsaw guard: skipping %s (stopped earlier today)", symbol)
+                results[symbol] = {
+                    "symbol": symbol, "action": "SKIP", "traded": False,
+                    "screen_rejected": "Stopped out earlier today — same-day re-entry blocked",
+                }
+                continue
             try:
                 result = self._trade_rule_based_setup(
                     setup_rows.get(symbol, {"symbol": symbol}),
@@ -559,6 +579,233 @@ class Orchestrator:
         )
         return results
 
+    def run_daily_trade_review(self) -> Dict:
+        """Per-trade post-mortems for trades that closed today.
+
+        Delegates to the shared `trade_review` module (used by all
+        variants). Kill-switched: `daily_trade_review_enabled` config
+        flag defaults to False. No effect on live trading; only reads
+        trade_outcomes + writes review artifacts.
+        """
+        from tradingagents.automation.trade_review import run_daily_review
+
+        return run_daily_review(
+            db=self.db,
+            broker=self.broker,
+            variant_name=self.config.get("variant_name", "unknown"),
+            config=self.config,
+        )
+
+    def run_exit_check_pass(
+        self,
+        preflight=None,
+        ai_review_enabled: bool = True,
+        _account=None,
+        _positions=None,
+    ) -> Dict:
+        """Evaluate held positions via ExitManager and act on decisions.
+
+        Idempotent: before submitting a market SELL, checks the broker for an
+        existing open sell order on the same symbol and skips if one is in
+        flight. Same guard already protects PARTIAL_SELL. This means two
+        concurrent callers (e.g. daily scan + 5-min cron) can both invoke
+        this method without double-submitting exits.
+
+        Parameters
+        ----------
+        preflight : optional
+            Minervini preflight result. If provided (and running v2), the
+            exit manager uses the preflight's market_regime to pick a
+            regime-aware trail width. If None, v2 trail falls back to the
+            regime-agnostic `trail_stop_pct`.
+        ai_review_enabled : bool
+            When True (daily scan), HOLD decisions with warning signs trigger
+            LLM-driven `_analyze_and_trade`. When False (5-min cron), skip
+            AI review — rules-based exits only, no LLM calls.
+        _account, _positions
+            Optional caller-provided state to avoid duplicate broker queries.
+            When None, we query broker fresh.
+        """
+        if not self.config.get("exit_manager_enabled", True):
+            # Exit manager disabled for this variant: still let the daily
+            # scan run the AI-only path when enabled. 5-min cron is a no-op.
+            if not ai_review_enabled:
+                return {}
+            # (Daily-scan AI-only path handled below.)
+
+        account = _account if _account is not None else self.broker.get_account()
+        if _positions is not None:
+            stock_positions = _positions
+        else:
+            stock_positions = self._stock_positions(self.broker.get_positions())
+
+        results: Dict = {}
+
+        if not self.config.get("exit_manager_enabled", True):
+            # AI-only path: analyze each held symbol when not in mechanical
+            # mode. Only fires from daily scan (ai_review_enabled=True).
+            for pos in stock_positions:
+                try:
+                    if self.config.get("mechanical_only_mode"):
+                        results[pos.symbol] = {
+                            "symbol": pos.symbol, "action": "HOLD", "traded": False,
+                        }
+                        continue
+                    results[pos.symbol] = self._analyze_and_trade(
+                        pos.symbol, account, stock_positions
+                    )
+                except Exception as e:
+                    logger.error(f"Error analyzing {pos.symbol}: {e}")
+                    results[pos.symbol] = {"error": str(e)}
+            return results
+
+        exit_manager_version = self.config.get("exit_manager_version", "v1")
+        use_v2 = exit_manager_version == "v2"
+        if use_v2:
+            exit_mgr = ExitManagerV2(self.config, broker=self.broker)
+            regime_label_for_exit = (
+                getattr(preflight, "market_regime", None) if preflight else None
+            )
+        else:
+            exit_mgr = ExitManager(self.config)
+            regime_label_for_exit = None
+
+        for pos in stock_positions:
+            try:
+                pos_state = self.db.get_position_state(pos.symbol)
+                if pos_state is None:
+                    pos_state = {
+                        "entry_price": float(pos.avg_entry_price),
+                        "entry_date": date.today().isoformat(),
+                        "highest_close": float(pos.current_price),
+                        "current_stop": float(pos.avg_entry_price) * 0.92,
+                        "partial_taken": False,
+                    }
+                features = self._get_latest_features(pos.symbol)
+                if use_v2:
+                    decision = exit_mgr.check_position(
+                        pos, features, pos_state, regime_label=regime_label_for_exit
+                    )
+                else:
+                    decision = exit_mgr.check_position(pos, features, pos_state)
+
+                if decision.action == "SELL":
+                    # Idempotency guard: if a sell is already in flight at
+                    # the broker (from an earlier tick, daily scan, or
+                    # manual intervention), don't submit a duplicate.
+                    existing = self._find_existing_open_order(pos.symbol, "sell")
+                    if existing is not None:
+                        logger.info(
+                            f"{pos.symbol}: Skipping SELL — existing open sell "
+                            f"order {existing.order_id} [{existing.status}]"
+                        )
+                        results[pos.symbol] = {
+                            "symbol": pos.symbol,
+                            "action": "SKIP",
+                            "traded": False,
+                            "screen_rejected": (
+                                "Existing open sell order — idempotency guard"
+                            ),
+                        }
+                        continue
+                    result = self._execute_structured_signal(
+                        symbol=pos.symbol,
+                        structured={
+                            "symbol": pos.symbol, "action": "SELL",
+                            "confidence": 0.9,
+                            "reasoning": f"Exit rule: {decision.reason}",
+                            "source": "exit_manager",
+                        },
+                        account=account, positions=stock_positions,
+                    )
+                    self.db.delete_position_state(pos.symbol)
+                    self._log_trade_outcome(pos, pos_state, decision.reason)
+                    results[pos.symbol] = result
+                    continue
+
+                if decision.action == "PARTIAL_SELL":
+                    partial_order = OrderRequest(
+                        symbol=pos.symbol, side="sell", qty=float(decision.qty)
+                    )
+                    risk_result = self.risk_engine.check_order(
+                        partial_order, account, stock_positions,
+                        float(pos.current_price),
+                    )
+                    existing_open_order = self._find_existing_open_order(pos.symbol, "sell")
+                    if existing_open_order is not None:
+                        logger.info(
+                            f"{pos.symbol}: Skipping partial sell — existing "
+                            f"open sell order {existing_open_order.order_id} "
+                            f"[{existing_open_order.status}]"
+                        )
+                    elif risk_result.passed:
+                        order_result = self.broker.submit_order(partial_order)
+                        self.db.log_trade(
+                            symbol=pos.symbol, side="sell",
+                            qty=float(decision.qty), order_type="market",
+                            status=order_result.status,
+                            filled_qty=order_result.filled_qty,
+                            filled_price=order_result.filled_avg_price,
+                            order_id=order_result.order_id,
+                            reasoning=f"Partial profit: {decision.reason}",
+                        )
+                        logger.info(
+                            f"{pos.symbol}: Partial sell {decision.qty} shares "
+                            f"({decision.reason})"
+                        )
+                    if decision.updated_state:
+                        self.db.upsert_position_state(pos.symbol, decision.updated_state)
+                    results[pos.symbol] = {
+                        "symbol": pos.symbol, "action": "PARTIAL_SELL",
+                        "traded": True,
+                    }
+                    continue
+
+                # HOLD. Check warning signs to decide whether to escalate to AI.
+                warnings = []
+                if features.get("rs_percentile") and features["rs_percentile"] < 50:
+                    warnings.append(
+                        f"RS dropped to {features['rs_percentile']:.0f}th pctl"
+                    )
+                if features.get("sma_50") and float(pos.current_price) < features["sma_50"] * 1.02:
+                    warnings.append("Price near 50 DMA")
+                if features.get("adx_14") and features["adx_14"] < 15:
+                    warnings.append(f"Weak trend (ADX={features['adx_14']:.1f})")
+
+                if not warnings or not ai_review_enabled:
+                    # Clear HOLD, or AI review disabled (5-min cron).
+                    if decision.updated_state:
+                        self.db.upsert_position_state(pos.symbol, decision.updated_state)
+                    results[pos.symbol] = {
+                        "symbol": pos.symbol, "action": "HOLD", "traded": False,
+                    }
+                    continue
+
+                if self.config.get("mechanical_only_mode"):
+                    logger.info(
+                        f"{pos.symbol}: Warnings: {warnings}. Mechanical-only "
+                        f"mode — holding (exit manager retains control)."
+                    )
+                    if decision.updated_state:
+                        self.db.upsert_position_state(pos.symbol, decision.updated_state)
+                    results[pos.symbol] = {
+                        "symbol": pos.symbol, "action": "HOLD", "traded": False,
+                        "warnings": warnings,
+                    }
+                    continue
+
+                logger.info(f"{pos.symbol}: Warnings: {warnings}. Running AI.")
+                result = self._analyze_and_trade(pos.symbol, account, stock_positions)
+                if decision.updated_state:
+                    self.db.upsert_position_state(pos.symbol, decision.updated_state)
+                results[pos.symbol] = result
+
+            except Exception as e:
+                logger.error(f"Error managing {pos.symbol}: {e}")
+                results[pos.symbol] = {"error": str(e)}
+
+        return results
+
     def run_daily_analysis(self) -> Dict:
         """Run full analysis → trade cycle for all watchlist symbols."""
         logger.info("=" * 60)
@@ -570,6 +817,17 @@ class Orchestrator:
         if not self.broker.is_market_open():
             logger.info("Market is closed. Skipping analysis.")
             return {"status": "market_closed"}
+
+        # Fail-closed freshness: sync broker → DB so the whipsaw guard in the
+        # per-symbol loop sees today's bracket_stop_loss fills.
+        try:
+            self.reconcile_orders()
+        except Exception as e:
+            logger.warning(
+                "Daily analysis aborted: pre-scan reconcile failed (%s). "
+                "Skipping rather than entering against a stale DB.", e,
+            )
+            return {"status": "reconcile_failed", "error": str(e)}
 
         preflight = None
         preflight_error = None
@@ -589,161 +847,16 @@ class Orchestrator:
         stock_positions = self._stock_positions(positions)
         results = {}
 
-        # First check existing positions using exit manager + sell-side rules
-        exit_manager_enabled = self.config.get("exit_manager_enabled", True)
-        if exit_manager_enabled:
-            exit_manager_version = self.config.get("exit_manager_version", "v1")
-            use_v2 = exit_manager_version == "v2"
-            if use_v2:
-                exit_mgr = ExitManagerV2(self.config, broker=self.broker)
-                regime_label_for_exit = (
-                    getattr(preflight, "market_regime", None) if preflight else None
-                )
-            else:
-                exit_mgr = ExitManager(self.config)
-                regime_label_for_exit = None
-            for pos in stock_positions:
-                try:
-                    # Step 1: Run exit manager rules
-                    pos_state = self.db.get_position_state(pos.symbol)
-                    if pos_state is None:
-                        pos_state = {
-                            "entry_price": float(pos.avg_entry_price),
-                            "entry_date": date.today().isoformat(),
-                            "highest_close": float(pos.current_price),
-                            "current_stop": float(pos.avg_entry_price) * 0.92,
-                            "partial_taken": False,
-                        }
-                    features = self._get_latest_features(pos.symbol)
-                    if use_v2:
-                        decision = exit_mgr.check_position(
-                            pos, features, pos_state, regime_label=regime_label_for_exit
-                        )
-                    else:
-                        decision = exit_mgr.check_position(pos, features, pos_state)
-
-                    if decision.action == "SELL":
-                        result = self._execute_structured_signal(
-                            symbol=pos.symbol,
-                            structured={
-                                "symbol": pos.symbol, "action": "SELL",
-                                "confidence": 0.9,
-                                "reasoning": f"Exit rule: {decision.reason}",
-                                "source": "exit_manager",
-                            },
-                            account=account, positions=stock_positions,
-                        )
-                        self.db.delete_position_state(pos.symbol)
-                        # Log trade outcome
-                        self._log_trade_outcome(pos, pos_state, decision.reason)
-                        results[pos.symbol] = result
-                        continue
-                    elif decision.action == "PARTIAL_SELL":
-                        partial_signal = {
-                            "symbol": pos.symbol, "action": "SELL",
-                            "confidence": 0.85,
-                            "reasoning": f"Partial profit: {decision.reason}",
-                            "source": "exit_manager",
-                        }
-                        # Submit partial sell via broker directly
-                        partial_order = OrderRequest(
-                            symbol=pos.symbol, side="sell", qty=float(decision.qty)
-                        )
-                        risk_result = self.risk_engine.check_order(
-                            partial_order, account, stock_positions,
-                            float(pos.current_price),
-                        )
-                        existing_open_order = self._find_existing_open_order(pos.symbol, "sell")
-                        if existing_open_order is not None:
-                            logger.info(
-                                f"{pos.symbol}: Skipping partial sell — existing open sell order "
-                                f"{existing_open_order.order_id} [{existing_open_order.status}]"
-                            )
-                        elif risk_result.passed:
-                            order_result = self.broker.submit_order(partial_order)
-                            self.db.log_trade(
-                                symbol=pos.symbol, side="sell",
-                                qty=float(decision.qty), order_type="market",
-                                status=order_result.status,
-                                filled_qty=order_result.filled_qty,
-                                filled_price=order_result.filled_avg_price,
-                                order_id=order_result.order_id,
-                                reasoning=f"Partial profit: {decision.reason}",
-                            )
-                            logger.info(
-                                f"{pos.symbol}: Partial sell {decision.qty} shares "
-                                f"({decision.reason})"
-                            )
-                        if decision.updated_state:
-                            self.db.upsert_position_state(pos.symbol, decision.updated_state)
-                        results[pos.symbol] = {
-                            "symbol": pos.symbol, "action": "PARTIAL_SELL",
-                            "traded": True,
-                        }
-                        continue
-
-                    # Step 2: Check warning signs (skip AI if position is clearly fine)
-                    warnings = []
-                    if features.get("rs_percentile") and features["rs_percentile"] < 50:
-                        warnings.append(
-                            f"RS dropped to {features['rs_percentile']:.0f}th pctl"
-                        )
-                    if features.get("sma_50") and float(pos.current_price) < features["sma_50"] * 1.02:
-                        warnings.append("Price near 50 DMA")
-                    if features.get("adx_14") and features["adx_14"] < 15:
-                        warnings.append(f"Weak trend (ADX={features['adx_14']:.1f})")
-
-                    if not warnings:
-                        # Position is fine — just update state
-                        if decision.updated_state:
-                            self.db.upsert_position_state(pos.symbol, decision.updated_state)
-                        results[pos.symbol] = {
-                            "symbol": pos.symbol, "action": "HOLD", "traded": False,
-                        }
-                        continue
-
-                    # Step 3: Ambiguous — run AI only when needed
-                    if self.config.get("mechanical_only_mode"):
-                        # Mechanical variant: exit manager already ran; warnings
-                        # alone don't trigger a sell without LLM judgment.
-                        logger.info(
-                            f"{pos.symbol}: Warnings: {warnings}. Mechanical-only "
-                            f"mode — holding (exit manager retains control)."
-                        )
-                        if decision.updated_state:
-                            self.db.upsert_position_state(pos.symbol, decision.updated_state)
-                        results[pos.symbol] = {
-                            "symbol": pos.symbol,
-                            "action": "HOLD",
-                            "traded": False,
-                            "warnings": warnings,
-                        }
-                        continue
-
-                    logger.info(f"{pos.symbol}: Warnings: {warnings}. Running AI.")
-                    result = self._analyze_and_trade(pos.symbol, account, stock_positions)
-                    if decision.updated_state:
-                        self.db.upsert_position_state(pos.symbol, decision.updated_state)
-                    results[pos.symbol] = result
-
-                except Exception as e:
-                    logger.error(f"Error managing {pos.symbol}: {e}")
-                    results[pos.symbol] = {"error": str(e)}
-        else:
-            for pos in stock_positions:
-                try:
-                    if self.config.get("mechanical_only_mode"):
-                        results[pos.symbol] = {
-                            "symbol": pos.symbol,
-                            "action": "HOLD",
-                            "traded": False,
-                        }
-                        continue
-                    result = self._analyze_and_trade(pos.symbol, account, stock_positions)
-                    results[pos.symbol] = result
-                except Exception as e:
-                    logger.error(f"Error analyzing {pos.symbol}: {e}")
-                    results[pos.symbol] = {"error": str(e)}
+        # Check existing positions via exit manager + sell-side rules.
+        # Extracted into run_exit_check_pass so the 5-min scheduler cron can
+        # invoke the same logic without waiting for a daily scan.
+        exit_results = self.run_exit_check_pass(
+            preflight=preflight,
+            ai_review_enabled=True,
+            _account=account,
+            _positions=stock_positions,
+        )
+        results.update(exit_results)
 
         # Then analyze watchlist for new BUY opportunities
         candidate_symbols = list(analysis_universe)
@@ -794,6 +907,13 @@ class Orchestrator:
                 results[symbol] = self._build_screen_rejection(symbol, preflight)
                 continue
             if symbol in results:
+                continue
+            if self.db.was_stopped_today(symbol):
+                logger.info("Whipsaw guard: skipping %s (stopped earlier today)", symbol)
+                results[symbol] = {
+                    "symbol": symbol, "action": "SKIP", "traded": False,
+                    "screen_rejected": "Stopped out earlier today — same-day re-entry blocked",
+                }
                 continue
             try:
                 if preflight is not None:
@@ -1917,6 +2037,16 @@ class Orchestrator:
                     rs_at_entry = row.get("rs_percentile")
                     regime_at_entry = row.get("market_regime")
 
+            # Compute MFE/MAE — kill-switched, fails soft. Adds one Alpaca API
+            # call per exit; cost is bounded and the guard ensures this never
+            # blocks outcome logging or the upstream exit path.
+            mfe, mae = self._compute_excursion(
+                symbol=position.symbol,
+                entry_date_str=pos_state.get("entry_date", ""),
+                exit_date_str=date.today().isoformat(),
+                entry_price=entry_price,
+            )
+
             self.db.log_trade_outcome({
                 "symbol": position.symbol,
                 "entry_date": pos_state.get("entry_date"),
@@ -1930,9 +2060,62 @@ class Orchestrator:
                 "stage_at_entry": stage_at_entry,
                 "rs_at_entry": rs_at_entry,
                 "regime_at_entry": regime_at_entry,
+                "max_favorable_excursion": mfe,
+                "max_adverse_excursion": mae,
             })
         except Exception as e:
             logger.debug(f"Could not log trade outcome for {position.symbol}: {e}")
+
+    def _compute_excursion(
+        self,
+        symbol: str,
+        entry_date_str: str,
+        exit_date_str: str,
+        entry_price: float,
+    ):
+        """Compute max-favorable / max-adverse excursion over a trade window.
+
+        Uses hourly bars from Alpaca. Returns ``(mfe_pct, mae_pct)`` as
+        decimals (0.05 == +5 %). Fails soft: returns ``(None, None)`` on any
+        error, missing data, or disabled kill switch. Wrapped by caller's
+        try/except too — two layers of insulation from the exit path.
+
+        Kill switch: ``trade_outcome_excursion_enabled`` config flag,
+        default False. Deploy code with the flag OFF, validate no exits
+        break, then flip per the rollout checklist.
+        """
+        if not self.config.get("trade_outcome_excursion_enabled", False):
+            return (None, None)
+        try:
+            from dateutil.parser import parse as parse_date
+            from alpaca.data.requests import StockBarsRequest
+            from alpaca.data.timeframe import TimeFrame
+
+            if not entry_date_str or entry_price <= 0:
+                return (None, None)
+            start = parse_date(entry_date_str)
+            end = parse_date(exit_date_str) + timedelta(days=1)
+            data_client = getattr(self.broker, "data_client", None)
+            if data_client is None:
+                return (None, None)
+            req = StockBarsRequest(
+                symbol_or_symbols=[symbol],
+                timeframe=TimeFrame.Hour,
+                start=start,
+                end=end,
+            )
+            bars = data_client.get_stock_bars(req)
+            series = getattr(bars, "data", {}).get(symbol) or []
+            if not series:
+                return (None, None)
+            max_high = max(float(b.high) for b in series)
+            min_low = min(float(b.low) for b in series)
+            mfe = (max_high - entry_price) / entry_price
+            mae = (min_low - entry_price) / entry_price
+            return (round(mfe, 4), round(mae, 4))
+        except Exception as e:
+            logger.warning(f"_compute_excursion({symbol}) failed: {e}")
+            return (None, None)
 
     def _get_latest_features(self, symbol: str) -> Dict:
         """Get latest technical features for a symbol from the screener data or yfinance.

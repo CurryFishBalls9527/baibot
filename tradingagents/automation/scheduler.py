@@ -183,6 +183,91 @@ class TradingScheduler:
                 flatten_time,
             )
 
+        # Weekly strategy review — Saturday 09:00 ET. Uses gpt-5.2 (deep-think)
+        # to produce per-variant markdown proposals. Gated by
+        # `weekly_strategy_review_enabled` (default off).
+        if self.config.get("weekly_strategy_review_enabled", False) and self.ab_runner:
+            weekly_time = self.config.get("weekly_review_time", "09:00")
+            hour, minute = weekly_time.split(":")
+            self.scheduler.add_job(
+                self._run_with_logging,
+                args=[self.ab_runner.run_weekly_strategy_review, "Weekly Strategy Review"],
+                trigger=CronTrigger(
+                    day_of_week="sat",
+                    hour=int(hour),
+                    minute=int(minute),
+                    timezone="US/Eastern",
+                ),
+                id="weekly_strategy_review",
+                name="Weekly Strategy Review",
+                misfire_grace_time=3600,
+            )
+            logger.info(
+                "Scheduled weekly strategy review at %s ET (Saturday)", weekly_time,
+            )
+
+        # Daily per-trade review — Mon-Fri 17:00 ET (after the 16:30 reflection
+        # cron, so trade_outcomes has latest fills). Chart + gpt-4o-mini LLM
+        # per closed trade. Gated by `daily_trade_review_enabled` (default off).
+        if self.config.get("daily_trade_review_enabled", False) and mode in ("swing", "both"):
+            review_time = self.config.get("daily_trade_review_time", "17:00")
+            hour, minute = review_time.split(":")
+            review_func = (
+                self.ab_runner.run_daily_trade_review
+                if self.ab_runner
+                else self.orchestrator.run_daily_trade_review
+            )
+            self.scheduler.add_job(
+                self._run_with_logging,
+                args=[review_func, "Daily Trade Review"],
+                trigger=CronTrigger(
+                    day_of_week="mon-fri",
+                    hour=int(hour),
+                    minute=int(minute),
+                    timezone="US/Eastern",
+                ),
+                id="daily_trade_review",
+                name="Daily Trade Review",
+                misfire_grace_time=1800,
+            )
+            logger.info(
+                "Scheduled daily trade review at %s ET (Mon-Fri)", review_time,
+            )
+
+        # Exit-check pass — 5-min cadence, rules-based only (no LLM). Runs
+        # `Orchestrator.run_exit_check_pass` for each swing variant so
+        # trailing stops / dead-money / 50-DMA exits don't wait for the
+        # once-daily scan to fire. Idempotent via in-flight-order guard.
+        # Chan / intraday variants short-circuit to not_applicable.
+        if self.config.get("exit_check_enabled", True) and mode in ("swing", "both"):
+            exit_check_interval = max(
+                int(self.config.get("exit_check_interval_minutes", 5)), 1
+            )
+            exit_check_func = (
+                self.ab_runner.run_exit_check_pass
+                if self.ab_runner
+                else self.orchestrator.run_exit_check_pass
+            )
+            self.scheduler.add_job(
+                self._run_with_logging,
+                args=[exit_check_func, "Exit Check Pass"],
+                trigger=CronTrigger(
+                    day_of_week="mon-fri",
+                    hour="9-16",
+                    minute=f"*/{exit_check_interval}"
+                    if exit_check_interval < 60
+                    else "0",
+                    timezone="US/Eastern",
+                ),
+                id="exit_check_pass",
+                name="Exit Check Pass",
+                misfire_grace_time=120,
+            )
+            logger.info(
+                "Scheduled exit-check pass every %dmin (9AM-4PM ET, swing variants)",
+                exit_check_interval,
+            )
+
         # Order reconciliation (Track P-SYNC) — sync local DB against broker.
         # Off by default; enable via `reconciler_enabled: true` in config.
         if self.config.get("reconciler_enabled", False):

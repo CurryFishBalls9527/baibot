@@ -37,6 +37,29 @@ class TradeAnalyzer:
         entry_date = outcome.get("entry_date", "?")
         exit_date = outcome.get("exit_date", "?")
 
+        # Optional enriched context — populated by the automation review loop
+        # (backwards compatible: omitted when called from the UI with a plain
+        # trade_outcomes row).
+        mfe = outcome.get("max_favorable_excursion")
+        mae = outcome.get("max_adverse_excursion")
+        setup_context = outcome.get("_setup_context") or ""
+        variant = outcome.get("_variant", "")
+
+        excursion_section = ""
+        if mfe is not None or mae is not None:
+            excursion_section = (
+                "\nExcursion (hourly bars over trade window):\n"
+                f"- Max Favorable (MFE): {mfe:+.2%}\n" if mfe is not None else ""
+            )
+            if mae is not None:
+                excursion_section += f"- Max Adverse (MAE): {mae:+.2%}\n"
+
+        setup_section = ""
+        if setup_context:
+            setup_section = f"\nSetup Context:\n{setup_context}\n"
+
+        variant_section = f"- Strategy variant: {variant}\n" if variant else ""
+
         signal_section = ""
         if entry_signal:
             reasoning = entry_signal.get("reasoning") or entry_signal.get("full_analysis") or ""
@@ -49,30 +72,30 @@ Entry Signal:
 - Reasoning: {reasoning[:1000]}
 """
 
-        return f"""You are a trading journal analyst. Analyze this closed trade concisely.
+        return f"""You are a trading journal analyst writing a post-mortem for a human trader who is learning technical analysis. Explain this closed trade in plain, concrete, teaching-oriented language. Reference specific levels, indicators, or price events — no vague platitudes.
 
 Trade Details:
 - Symbol: {symbol}
-- Entry: ${entry_price:.2f} on {entry_date}
+{variant_section}- Entry: ${entry_price:.2f} on {entry_date}
 - Exit: ${exit_price:.2f} on {exit_date}
 - Return: {return_pct:+.2f}%
 - Hold Duration: {hold_days} days
 - Exit Reason: {exit_reason}
 - Base Pattern: {base_pattern}
 - Market Regime at Entry: {regime}
-{signal_section}
-Write a brief analysis in 4 sections (use markdown headers):
+{excursion_section}{setup_section}{signal_section}
+Write in 4 sections (use markdown H3 headers):
 
 ### Entry Thesis
-Why was this trade entered? (Based on signal reasoning and pattern.)
+Why did we buy? Name the specific setup and the TA indicators that fired (pivot / ORB level / Chan BSP type / SMA stack / VWAP / volume surge — whichever apply). Be concrete about the price levels.
 
 ### What Happened
-Price action summary, hold duration, and what triggered the exit.
+Narrate the price path from entry to exit in 2-3 short beats. Reference MFE/MAE if they tell a story (e.g. "ran to +8% before giving back").
 
 ### Assessment
-Why did this trade {"succeed" if return_pct and return_pct > 0 else "fail"}? What market conditions helped or hurt?
+Did this trade {"succeed" if return_pct and return_pct > 0 else "fail"} for the reason we expected, or by luck? What market condition helped/hurt? Contrast against what a textbook outcome would look like.
 
 ### Lesson
-One actionable takeaway for future trades.
+One actionable, testable takeaway for future trades with this setup. Avoid generic advice.
 
-Keep total response under 250 words."""
+Keep total response under 350 words. Quote prices and indicators precisely."""

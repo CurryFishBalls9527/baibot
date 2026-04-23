@@ -234,6 +234,60 @@ class TradeChartBuilder:
             ))
         return self
 
+    def add_vwap_line(self) -> Self:
+        """Intraday VWAP line — compute from bars' typical-price × volume."""
+        if "volume" not in self.df.columns:
+            return self
+        tp = (self.df["high"] + self.df["low"] + self.df["close"]) / 3.0
+        pv = tp * self.df["volume"]
+        vwap = pv.cumsum() / self.df["volume"].cumsum().replace(0, np.nan)
+        self._traces_main.append(go.Scatter(
+            x=self.df.index, y=vwap, mode="lines",
+            line=dict(width=1.2, color="#ffb74d", dash="dot"),
+            name="VWAP",
+        ))
+        return self
+
+    def add_orb_levels(self, orb_high: float, orb_low: float) -> Self:
+        """Intraday opening-range high/low lines."""
+        for name, val, color in [
+            ("ORB High", orb_high, "#4caf50"),
+            ("ORB Low", orb_low, "#f44336"),
+        ]:
+            if val:
+                self._shapes.append(dict(
+                    type="line", y0=val, y1=val,
+                    x0=self.df.index[0], x1=self.df.index[-1],
+                    line=dict(color=color, width=1, dash="dashdot"),
+                ))
+                self._annotations.append(dict(
+                    x=self.df.index[-1], y=val,
+                    text=f"{name}: ${val:.2f}",
+                    showarrow=False, xanchor="left",
+                    font=dict(size=9, color=color),
+                ))
+        return self
+
+    def add_prior_session_levels(self, prior_high=None, prior_close=None) -> Self:
+        """Used by NR4 / gap-reclaim setups."""
+        for name, val, color, dash in [
+            ("Prior Hi", prior_high, "#9c27b0", "dot"),
+            ("Prior Close", prior_close, "#03a9f4", "dot"),
+        ]:
+            if val:
+                self._shapes.append(dict(
+                    type="line", y0=val, y1=val,
+                    x0=self.df.index[0], x1=self.df.index[-1],
+                    line=dict(color=color, width=1, dash=dash),
+                ))
+                self._annotations.append(dict(
+                    x=self.df.index[-1], y=val,
+                    text=f"{name}: ${val:.2f}",
+                    showarrow=False, xanchor="left",
+                    font=dict(size=9, color=color),
+                ))
+        return self
+
     def add_chan_bsp(self, bsp_list: list[dict]) -> Self:
         for bsp in bsp_list:
             is_buy = bsp.get("is_buy", True)

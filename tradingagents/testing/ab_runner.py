@@ -60,6 +60,7 @@ class ABRunner:
 
     def __init__(self, experiment: Experiment, base_config: dict):
         self.experiment = experiment
+        self.base_config = base_config  # kept for cross-variant jobs (weekly review)
         self.orchestrators: Dict[str, Orchestrator] = {}
         for variant in experiment.variants:
             variant_config = build_variant_config(base_config, variant)
@@ -114,6 +115,63 @@ class ABRunner:
             lambda _name, orch: orch.reconcile_orders(),
             "reconcile",
         )
+
+    def run_weekly_strategy_review(self) -> Dict:
+        """Saturday cross-variant weekly review (gpt-5.2 deep-think).
+
+        Runs once across all variants, not per-variant — the output is a
+        single directory of markdown files plus an index.
+        """
+        from tradingagents.automation.weekly_review import run_weekly_review
+
+        merged_config = dict(self.base_config or {})
+        # Ensure the module sees the flag; real gate is at scheduler cron.
+        merged_config.setdefault("weekly_strategy_review_enabled", True)
+        return run_weekly_review(ab_runner=self, config=merged_config)
+
+    def run_daily_trade_review(self) -> Dict[str, Dict]:
+        """Fan out the daily per-trade review across all variants.
+
+        Each orchestrator implements `run_daily_trade_review`; variants
+        without closed trades today produce a no-op summary. Kill-switched
+        at the per-variant config level (`daily_trade_review_enabled`).
+        """
+        def _dispatch(_name: str, orch) -> Dict:
+            if hasattr(orch, "run_daily_trade_review"):
+                try:
+                    return orch.run_daily_trade_review()
+                except Exception as e:
+                    logger.error(
+                        "Variant '%s' daily_trade_review failed: %s",
+                        _name, e, exc_info=True,
+                    )
+                    return {"error": str(e)}
+            return {"status": "not_applicable"}
+        return self._grouped_parallel(_dispatch, "daily trade review")
+
+    def run_exit_check_pass(self) -> Dict[str, Dict]:
+        """Run exit-manager check across swing variants on 5-min cadence.
+
+        `ai_review_enabled=False` so this path is rules-only (no LLM calls)
+        — identical to the AI-skipping daily-scan branch. Idempotent:
+        `Orchestrator.run_exit_check_pass` guards SELL submission against
+        in-flight orders via `_find_existing_open_order`.
+
+        Variants without the method (chan, chan_v2, intraday_*) short-circuit
+        to `not_applicable` because they have their own exit logic paths.
+        """
+        def _dispatch(_name: str, orch) -> Dict:
+            if hasattr(orch, "run_exit_check_pass"):
+                try:
+                    return orch.run_exit_check_pass(ai_review_enabled=False)
+                except Exception as e:
+                    logger.error(
+                        "Variant '%s' exit_check_pass failed: %s",
+                        _name, e, exc_info=True,
+                    )
+                    return {"error": str(e)}
+            return {"status": "not_applicable"}
+        return self._grouped_parallel(_dispatch, "exit check pass")
 
     def run_intraday_scan(self) -> Dict[str, Dict]:
         """Run intraday scans (Chan: 30m signals; intraday_mechanical: 15m NR4 scan;
