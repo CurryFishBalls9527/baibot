@@ -1,3 +1,7 @@
+# Local tool state (Claude Code, AGENTS tooling) — not shared across machines
+.claude/
+.agents/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
