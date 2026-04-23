@@ -489,6 +489,13 @@ class IntradayOrchestrator:
                 "highest_close": order_result.filled_avg_price or current_price,
                 "current_stop": sl_price,
                 "partial_taken": False,
+                "variant": self.config.get("variant_name", "intraday_mechanical"),
+                # Setup family (nr4_breakout / orb_breakout / gap_reclaim_long /
+                # ...) used as base_pattern so the daily/weekly review can cut
+                # stats by setup. Regime left NULL here: intraday doesn't join
+                # the daily market-regime score, and the signal_metadata JSON
+                # already captures session-level context for charting.
+                "base_pattern": signal.get("setup_family"),
             })
 
         return {
@@ -529,11 +536,15 @@ class IntradayOrchestrator:
                             self.broker.cancel_order(o.order_id)
                         except Exception as e:
                             logger.debug("cancel_order(%s) failed: %s", o.order_id, e)
+                # Capture entry context BEFORE the SELL so the outcome hook
+                # has it even if delete_position_state races.
+                pos_state_before = self.db.get_position_state(symbol)
                 result = self.broker.close_position(symbol)
                 closed.append({
                     "symbol": symbol, "closed": True,
                     "status": getattr(result, "status", None),
                 })
+                fill_price = getattr(result, "filled_avg_price", None)
                 self.db.log_trade(
                     symbol=symbol,
                     side="sell",
@@ -541,10 +552,39 @@ class IntradayOrchestrator:
                     order_type="market",
                     status=getattr(result, "status", "submitted"),
                     filled_qty=getattr(result, "filled_qty", None),
-                    filled_price=getattr(result, "filled_avg_price", None),
+                    filled_price=fill_price,
                     order_id=getattr(result, "order_id", None),
                     reasoning="intraday EOD flatten",
                 )
+                # Log the closed-trade outcome for the daily/weekly reviews.
+                # Kill-switched + try/except at the helper level — a hook
+                # failure cannot block the EOD flatten loop.
+                if (
+                    self.config.get("trade_outcome_live_hook_intraday_enabled", True)
+                    and pos_state_before
+                ):
+                    try:
+                        from tradingagents.automation.trade_outcome import log_closed_trade
+                        exit_px = float(fill_price) if fill_price else float(pos.current_price)
+                        log_closed_trade(
+                            db=self.db,
+                            symbol=symbol,
+                            pos_state=pos_state_before,
+                            exit_price=exit_px,
+                            exit_reason="eod_flatten",
+                            broker=self.broker,
+                            excursion_enabled=self.config.get(
+                                "trade_outcome_excursion_enabled", False
+                            ),
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "intraday flatten trade_outcome hook failed %s: %s",
+                            symbol, e,
+                        )
+                # Always delete the state after a live flatten — the position
+                # is gone at broker, ghost row would confuse the reconciler.
+                self.db.delete_position_state(symbol)
             except Exception as e:
                 logger.warning("flatten_all: close_position(%s) failed: %s", symbol, e)
                 closed.append({"symbol": symbol, "closed": False, "error": str(e)})

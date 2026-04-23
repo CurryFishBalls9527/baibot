@@ -24,6 +24,48 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 
+RED_TEAM_PROMPT = """You are an adversarial strategy reviewer. The weekly
+analyst below wrote the PRIMARY REVIEW. Your job is to find where their
+confidence exceeds the evidence. Do not cheerlead. Do not rehash stats.
+
+Focus on:
+1. Small-sample claims dressed as conclusions (N < 15 is weak, N < 5 is noise).
+2. Negative data that was mentioned but not weighed.
+3. Proposals whose validation plan is vague or easily gamed.
+4. Correlation mistaken for causation.
+5. Contradictions with prior-week proposals (if provided in the prompt).
+
+If the primary review is sound, say so explicitly under a single line and
+move on. Do NOT invent problems just to fill space.
+
+Output format — exactly these Markdown H3 headers in order:
+
+### Small-Sample Warning
+Any conclusion drawn from N < 15 trades or from a single week's noise?
+Cite the specific section. If none, write "N/A — sample sizes adequate."
+
+### Ignored / Contradictory Data
+What in the raw stats (below) was omitted or minimised?
+
+### Challenge to Proposals
+For each of the primary review's proposals, challenge its validation plan
+and its risk/reward assumption.
+
+Under 350 words total. End on a single line:
+**RED-TEAM VERDICT: <support | partial-support | reject-with-reason>**
+
+---
+
+## RAW STATS (same inputs as primary review)
+{raw_stats}
+
+---
+
+## PRIMARY REVIEW TO CHALLENGE
+{primary_review}
+"""
+
+
 BIAS_AUDIT_STANZA = """
 BIAS-AUDIT RULES (from the repo's CLAUDE.md — apply to all recommendations):
 1. State scope explicitly: list what you ANALYZED AND what you did NOT.
@@ -131,10 +173,149 @@ def _strategy_daily_returns(db, start: date, end: date) -> list[float]:
     return out
 
 
+_PROPOSAL_SECTION_HEADERS = (
+    "## Proposals (Open-Ended)",
+    "## Proposals",
+    "## Proposals (Open Ended)",
+)
+
+
+def _parse_and_store_proposals(
+    db, *, variant: str, iso_week: str, review_md: str,
+) -> int:
+    """Parse proposals from the LLM-produced weekly review markdown.
+
+    Expected structure:
+
+        ## Proposals (Open-Ended)
+
+        ### Proposal: <title>
+        - **What:** <text>
+        - **Why:** <text>
+        - **How to validate:** <text>
+        - **Risk:** <text>
+
+        ### Proposal: <next title>
+        ...
+
+    Tolerant to formatting drift — missing bullets become NULL, unusually
+    titled proposal headers still match by starting with "### Proposal:".
+    Returns the number of rows inserted.
+    """
+    if not review_md:
+        return 0
+
+    # Locate the proposals section by header match.
+    section = ""
+    for header in _PROPOSAL_SECTION_HEADERS:
+        idx = review_md.find(header)
+        if idx != -1:
+            section = review_md[idx + len(header):]
+            break
+    if not section:
+        return 0
+    # Trim at the next H2 header if any.
+    next_h2 = section.find("\n## ")
+    if next_h2 != -1:
+        section = section[:next_h2]
+
+    # Split into per-proposal blocks on "### Proposal:"
+    blocks = []
+    cursor = 0
+    while True:
+        start = section.find("### Proposal:", cursor)
+        if start == -1:
+            break
+        nxt = section.find("### Proposal:", start + 1)
+        block = section[start:nxt] if nxt != -1 else section[start:]
+        blocks.append(block)
+        cursor = start + 1
+        if nxt == -1:
+            break
+
+    inserted = 0
+    for block in blocks:
+        title_line, _, body = block.partition("\n")
+        title = title_line.replace("### Proposal:", "").strip()[:200] or "Untitled"
+        fields = {"what": None, "why": None, "how_to_validate": None, "risk": None}
+
+        # Bullet extractor — handles "**What:** text" and "- **What:** text".
+        # Only strip "-" and whitespace on the left, NOT "*" (which is a
+        # markdown bold marker the alias explicitly includes).
+        for line in body.splitlines():
+            stripped = line.lstrip()
+            if stripped.startswith("- "):
+                stripped = stripped[2:].lstrip()
+            lower = stripped.lower()
+            for key, alias in (
+                ("what", "**what:**"),
+                ("why", "**why:**"),
+                ("how_to_validate", "**how to validate:**"),
+                ("risk", "**risk:**"),
+            ):
+                if lower.startswith(alias):
+                    fields[key] = stripped[len(alias):].strip() or None
+                    break
+        try:
+            db.insert_proposal(
+                variant=variant, iso_week=iso_week, title=title, **fields,
+            )
+            inserted += 1
+        except Exception as e:
+            logger.warning(
+                "insert_proposal(%s, %s) failed: %s", variant, title[:40], e,
+            )
+    if inserted:
+        logger.info(
+            "weekly_review[%s]: parsed + stored %d proposal(s)",
+            variant, inserted,
+        )
+    return inserted
+
+
+def _prior_proposals_block(db, variant: str, max_weeks: int = 8) -> str:
+    """Compact summary of prior proposals for this variant — fed into next week's prompt.
+
+    Shows status for everything in the last N weeks, plus any still-open
+    proposal regardless of age. Keeps the prompt context bounded.
+    """
+    try:
+        rows = db.get_proposals(variant=variant, limit=50)
+    except Exception:
+        return ""
+    if not rows:
+        return ""
+    # Filter: keep if open/accepted/tested OR created in last max_weeks.
+    cutoff = (date.today() - timedelta(weeks=max_weeks)).isoformat()
+    kept = [
+        r for r in rows
+        if r.get("status") in ("open", "accepted", "tested")
+        or (r.get("created_at") or "") >= cutoff
+    ]
+    if not kept:
+        return ""
+    lines = ["## Prior proposals (status carried from previous weeks)"]
+    lines.append(
+        "Use this to avoid re-proposing the same idea; acknowledge what "
+        "was tested and whether it worked."
+    )
+    for r in kept[:20]:
+        status = r.get("status", "open")
+        title = (r.get("title") or "?")[:80]
+        week = r.get("iso_week", "")
+        outcome = (r.get("outcome_summary") or "").replace("\n", " ")[:160]
+        if outcome:
+            lines.append(f"- [{status}] {week} · {title} → {outcome}")
+        else:
+            lines.append(f"- [{status}] {week} · {title}")
+    return "\n".join(lines)
+
+
 def _build_prompt(
     variant_name: str, window_start: date, window_end: date,
     stats: dict, regime_stats: dict, pattern_stats: dict, dow_stats: dict,
     spy_cmp: dict, qqq_cmp: dict, memories: list[dict],
+    prior_proposals_block: str = "",
 ) -> str:
     def _fmt_stats(s: dict) -> str:
         if not s or s.get("count", 0) == 0:
@@ -194,6 +375,8 @@ QQQ: benchmark_return={qqq_cmp.get('benchmark_return'):+.2%}, excess={qqq_cmp.ge
 
 ## Lessons logged this week (from agent_memories)
 {memory_block}
+
+{prior_proposals_block}
 
 ## OUTPUT CONTRACT
 Write the review using exactly these Markdown H2 headers, in order:
@@ -305,6 +488,7 @@ def run_weekly_review(
             )
 
             memories = _memories_this_week(db, start.isoformat())
+            prior_block = _prior_proposals_block(db, variant=name)
 
             prompt = _build_prompt(
                 variant_name=name,
@@ -313,6 +497,7 @@ def run_weekly_review(
                 pattern_stats=pattern_stats, dow_stats=dow_stats,
                 spy_cmp=spy_cmp, qqq_cmp=qqq_cmp,
                 memories=memories,
+                prior_proposals_block=prior_block,
             )
 
             client = create_llm_client(provider=provider, model=deep_model)
@@ -320,16 +505,57 @@ def run_weekly_review(
             body = llm.invoke(prompt).content
             llm_calls += 1
 
+            # Red-team pass: second gpt-5.2 call that challenges the primary
+            # review. Gated by `weekly_red_team_enabled` (default True).
+            # Output appended as a "## Red-Team Counter-Review" section.
+            red_team_md = ""
+            if config.get("weekly_red_team_enabled", True) and llm_calls < budget:
+                try:
+                    red_prompt = RED_TEAM_PROMPT.format(
+                        raw_stats=prompt.split("## OUTPUT CONTRACT", 1)[0],
+                        primary_review=body,
+                    )
+                    red_client = create_llm_client(provider=provider, model=deep_model)
+                    red_body = red_client.get_llm().invoke(red_prompt).content
+                    red_team_md = (
+                        "\n\n---\n\n## Red-Team Counter-Review\n"
+                        + red_body.strip() + "\n"
+                    )
+                    llm_calls += 1
+                except Exception as e:
+                    logger.warning(
+                        "weekly_review[%s] red-team pass failed: %s", name, e,
+                    )
+                    red_team_md = (
+                        "\n\n---\n\n## Red-Team Counter-Review\n"
+                        f"_(red-team pass failed: {e})_\n"
+                    )
+
             out_path = out_dir / f"{name}.md"
             header = (
                 f"# Weekly Review — {name} — {iso_week}\n"
                 f"_{start} → {end} · generated {review_date}_\n\n"
             )
-            out_path.write_text(header + body, encoding="utf-8")
+            out_path.write_text(header + body + red_team_md, encoding="utf-8")
+
+            # Parse the `## Proposals (Open-Ended)` section and persist each
+            # proposal so the loop actually closes. Tolerant: log on drift,
+            # never raise. Skip in dry-run so test runs don't pollute DB.
+            proposals_inserted = 0
+            if not dry_run:
+                try:
+                    proposals_inserted = _parse_and_store_proposals(
+                        db, variant=name, iso_week=iso_week, review_md=body,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "weekly_review[%s] proposal parse failed: %s", name, e,
+                    )
 
             summary["variants"][name] = {
                 "trades": stats.get("count", 0),
                 "output": str(out_path),
+                "proposals_inserted": proposals_inserted,
             }
             logger.info(
                 "weekly_review[%s] %s: %d trades, review saved to %s",

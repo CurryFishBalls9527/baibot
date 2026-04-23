@@ -70,7 +70,13 @@ def _load_trades(db: TradingDatabase, limit: int = 100) -> pd.DataFrame:
     if not trades:
         return pd.DataFrame()
     df = pd.DataFrame(trades)
-    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    # Mixed timestamp formats across live-insert and reconciler paths —
+    # see pages/1_Performance.py for the full story.
+    df["timestamp"] = pd.to_datetime(
+        df["timestamp"], format="mixed", errors="coerce", utc=True,
+    )
+    df = df.dropna(subset=["timestamp"])
+    df["timestamp"] = df["timestamp"].dt.tz_localize(None)
     return df.sort_values("timestamp", ascending=False)
 
 
@@ -192,7 +198,20 @@ def main():
     builder.add_trade_markers(trade_markers)
 
     if show_chan and variant == "chan":
+        # Pre-flight: Chan's CChan constructor raises cryptic errors when the
+        # symbol has no 30m bars in the window, or when the window is too
+        # narrow for the pivot calculation. Surface a clearer message and
+        # log the full traceback so the terminal shows the cause.
         try:
+            if ohlcv.empty:
+                raise RuntimeError("no 30m OHLCV bars in window")
+            # Chan wants at least ~40 bars (Bi + ZS pivots). If the window
+            # is too small, the extractor returns degenerate output at best.
+            if len(ohlcv) < 20:
+                raise RuntimeError(
+                    f"only {len(ohlcv)} 30m bars in window "
+                    f"(need ~40+ for meaningful Bi/ZS extraction)"
+                )
             from tradingagents.dashboard.chan_structures import extract_chan_structures
             structures = extract_chan_structures(
                 selected_symbol, begin, end, vcfg["ohlcv_db"],
@@ -201,7 +220,32 @@ def main():
             builder.add_chan_zs(structures["zs_list"])
             builder.add_chan_bsp(structures["bsp_list"])
         except Exception as e:
-            st.warning(f"Chan structure extraction failed: {e}")
+            import traceback
+            tb = traceback.format_exc()
+            is_bare_assert = (
+                isinstance(e, AssertionError) and not str(e)
+            )
+            st.warning(
+                f"**Chan structure extraction failed for {selected_symbol}:**\n\n"
+                f"`{type(e).__name__}: {e}`\n\n"
+                f"Window: {begin} → {end} · bars loaded: {len(ohlcv)}\n\n"
+                + (
+                    "AssertionError with empty message usually comes from a "
+                    "bare `assert` in the Chan library. Often caused by "
+                    "in-process state leaking from a prior extraction — "
+                    "click **Clear cache + rerun** below, or try a "
+                    "different window/symbol.\n\n"
+                    if is_bare_assert else
+                    "Tip: widen the context window in the sidebar, or confirm "
+                    f"this symbol has 30m data in `{vcfg['ohlcv_db']}`.\n\n"
+                )
+            )
+            with st.expander("Full traceback", expanded=False):
+                st.code(tb, language="python")
+            if st.button("Clear cache + rerun", key=f"chan_retry_{selected_symbol}"):
+                st.cache_data.clear()
+                st.cache_resource.clear()
+                st.rerun()
 
     fig = builder.build()
     st.plotly_chart(fig, use_container_width=True)

@@ -1199,6 +1199,30 @@ class Orchestrator:
                 state_to_persist["tp_order_id"] = tp_leg
             state_to_persist["entry_order_id"] = order_result.order_id
             state_to_persist["variant"] = self.config.get("variant_name")
+
+            # Capture Minervini entry context for the daily/weekly reviews.
+            # Pulled from the preflight screener cache if available.
+            try:
+                pre = self._latest_minervini_preflight
+                if pre is not None and pre.screen_df is not None:
+                    match = pre.screen_df[pre.screen_df["symbol"] == symbol]
+                    if not match.empty:
+                        row = match.iloc[0]
+                        bp = row.get("base_label")
+                        stage = row.get("stage_number")
+                        rs = row.get("rs_percentile")
+                        regime = row.get("market_regime")
+                        if bp is not None:
+                            state_to_persist["base_pattern"] = bp
+                        if stage is not None:
+                            state_to_persist["stage_at_entry"] = float(stage)
+                        if rs is not None:
+                            state_to_persist["rs_at_entry"] = float(rs)
+                        if regime is not None:
+                            state_to_persist["regime_at_entry"] = regime
+            except Exception as e:
+                logger.debug(f"{symbol}: entry-context capture skipped: {e}")
+
             self.db.upsert_position_state(symbol, state_to_persist)
 
         logger.info(
@@ -2009,113 +2033,53 @@ class Orchestrator:
     # ── Helpers ──────────────────────────────────────────────────────
 
     def _log_trade_outcome(self, position, pos_state: Dict, exit_reason: str):
-        """Log a structured trade outcome for reflection analysis (Phase 7)."""
-        try:
-            from dateutil.parser import parse as parse_date
-            entry_price = float(pos_state.get("entry_price", position.avg_entry_price))
-            exit_price = float(position.current_price)
-            return_pct = (exit_price - entry_price) / entry_price if entry_price > 0 else 0
-            try:
-                entry_date = parse_date(pos_state.get("entry_date", "")).date()
-                hold_days = (date.today() - entry_date).days
-            except Exception:
-                hold_days = 0
+        """Log a structured trade outcome for reflection analysis (Phase 7).
 
-            # Try to get screener context
-            base_pattern = None
-            stage_at_entry = None
-            rs_at_entry = None
-            regime_at_entry = None
-            if self._latest_minervini_preflight and self._latest_minervini_preflight.screen_df is not None:
+        Delegates the heavy lifting (return/MFE/MAE compute + insert) to the
+        shared `trade_outcome.log_closed_trade`. This method is responsible
+        for enriching the pos_state with Minervini-specific screener context
+        (base_label, stage, RS percentile, regime) from the latest preflight,
+        since the swing Orchestrator holds that state in memory rather than
+        in position_states.
+        """
+        try:
+            from tradingagents.automation.trade_outcome import log_closed_trade
+
+            # Enrich pos_state with screener context if we have it. Keeps the
+            # pos_state in memory untouched — we only add to the dict we pass
+            # into log_closed_trade.
+            enriched = dict(pos_state) if pos_state else {}
+            if "entry_price" not in enriched:
+                enriched["entry_price"] = float(position.avg_entry_price)
+            if (
+                self._latest_minervini_preflight
+                and self._latest_minervini_preflight.screen_df is not None
+            ):
                 match = self._latest_minervini_preflight.screen_df[
                     self._latest_minervini_preflight.screen_df["symbol"] == position.symbol
                 ]
                 if not match.empty:
                     row = match.iloc[0]
-                    base_pattern = row.get("base_label")
-                    stage_at_entry = row.get("stage_number")
-                    rs_at_entry = row.get("rs_percentile")
-                    regime_at_entry = row.get("market_regime")
+                    # Only set if not already populated — respect the entry-time
+                    # context that might have been persisted to position_states.
+                    enriched.setdefault("base_pattern", row.get("base_label"))
+                    enriched.setdefault("stage_at_entry", row.get("stage_number"))
+                    enriched.setdefault("rs_at_entry", row.get("rs_percentile"))
+                    enriched.setdefault("regime_at_entry", row.get("market_regime"))
 
-            # Compute MFE/MAE — kill-switched, fails soft. Adds one Alpaca API
-            # call per exit; cost is bounded and the guard ensures this never
-            # blocks outcome logging or the upstream exit path.
-            mfe, mae = self._compute_excursion(
+            log_closed_trade(
+                db=self.db,
                 symbol=position.symbol,
-                entry_date_str=pos_state.get("entry_date", ""),
-                exit_date_str=date.today().isoformat(),
-                entry_price=entry_price,
+                pos_state=enriched,
+                exit_price=float(position.current_price),
+                exit_reason=exit_reason,
+                broker=self.broker,
+                excursion_enabled=self.config.get(
+                    "trade_outcome_excursion_enabled", False
+                ),
             )
-
-            self.db.log_trade_outcome({
-                "symbol": position.symbol,
-                "entry_date": pos_state.get("entry_date"),
-                "exit_date": date.today().isoformat(),
-                "entry_price": entry_price,
-                "exit_price": exit_price,
-                "return_pct": round(return_pct, 4),
-                "hold_days": hold_days,
-                "exit_reason": exit_reason,
-                "base_pattern": base_pattern,
-                "stage_at_entry": stage_at_entry,
-                "rs_at_entry": rs_at_entry,
-                "regime_at_entry": regime_at_entry,
-                "max_favorable_excursion": mfe,
-                "max_adverse_excursion": mae,
-            })
         except Exception as e:
             logger.debug(f"Could not log trade outcome for {position.symbol}: {e}")
-
-    def _compute_excursion(
-        self,
-        symbol: str,
-        entry_date_str: str,
-        exit_date_str: str,
-        entry_price: float,
-    ):
-        """Compute max-favorable / max-adverse excursion over a trade window.
-
-        Uses hourly bars from Alpaca. Returns ``(mfe_pct, mae_pct)`` as
-        decimals (0.05 == +5 %). Fails soft: returns ``(None, None)`` on any
-        error, missing data, or disabled kill switch. Wrapped by caller's
-        try/except too — two layers of insulation from the exit path.
-
-        Kill switch: ``trade_outcome_excursion_enabled`` config flag,
-        default False. Deploy code with the flag OFF, validate no exits
-        break, then flip per the rollout checklist.
-        """
-        if not self.config.get("trade_outcome_excursion_enabled", False):
-            return (None, None)
-        try:
-            from dateutil.parser import parse as parse_date
-            from alpaca.data.requests import StockBarsRequest
-            from alpaca.data.timeframe import TimeFrame
-
-            if not entry_date_str or entry_price <= 0:
-                return (None, None)
-            start = parse_date(entry_date_str)
-            end = parse_date(exit_date_str) + timedelta(days=1)
-            data_client = getattr(self.broker, "data_client", None)
-            if data_client is None:
-                return (None, None)
-            req = StockBarsRequest(
-                symbol_or_symbols=[symbol],
-                timeframe=TimeFrame.Hour,
-                start=start,
-                end=end,
-            )
-            bars = data_client.get_stock_bars(req)
-            series = getattr(bars, "data", {}).get(symbol) or []
-            if not series:
-                return (None, None)
-            max_high = max(float(b.high) for b in series)
-            min_low = min(float(b.low) for b in series)
-            mfe = (max_high - entry_price) / entry_price
-            mae = (min_low - entry_price) / entry_price
-            return (round(mfe, 4), round(mae, 4))
-        except Exception as e:
-            logger.warning(f"_compute_excursion({symbol}) failed: {e}")
-            return (None, None)
 
     def _get_latest_features(self, symbol: str) -> Dict:
         """Get latest technical features for a symbol from the screener data or yfinance.

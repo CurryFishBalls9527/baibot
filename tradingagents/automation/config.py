@@ -243,6 +243,16 @@ def build_config(overrides: dict = None) -> dict:
         "weekly_review_time": "09:00",
         "weekly_review_max_calls": 10,
         "weekly_review_model": "gpt-5.2",
+        # Red-team adversarial second pass on the weekly review. Doubles
+        # the weekly LLM cost (~$5-10/wk). Appended to the variant markdown
+        # as a "## Red-Team Counter-Review" section ending with a single
+        # RED-TEAM VERDICT line that the dashboard surfaces as a badge.
+        "weekly_red_team_enabled": True,
+        # Kill-switches for the per-variant trade_outcome hook. Default On
+        # (safe additive; all writes wrapped in try/except). Flip off if
+        # a specific variant's exit path starts producing spurious warnings.
+        "trade_outcome_live_hook_chan_enabled": True,
+        "trade_outcome_live_hook_intraday_enabled": True,
 
         # Storage
         "db_path": os.path.join(

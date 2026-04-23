@@ -159,32 +159,148 @@ def _trades_for_marker(db, symbol: str, entry_date: str, exit_date: str) -> list
     ]
 
 
+def _parse_payload(setup_row: Optional[dict]) -> dict:
+    """Unpack payload_json blob from a setup_candidates row (or {})."""
+    if not setup_row:
+        return {}
+    payload = setup_row.get("payload_json") or ""
+    if not payload:
+        return {}
+    try:
+        return json.loads(payload) or {}
+    except Exception:
+        return {}
+
+
+def _minervini_criteria_checklist(setup_row: dict, payload: dict) -> list[tuple[str, str, bool]]:
+    """Evaluate classic Minervini-template criteria against captured metrics.
+
+    Returns a list of (criterion, value-as-shown, passes?). Same 8-point
+    check Mark Minervini publishes in Trade Like a Stock Market Wizard,
+    plus a few volume / accumulation checks that matter for breakouts.
+    Passes are tri-state via None for "no data"; for the view we collapse
+    to bool just for display.
+    """
+    sma50 = payload.get("sma_50")
+    sma150 = payload.get("sma_150")
+    sma200 = payload.get("sma_200")
+    price = payload.get("close")
+    hi52 = payload.get("52w_high")
+    lo52 = payload.get("52w_low")
+    rs = payload.get("rs_percentile")
+    stage = payload.get("stage_number")
+    adx = payload.get("adx_14")
+    rsi = payload.get("rsi_14")
+    vol_ratio = payload.get("breakout_volume_ratio")
+    tmpl_score = payload.get("template_score")
+    roc60 = payload.get("roc_60")
+    roc120 = payload.get("roc_120")
+
+    def _ok(cond):  # `None`-aware bool coercion
+        return bool(cond) if cond is not None else False
+
+    items = []
+    if price is not None and sma150 is not None:
+        items.append(("Price > 150-DMA", f"${price:.2f} vs ${sma150:.2f}", price > sma150))
+    if price is not None and sma200 is not None:
+        items.append(("Price > 200-DMA", f"${price:.2f} vs ${sma200:.2f}", price > sma200))
+    if sma150 is not None and sma200 is not None:
+        items.append(("150-DMA > 200-DMA", f"${sma150:.2f} vs ${sma200:.2f}", sma150 > sma200))
+    if sma50 is not None and sma150 is not None and sma200 is not None:
+        items.append(("50-DMA > 150 > 200 (stack)", "", sma50 > sma150 > sma200))
+    if price is not None and sma50 is not None:
+        items.append(("Price > 50-DMA", f"${price:.2f} vs ${sma50:.2f}", price > sma50))
+    if price is not None and hi52 is not None:
+        dist = (hi52 - price) / hi52
+        items.append(("Within 25% of 52w high", f"{dist:.1%} below", dist <= 0.25))
+    if price is not None and lo52 is not None and lo52 > 0:
+        r = (price - lo52) / lo52
+        items.append(("≥ 30% above 52w low", f"{r:.1%}", r >= 0.30))
+    if rs is not None:
+        items.append(("RS ≥ 70th pct", f"{rs:.1f}", rs >= 70))
+    if stage is not None:
+        items.append(("Stage 2 (1-3)", f"stage {stage:.0f}", stage <= 3))
+    if vol_ratio is not None:
+        items.append(("Breakout vol ≥ 1.4×", f"{vol_ratio:.2f}×", vol_ratio >= 1.4))
+    if adx is not None:
+        items.append(("ADX ≥ 20 (trend)", f"{adx:.1f}", adx >= 20))
+    if rsi is not None:
+        items.append(("RSI 40-80", f"{rsi:.1f}", 40 <= rsi <= 80))
+    if roc60 is not None:
+        items.append(("3-mo return ≥ 10%", f"{roc60:+.1%}", roc60 >= 0.10))
+    if roc120 is not None:
+        items.append(("6-mo return ≥ 25%", f"{roc120:+.1%}", roc120 >= 0.25))
+    if tmpl_score is not None:
+        items.append(("Template score ≤ 8", f"score {tmpl_score}", tmpl_score <= 8))
+    return items
+
+
 def _build_setup_context(variant: str, setup_row: Optional[dict],
-                        signal_metadata_str: Optional[str]) -> str:
-    """Human-readable setup summary for the LLM prompt."""
+                        signal_metadata_str: Optional[str],
+                        entry_signal: Optional[dict] = None) -> str:
+    """Human-readable setup summary for the LLM prompt.
+
+    Much richer than the v1: pulls the full payload_json from
+    setup_candidates (SMAs, ROC, ADX, RSI, fundamentals, sector), surfaces
+    the untruncated entry-signal reasoning, and computes the Minervini
+    criteria checklist so the LLM can explain which rules actually fired.
+    """
     lines = []
     if _is_minervini(variant) and setup_row:
-        lines.append("Minervini setup:")
+        payload = _parse_payload(setup_row)
+        lines.append("Minervini setup (row from setup_candidates):")
         for k in (
             "base_label", "stage_number", "rs_percentile",
             "pivot_price", "buy_point", "buy_limit_price",
             "initial_stop_price", "initial_stop_pct",
+            "candidate_status", "breakout_signal",
+            "rule_entry_candidate", "rule_watch_candidate",
         ):
             v = setup_row.get(k)
             if v is not None:
                 lines.append(f"  - {k}: {v}")
+        if payload:
+            lines.append("")
+            lines.append("Market / fundamentals / technicals at entry screen:")
+            for k in (
+                "sector", "industry",
+                "template_score", "passed_template",
+                "sma_50", "sma_150", "sma_200",
+                "52w_high", "52w_low",
+                "base_depth_pct", "handle_depth_pct",
+                "rs_score", "rsi_14", "adx_14", "atr_pct_14",
+                "roc_20", "roc_60", "roc_120",
+                "breakout_volume_ratio", "close_range_pct",
+                "revenue_growth", "eps_growth",
+                "revenue_acceleration", "eps_acceleration",
+                "return_on_equity",
+                "earnings_days_away",
+                "market_regime", "market_confirmed_uptrend",
+            ):
+                v = payload.get(k)
+                if v is not None:
+                    lines.append(f"  - {k}: {v}")
+            criteria = _minervini_criteria_checklist(setup_row, payload)
+            if criteria:
+                lines.append("")
+                lines.append("Minervini template criteria (at entry screen):")
+                for name, val, ok in criteria:
+                    mark = "✓" if ok else "✗"
+                    tail = f" ({val})" if val else ""
+                    lines.append(f"  {mark} {name}{tail}")
     if _is_intraday(variant) and signal_metadata_str:
         try:
             meta = json.loads(signal_metadata_str)
         except Exception:
             meta = None
         if meta:
-            lines.append("Intraday setup:")
+            lines.append("Intraday setup (row from signal_metadata):")
             for k in (
                 "setup_family", "opening_range_high", "opening_range_low",
                 "vwap", "distance_from_vwap_pct", "volume_ratio",
                 "prior_session_high", "prior_session_close",
-                "prior_session_is_nr",
+                "prior_session_is_nr", "candidate_score",
+                "breakout_distance_pct",
             ):
                 v = meta.get(k)
                 if v is not None:
@@ -195,6 +311,15 @@ def _build_setup_context(variant: str, setup_row: Optional[dict],
             "T1/T2/T2S off a ZS (central symmetry zone). Exits on structural "
             "ZS-low break or opposite BSP."
         )
+    # Full entry reasoning — untruncated. Critical for "why did we enter?"
+    if entry_signal:
+        reasoning = (
+            entry_signal.get("reasoning") or entry_signal.get("full_analysis") or ""
+        )
+        if reasoning:
+            lines.append("")
+            lines.append("Raw entry-signal reasoning (orchestrator log):")
+            lines.append(reasoning)
     return "\n".join(lines) if lines else ""
 
 
@@ -323,10 +448,12 @@ def run_daily_review(
             else:
                 chart_path = None
 
-            # LLM post-mortem via enriched outcome dict.
+            # LLM post-mortem via enriched outcome dict. Pass the full
+            # entry-signal so the prompt can cite its untruncated reasoning
+            # rather than the 80-char tooltip.
             oc_enriched = dict(oc)
             oc_enriched["_setup_context"] = _build_setup_context(
-                variant_name, setup_row, signal_metadata
+                variant_name, setup_row, signal_metadata, entry_signal=entry_signal,
             )
             oc_enriched["_variant"] = variant_name
 
@@ -423,6 +550,8 @@ def _compose_markdown(
         link = f"[Interactive chart]({Path('charts') / chart_path.name})\n\n"
 
     setup_lines = ["## The Setup (why we bought)"]
+    payload = _parse_payload(setup_row)
+
     if _is_minervini(variant) and setup_row:
         setup_lines.append(
             f"- Pattern: **{setup_row.get('base_label') or 'n/a'}** · "
@@ -434,6 +563,18 @@ def _compose_markdown(
                 f"- Pivot **${setup_row.get('pivot_price'):.2f}** · "
                 f"Buy point **${setup_row.get('buy_point') or 0:.2f}** · "
                 f"Stop **${setup_row.get('initial_stop_price') or 0:.2f}**"
+            )
+        # Sector + earnings proximity are load-bearing for swing trades.
+        sector = payload.get("sector")
+        industry = payload.get("industry")
+        if sector:
+            setup_lines.append(f"- Sector: **{sector}**"
+                               + (f" · {industry}" if industry else ""))
+        edays = payload.get("earnings_days_away")
+        if edays is not None:
+            setup_lines.append(
+                f"- Earnings: **{edays:.0f} days** away"
+                + (" ⚠️ earnings risk" if 0 <= edays <= 15 else "")
             )
     if _is_intraday(variant) and signal_metadata_str:
         try:
@@ -460,6 +601,32 @@ def _compose_markdown(
     )
     setup_block = "\n".join(setup_lines) + "\n\n"
 
+    # Minervini criteria checklist — one line per rule, ✓ or ✗, shown above
+    # the LLM narrative so you can scan "which filters actually fired".
+    criteria_block = ""
+    if _is_minervini(variant) and setup_row and payload:
+        items = _minervini_criteria_checklist(setup_row, payload)
+        if items:
+            criteria_block = "## Criteria at entry (Minervini template)\n"
+            for name, val, ok in items:
+                mark = "✅" if ok else "❌"
+                tail = f" — {val}" if val else ""
+                criteria_block += f"- {mark} {name}{tail}\n"
+            criteria_block += "\n"
+
+    # Raw entry reasoning from the orchestrator — untruncated.
+    reasoning = ""
+    if entry_signal:
+        reasoning = (
+            entry_signal.get("reasoning") or entry_signal.get("full_analysis") or ""
+        )
+    reasoning_block = ""
+    if reasoning:
+        reasoning_block = (
+            "## Entry signal (orchestrator log)\n"
+            f"> {reasoning.strip()}\n\n"
+        )
+
     happened_block = (
         "## What Happened\n"
         f"- Entry **${outcome.get('entry_price', 0):.2f}** on "
@@ -478,7 +645,15 @@ def _compose_markdown(
         f"_{outcome.get('exit_reason') or 'unknown'}_\n\n"
     )
 
-    return header + link + setup_block + happened_block + (llm_body or "") + "\n"
+    return (
+        header + link
+        + setup_block
+        + criteria_block
+        + reasoning_block
+        + happened_block
+        + (llm_body or "")
+        + "\n"
+    )
 
 
 def _write_day_summary(out_dir: Path, variant: str, iso_day: str,

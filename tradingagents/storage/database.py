@@ -183,6 +183,22 @@ class TradingDatabase:
                 max_adverse_excursion REAL,
                 trade_analysis TEXT
             );
+
+            CREATE TABLE IF NOT EXISTS proposals (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at          TEXT    NOT NULL DEFAULT (datetime('now')),
+                variant             TEXT    NOT NULL,
+                iso_week            TEXT    NOT NULL,
+                title               TEXT    NOT NULL,
+                what                TEXT,
+                why                 TEXT,
+                how_to_validate     TEXT,
+                risk                TEXT,
+                status              TEXT    NOT NULL DEFAULT 'open',
+                status_updated_at   TEXT,
+                outcome_summary     TEXT,
+                outcome_metrics_json TEXT
+            );
         """)
         self._ensure_columns(
             "trade_outcomes",
@@ -198,6 +214,16 @@ class TradingDatabase:
                 "variant": "TEXT",
                 "entry_order_id": "TEXT",
                 "bars_held": "INTEGER DEFAULT 0",
+                # Entry-time context captured at BUY time and read at SELL by
+                # the shared trade_outcome helper. Polymorphic across variants:
+                #   - Minervini: base_pattern=<base_label>, rs/stage populated.
+                #   - Chan: base_pattern=<T-type: T1/T2/T2S>, rs/stage NULL.
+                #   - Intraday: base_pattern=<setup_family>, rs/stage NULL.
+                # regime_at_entry is optional per variant.
+                "regime_at_entry": "TEXT",
+                "base_pattern": "TEXT",
+                "rs_at_entry": "REAL",
+                "stage_at_entry": "REAL",
             },
         )
         self._ensure_columns(
@@ -602,15 +628,18 @@ class TradingDatabase:
 
     def upsert_position_state(self, symbol: str, state: Dict):
         # Merge with existing row so v1 callers (passing only core fields) don't
-        # overwrite v2-populated columns like stop_order_id / bars_held / variant.
+        # overwrite v2-populated columns like stop_order_id / bars_held / variant
+        # or feedback-loop fields like base_pattern / regime_at_entry.
         existing = self.get_position_state(symbol) or {}
         merged = {**existing, **state}
         self.conn.execute(
             """INSERT OR REPLACE INTO position_states
                (symbol, entry_price, entry_date, highest_close, current_stop,
                 partial_taken, stop_type, stop_order_id, tp_order_id,
-                entry_order_id, variant, bars_held, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))""",
+                entry_order_id, variant, bars_held,
+                regime_at_entry, base_pattern, rs_at_entry, stage_at_entry,
+                updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))""",
             (
                 symbol,
                 merged["entry_price"],
@@ -624,6 +653,10 @@ class TradingDatabase:
                 merged.get("entry_order_id"),
                 merged.get("variant"),
                 int(merged.get("bars_held") or 0),
+                merged.get("regime_at_entry"),
+                merged.get("base_pattern"),
+                merged.get("rs_at_entry"),
+                merged.get("stage_at_entry"),
             ),
         )
         self.conn.commit()
@@ -791,6 +824,67 @@ class TradingDatabase:
             (mfe, mae, outcome_id),
         )
         self.conn.commit()
+
+    # ── Proposals (weekly-review feedback loop) ───────────────────────
+
+    def insert_proposal(
+        self,
+        *,
+        variant: str,
+        iso_week: str,
+        title: str,
+        what: Optional[str] = None,
+        why: Optional[str] = None,
+        how_to_validate: Optional[str] = None,
+        risk: Optional[str] = None,
+    ) -> int:
+        """Insert one proposal row from the weekly review. Returns row id."""
+        cur = self.conn.execute(
+            """INSERT INTO proposals
+               (variant, iso_week, title, what, why, how_to_validate, risk, status)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'open')""",
+            (variant, iso_week, title, what, why, how_to_validate, risk),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def update_proposal_status(
+        self,
+        proposal_id: int,
+        status: str,
+        outcome_summary: Optional[str] = None,
+    ) -> None:
+        """Update a proposal's status (open/accepted/rejected/tested) + optional outcome."""
+        self.conn.execute(
+            """UPDATE proposals
+               SET status = ?, status_updated_at = datetime('now'),
+                   outcome_summary = COALESCE(?, outcome_summary)
+               WHERE id = ?""",
+            (status, outcome_summary, proposal_id),
+        )
+        self.conn.commit()
+
+    def get_proposals(
+        self,
+        variant: Optional[str] = None,
+        status: Optional[str] = None,
+        iso_week: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> List[Dict]:
+        """Filtered read of proposals table. Most-recent-first."""
+        clauses, params = [], []
+        if variant:
+            clauses.append("variant = ?"); params.append(variant)
+        if status:
+            clauses.append("status = ?"); params.append(status)
+        if iso_week:
+            clauses.append("iso_week = ?"); params.append(iso_week)
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        sql = f"SELECT * FROM proposals {where} ORDER BY created_at DESC"
+        if limit:
+            sql += f" LIMIT {int(limit)}"
+        rows = self.conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
 
     def close(self):
         self.conn.close()

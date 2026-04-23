@@ -75,7 +75,14 @@ def _trades_for(variant: str, limit: int = 50) -> pd.DataFrame:
         return pd.DataFrame()
     frame = pd.DataFrame(rows)
     if "timestamp" in frame.columns:
-        frame["timestamp"] = pd.to_datetime(frame["timestamp"], errors="coerce")
+        # Trades table holds mixed timestamp formats — orchestrator live
+        # inserts use a space separator, reconciler bracket-leg inserts use
+        # "T" + timezone. `format="mixed"` handles both.
+        frame["timestamp"] = pd.to_datetime(
+            frame["timestamp"], format="mixed", errors="coerce", utc=True,
+        )
+        frame = frame.dropna(subset=["timestamp"])
+        frame["timestamp"] = frame["timestamp"].dt.tz_localize(None)
         frame = frame.sort_values("timestamp", ascending=False)
     return frame
 

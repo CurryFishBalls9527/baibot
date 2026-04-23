@@ -176,4 +176,28 @@ elif mode == "Weekly strategy":
             st.markdown(_read_md(str(idx)))
 
     st.subheader(f"{chosen_variant} — {iso}")
-    st.markdown(_read_md(str(target)))
+
+    # Red-team verdict badge — parsed from the final line of the markdown.
+    # Format: "**RED-TEAM VERDICT: <support | partial-support | reject-with-reason>**"
+    md_body = _read_md(str(target))
+    verdict_color = {"support": "#66bb6a",
+                     "partial-support": "#ffa726",
+                     "reject": "#ef5350"}
+    verdict = None
+    for line in md_body.splitlines():
+        if "RED-TEAM VERDICT" in line.upper():
+            verdict = line.split(":", 1)[-1].strip().strip("*").strip()
+            break
+    if verdict:
+        key = verdict.split("-with")[0].strip().lower()  # "reject-with-reason" → "reject"
+        key = key.split()[0] if " " in key else key
+        color = verdict_color.get(key, "#888")
+        st.markdown(
+            f"<div style='display:inline-block;background:{color};color:#000;"
+            f"padding:4px 12px;border-radius:6px;font-weight:600;font-size:13px;"
+            f"margin-bottom:12px;'>"
+            f"RED-TEAM VERDICT: {verdict}</div>",
+            unsafe_allow_html=True,
+        )
+
+    st.markdown(md_body)

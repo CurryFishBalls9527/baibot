@@ -171,7 +171,16 @@ trades = query_all_variants(lambda db: db.get_recent_trades(limit=500))
 if trades.empty or "timestamp" not in trades.columns:
     st.info("No trades yet.")
 else:
-    trades["timestamp"] = pd.to_datetime(trades["timestamp"])
+    # Trades table has two timestamp flavours:
+    #   - "YYYY-MM-DD HH:MM:SS[.ffffff]" from orchestrator live inserts
+    #   - "YYYY-MM-DDTHH:MM:SS[+00:00]" from reconciler bracket-leg backfill
+    # format="mixed" handles both; errors="coerce" drops anything broken.
+    trades["timestamp"] = pd.to_datetime(
+        trades["timestamp"], format="mixed", errors="coerce", utc=True,
+    )
+    trades = trades.dropna(subset=["timestamp"])
+    # Strip tz for resample grouping (all are UTC after utc=True).
+    trades["timestamp"] = trades["timestamp"].dt.tz_localize(None)
     trades = trades[trades["variant"].isin(selected)]
     if not trades.empty:
         fig_act = go.Figure()

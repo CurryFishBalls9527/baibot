@@ -311,6 +311,13 @@ class ChanOrchestrator:
                         stop_loss_pct=buy_signal.get("stop_loss_pct", self.default_stop_loss_pct),
                         take_profit_pct=buy_signal.get("take_profit_pct", self.default_take_profit_pct),
                         account=account, positions=positions,
+                        entry_context={
+                            "base_pattern": buy_signal.get("types"),
+                            "regime_at_entry": (
+                                self._cached_regime.get("market_regime")
+                                if self._cached_regime else None
+                            ),
+                        },
                     )
                     entry_results.append(result)
             except Exception as e:
@@ -728,6 +735,9 @@ class ChanOrchestrator:
             "stop_loss_pct": stop_loss_pct,
             "take_profit_pct": self.default_take_profit_pct,
             "bi_low": bi_low,
+            # Structured T-type (T1 / T2 / T2S, or combos) so the outcome
+            # hook can persist it as base_pattern for per-setup review cuts.
+            "types": "+".join(sorted(types_set)) if types_set else None,
         }
 
     def _analyze_chan_exit(self, symbol: str, chan_cfg: CChanConfig) -> Optional[Dict]:
@@ -809,6 +819,7 @@ class ChanOrchestrator:
         positions: List[Position],
         stop_loss_pct: float = 0.05,
         take_profit_pct: float = 0.15,
+        entry_context: Optional[Dict] = None,
     ) -> Dict:
         """Size, risk-check, and execute a signal via Alpaca."""
         signal = {
@@ -929,13 +940,51 @@ class ChanOrchestrator:
         self.db.mark_signal_executed(signal_id)
 
         if order_request.side == "buy" and "fill" in str(order_result.status).lower():
-            self.db.upsert_position_state(symbol, {
+            state_payload = {
                 "entry_price": order_result.filled_avg_price or current_price,
                 "entry_date": date.today().isoformat(),
                 "highest_close": order_result.filled_avg_price or current_price,
                 "current_stop": sl_price,
                 "partial_taken": False,
-            })
+                "variant": self.config.get("variant_name", "chan"),
+            }
+            # Entry-time context (T-type + regime) for the daily/weekly reviews.
+            # Always persisted even when None — keeps the read path uniform.
+            if entry_context:
+                if entry_context.get("base_pattern") is not None:
+                    state_payload["base_pattern"] = entry_context["base_pattern"]
+                if entry_context.get("regime_at_entry") is not None:
+                    state_payload["regime_at_entry"] = entry_context["regime_at_entry"]
+            self.db.upsert_position_state(symbol, state_payload)
+
+        # On SELL fill, log the closed-trade outcome (daily/weekly review
+        # inputs) and clean up position_states. Uses the state captured at
+        # entry time — T-type, regime, entry price — which was read BEFORE
+        # this function body started (see `pos_state_before` snapshot).
+        if order_request.side == "sell" and "fill" in str(order_result.status).lower():
+            try:
+                if self.config.get("trade_outcome_live_hook_chan_enabled", True):
+                    from tradingagents.automation.trade_outcome import log_closed_trade
+                    pos_state = self.db.get_position_state(symbol)
+                    if pos_state:
+                        log_closed_trade(
+                            db=self.db,
+                            symbol=symbol,
+                            pos_state=pos_state,
+                            exit_price=float(
+                                order_result.filled_avg_price or current_price
+                            ),
+                            exit_reason=reasoning or action,
+                            broker=self.broker,
+                            excursion_enabled=self.config.get(
+                                "trade_outcome_excursion_enabled", False
+                            ),
+                        )
+                        self.db.delete_position_state(symbol)
+            except Exception as e:
+                logger.warning(
+                    "chan trade_outcome hook failed for %s: %s", symbol, e
+                )
 
         return {
             "symbol": symbol, "action": action, "traded": True,
