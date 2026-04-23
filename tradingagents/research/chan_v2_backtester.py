@@ -142,6 +142,10 @@ class PortfolioChanV2Backtester(PortfolioChanBacktester):
 
         pending_entries: dict[str, _PendingEntryV2] = {}
         pending_exits: dict[str, _PendingExit] = {}
+        # Whipsaw guard: symbol -> ISO date of the most recent stop-exit.
+        # When post_stop_reentry_block is on, buy signals are suppressed on
+        # the same calendar day as a stop-exit.
+        stopped_today: dict[str, str] = {}
 
         events = self._shuffle_ties(events, rng)
 
@@ -214,6 +218,7 @@ class PortfolioChanV2Backtester(PortfolioChanBacktester):
                         all_trades, positions,
                     )
                     cash += pos.shares * actual_exit - abs(pos.shares * actual_exit * cfg.commission_bps / 10000)
+                    stopped_today[symbol] = cur_day
                 else:
                     # --- V2: Sell signal cooldown ---
                     # Only check sell BSP if past the cooldown period
@@ -251,6 +256,8 @@ class PortfolioChanV2Backtester(PortfolioChanBacktester):
 
             # --- Check buy signals → queue for NEXT bar execution ---
             if symbol not in positions and symbol not in pending_entries:
+                if cfg.post_stop_reentry_block and stopped_today.get(symbol) == cur_day:
+                    continue
                 daily_ok = True
 
                 if cfg.regime_gate and regime_scores is not None:

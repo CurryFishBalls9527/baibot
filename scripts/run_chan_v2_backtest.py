@@ -113,6 +113,9 @@ def parse_args():
     p.add_argument("--divergence-sizing-max-boost", type=float, default=1.5,
                     help="Max sizing multiplier for strong divergence")
 
+    p.add_argument("--post-stop-reentry-block", action="store_true",
+                    help="Block same-day re-entry after a stop-exit (whipsaw guard)")
+
     p.add_argument("--out", default="results/chan_v2/backtest.json")
     return p.parse_args()
 
@@ -162,6 +165,7 @@ def main():
         divergence_sizing=args.divergence_sizing,
         divergence_sizing_base=args.divergence_sizing_base,
         divergence_sizing_max_boost=args.divergence_sizing_max_boost,
+        post_stop_reentry_block=args.post_stop_reentry_block,
     )
 
     regime_df = None

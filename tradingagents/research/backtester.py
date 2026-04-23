@@ -33,6 +33,11 @@ class BacktestConfig:
     breakeven_trigger_pct: float = 0.05
     partial_profit_trigger_pct: float = 0.12
     partial_profit_fraction: float = 0.33
+    # Future-blanked probe: when > 0, the partial-exit trigger is evaluated
+    # against the close N bars ago instead of the current bar's close. Set to
+    # 1 to simulate "signal known at yesterday's close, execute at today's
+    # close" — if the edge disappears, the same-bar check was lookahead.
+    partial_trigger_lag_bars: int = 0
     use_ema21_exit: bool = False
     use_50dma_exit: bool = True
     use_close_range_filter: bool = False
@@ -468,6 +473,12 @@ class MinerviniBacktester:
         add_on_2_done = False
         running_peak = self.config.initial_cash
         max_drawdown = 0.0
+        # Future-blanked probe: precompute close shifted by lag_bars so the
+        # partial-exit trigger can be evaluated against strictly-past price.
+        partial_lag = max(0, int(self.config.partial_trigger_lag_bars))
+        lagged_close = (
+            features["close"].shift(partial_lag) if partial_lag > 0 else None
+        )
 
         for trade_date, row in features.iterrows():
             price = float(row["close"])
@@ -601,10 +612,16 @@ class MinerviniBacktester:
 
             shares = self._total_shares(lots)
             average_cost = self._average_cost(lots)
+            if lagged_close is not None:
+                lagged = lagged_close.loc[trade_date]
+                trigger_price = float(lagged) if pd.notna(lagged) else None
+            else:
+                trigger_price = price
             if (
                 not partial_taken
                 and shares > 0
-                and price >= average_cost * (1.0 + self.config.partial_profit_trigger_pct)
+                and trigger_price is not None
+                and trigger_price >= average_cost * (1.0 + self.config.partial_profit_trigger_pct)
             ):
                 partial_qty = max(1, int(shares * self.config.partial_profit_fraction))
                 partial_qty = min(partial_qty, shares)

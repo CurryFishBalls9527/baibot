@@ -113,6 +113,9 @@ class ChanBacktestConfig:
     daily_zs_filter: bool = False     # require price above nearest daily ZS low
     daily_bsp_confirm: bool = False   # boost when intraday buy aligns with daily buy BSP
 
+    # Whipsaw guard — block same-day re-entry after a stop-exit
+    post_stop_reentry_block: bool = False
+
 
 @dataclass
 class ChanPortfolioResult:
@@ -254,6 +257,10 @@ class PortfolioChanBacktester:
 
         pending_entries: dict[str, _PendingEntry] = {}
         pending_exits: dict[str, _PendingExit] = {}
+        # Whipsaw guard: symbol -> ISO date of the most recent stop-exit.
+        # When post_stop_reentry_block is on, buy signals are suppressed on
+        # the same calendar day as a stop-exit.
+        stopped_today: dict[str, str] = {}
 
         # Shuffle events at same-timestamp boundaries to remove ordering bias
         events = self._shuffle_ties(events, rng)
@@ -327,6 +334,7 @@ class PortfolioChanBacktester:
                         all_trades, positions,
                     )
                     cash += pos.shares * actual_exit - abs(pos.shares * actual_exit * cfg.commission_bps / 10000)
+                    stopped_today[symbol] = cur_day
                 else:
                     # Check sell signal → queue for NEXT bar execution
                     sell_sig = self._check_sell_signal(
@@ -351,6 +359,8 @@ class PortfolioChanBacktester:
 
             # --- Check buy signals → queue for NEXT bar execution ---
             if symbol not in positions and symbol not in pending_entries:
+                if cfg.post_stop_reentry_block and stopped_today.get(symbol) == cur_day:
+                    continue
                 daily_ok = True
 
                 if cfg.regime_gate and regime_scores is not None:

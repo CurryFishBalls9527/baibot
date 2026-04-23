@@ -60,6 +60,17 @@ class IntradayBacktestConfig:
     allow_overextended_setup: bool = True
     allow_expansion_setup: bool = True
     allow_pullback_vwap: bool = False
+    # True VWAP-mean-reversion (distinct from pullback_vwap which is a
+    # continuation entry in an uptrending session). Fires long when close
+    # is min..max % BELOW session VWAP after bar `earliest`. Bets that
+    # the discount mean-reverts to VWAP. Max discount is a falling-knife
+    # guard: too far below = something structurally wrong, skip.
+    allow_vwap_reversion_long: bool = False
+    vwap_reversion_min_discount_pct: float = 0.005
+    vwap_reversion_max_discount_pct: float = 0.03
+    vwap_reversion_earliest_entry_bar: int = 4
+    vwap_reversion_latest_entry_bar: int = 18
+    vwap_reversion_min_volume_ratio: float = 1.3
     pullback_vwap_touch_tolerance_pct: float = 0.002
     pullback_vwap_touch_lookback_bars: int = 4
     pullback_vwap_reclaim_min_pct: float = 0.001
@@ -77,6 +88,14 @@ class IntradayBacktestConfig:
     gap_reclaim_earliest_entry_bar: int = 1
     gap_reclaim_latest_entry_bar: int = 4
     gap_reclaim_require_above_session_open: bool = True
+    # Pure-fade variant: when disable_reclaim_check=True, drop both the
+    # `close >= reclaim_threshold` AND the prior-bar-below-threshold dedup,
+    # and fire on a single fixed bar (`fade_entry_bar`) per qualifying
+    # gap-down session. Hypothesis: mean-reversion on overnight gaps
+    # without a reclaim-confirmation requirement may be more universal
+    # across regimes (esp 2020 high-vol).
+    gap_reclaim_disable_reclaim_check: bool = False
+    gap_reclaim_fade_entry_bar: int = 4
     gap_reclaim_max_position_pct: Optional[float] = None
     gap_reclaim_trail_stop_pct: Optional[float] = None
     gap_reclaim_trail_activation_return_pct: Optional[float] = None
@@ -109,6 +128,11 @@ class IntradayBacktestConfig:
     interval_minutes: int = 30
     daily_trend_filter: bool = False
     daily_trend_sma: int = 20
+    # Composite market-context regime gate (SPY/QQQ/IWM/SMH/^VIX score 0-8 from
+    # tradingagents.research.market_context). Gate fires when prior session's
+    # market_score >= this threshold. None disables. Uses same `<` boundary as
+    # daily_trend_filter to avoid same-day lookahead.
+    market_context_min_score: Optional[int] = None
     daily_db_path: str = "research_data/market_data.duckdb"
 
 
@@ -168,6 +192,7 @@ class IntradayBreakoutBacktester:
             "opening_drive_expansion": 6,
             "pullback_vwap": 5,
             "gap_reclaim_long": 4,
+            "vwap_reversion_long": 4,
             "nr4_breakout": 3,
             "orb_breakout": 3,
             "opening_drive_overextended": 2,
@@ -422,6 +447,8 @@ class IntradayBreakoutBacktester:
             frame = self._apply_nr4_breakout(frame)
         if self.config.allow_orb_breakout:
             frame = self._apply_orb_breakout(frame)
+        if self.config.allow_vwap_reversion_long:
+            frame = self._apply_vwap_reversion_long(frame)
         if self.config.use_expansion_confirmation_entry:
             frame = self._apply_expansion_confirmation_entry(frame)
         if self.config.use_midday_entry_window:
@@ -550,18 +577,85 @@ class IntradayBreakoutBacktester:
             }
         )
 
-        gap_reclaim_mask = (
-            gap_ok
-            & reclaim_ok
-            & prior_below_reclaim
-            & volume_ok
-            & bar_ok
-            & above_open_ok
-            & (~already_assigned)
-        ).fillna(False)
+        if bool(self.config.gap_reclaim_disable_reclaim_check):
+            # Pure-fade: skip reclaim_ok and prior_below_reclaim. Single-bar
+            # trigger per session deduplicates without needing a cross event.
+            fixed_bar = int(self.config.gap_reclaim_fade_entry_bar)
+            fixed_bar_ok = (frame["bar_in_session"] == fixed_bar)
+            gap_reclaim_mask = (
+                gap_ok
+                & volume_ok
+                & fixed_bar_ok
+                & above_open_ok
+                & (~already_assigned)
+            ).fillna(False)
+        else:
+            gap_reclaim_mask = (
+                gap_ok
+                & reclaim_ok
+                & prior_below_reclaim
+                & volume_ok
+                & bar_ok
+                & above_open_ok
+                & (~already_assigned)
+            ).fillna(False)
 
         frame.loc[gap_reclaim_mask, "entry_signal"] = True
         frame.loc[gap_reclaim_mask, "setup_family"] = "gap_reclaim_long"
+        return frame
+
+    def _apply_vwap_reversion_long(self, frame: pd.DataFrame) -> pd.DataFrame:
+        min_disc = float(self.config.vwap_reversion_min_discount_pct)
+        max_disc = float(self.config.vwap_reversion_max_discount_pct)
+        earliest = int(self.config.vwap_reversion_earliest_entry_bar)
+        latest = int(self.config.vwap_reversion_latest_entry_bar)
+        min_vol = float(self.config.vwap_reversion_min_volume_ratio)
+
+        vwap = frame["vwap"]
+        vwap_valid = vwap.notna() & (vwap > 0)
+        # Positive when close < vwap (price discounted vs VWAP).
+        discount_pct = (vwap - frame["close"]) / vwap.where(vwap_valid)
+        discount_ok = vwap_valid & (discount_pct >= min_disc) & (discount_pct <= max_disc)
+
+        # Single-cross dedup: fire on the first bar in session where
+        # the discount crosses past `min_disc` from below. Mirrors the
+        # gap_reclaim `prior_below_reclaim` pattern.
+        prior_close = frame["close"].shift(1)
+        prior_vwap = vwap.shift(1)
+        same_session_as_prior = frame["session_date"] == frame["session_date"].shift(1)
+        prior_discount_pct = (prior_vwap - prior_close) / prior_vwap
+        prior_below_threshold = (
+            prior_close.notna()
+            & prior_vwap.notna()
+            & same_session_as_prior
+            & (prior_discount_pct < min_disc)
+        )
+
+        volume_ok = frame["volume_ratio"].fillna(0) >= min_vol
+        bar_ok = (frame["bar_in_session"] >= earliest) & (frame["bar_in_session"] <= latest)
+
+        already_assigned = frame["setup_family"].isin(
+            {
+                "opening_drive_continuation",
+                "opening_drive_expansion",
+                "opening_drive_overextended",
+                "pullback_vwap",
+                "gap_reclaim_long",
+                "nr4_breakout",
+                "orb_breakout",
+            }
+        )
+
+        mask = (
+            discount_ok
+            & prior_below_threshold
+            & volume_ok
+            & bar_ok
+            & (~already_assigned)
+        ).fillna(False)
+
+        frame.loc[mask, "entry_signal"] = True
+        frame.loc[mask, "setup_family"] = "vwap_reversion_long"
         return frame
 
     def _apply_nr4_breakout(self, frame: pd.DataFrame) -> pd.DataFrame:
@@ -835,6 +929,37 @@ class IntradayBreakoutBacktester:
             warehouse.close()
         return trend_map
 
+    def _load_market_context_score(self, begin: str, end: str) -> pd.Series:
+        """Composite SPY/QQQ/IWM/SMH/^VIX score (0-8) per session date.
+
+        Pulls daily bars with a 250-day pre-buffer so SMA-200 is defined at
+        the start of the requested range. Returned Series is indexed by date
+        (timestamps normalized to midnight) and is intended to be queried
+        with a strict `<` boundary against the intraday session date to
+        avoid same-day lookahead — same convention as daily_trend_filter.
+        """
+        if self.config.market_context_min_score is None:
+            return pd.Series(dtype="int64")
+        from .market_context import build_market_context  # local import to keep top-level light
+        # Pre-buffer ~250 trading days (~1 calendar year) for SMA-200 warmup.
+        buffer_begin = (pd.Timestamp(begin) - pd.Timedelta(days=400)).strftime("%Y-%m-%d")
+        warehouse = MarketDataWarehouse(self.config.daily_db_path, read_only=True)
+        data: dict[str, pd.DataFrame] = {}
+        try:
+            for symbol in ("SPY", "QQQ", "IWM", "SMH", "^VIX"):
+                df = warehouse.get_daily_bars(symbol, buffer_begin, end)
+                if df is not None and not df.empty:
+                    data[symbol] = df.copy().sort_index()
+        finally:
+            warehouse.close()
+        ctx = build_market_context(data)
+        if ctx.empty or "market_score" not in ctx.columns:
+            return pd.Series(dtype="int64")
+        score = ctx["market_score"].astype("int64")
+        # Normalize index to date-only for consistent `<` comparison vs trend_day.
+        score.index = pd.to_datetime(score.index).normalize()
+        return score
+
     @staticmethod
     def _symbol_summary(trades_df: pd.DataFrame) -> pd.DataFrame:
         if trades_df.empty:
@@ -870,6 +995,7 @@ class IntradayBreakoutBacktester:
     ) -> IntradayPortfolioResult:
         data_by_symbol = self._load_intraday_bars(db_path, symbols, begin, end)
         daily_trend = self._load_daily_trend_filter(symbols, begin, end)
+        market_context_score = self._load_market_context_score(begin, end)
         prepared = {
             symbol: self._prepare_symbol_features(df)
             for symbol, df in data_by_symbol.items()
@@ -1237,6 +1363,19 @@ class IntradayBreakoutBacktester:
                         valid = trend_series.loc[trend_series.index < trend_day]
                         if valid.empty or not bool(valid.iloc[-1]):
                             candidate["filter_reason"] = "daily_trend_filter"
+                            candidate_log.append(candidate)
+                            continue
+                    if self.config.market_context_min_score is not None:
+                        if market_context_score.empty:
+                            candidate["filter_reason"] = "missing_market_context"
+                            candidate_log.append(candidate)
+                            continue
+                        ctx_day = pd.Timestamp(ts.date())
+                        # Same `<` boundary as daily_trend_filter — prior
+                        # session's composite score, never today's close.
+                        ctx_valid = market_context_score.loc[market_context_score.index < ctx_day]
+                        if ctx_valid.empty or int(ctx_valid.iloc[-1]) < int(self.config.market_context_min_score):
+                            candidate["filter_reason"] = "market_context_filter"
                             candidate_log.append(candidate)
                             continue
                     if self.config.allow_relative_volume_filter:

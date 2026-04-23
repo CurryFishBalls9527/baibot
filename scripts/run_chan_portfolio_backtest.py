@@ -100,6 +100,8 @@ def parse_args():
                     help="Chan BSP types to compute (e.g. '1,2,2s,3a')")
     p.add_argument("--buy-types", default="T1,T2,T2S",
                     help="BSP types to accept as buy signals (e.g. 'T1,T2,T2S,T3A')")
+    p.add_argument("--post-stop-reentry-block", action="store_true",
+                    help="Block same-day re-entry after a stop-exit (whipsaw guard)")
     p.add_argument("--out", default="results/chan_portfolio/backtest.json")
     return p.parse_args()
 
@@ -138,6 +140,7 @@ def main():
         daily_bsp_confirm=args.daily_bsp_confirm,
         chan_bs_type=args.bs_type,
         buy_types=tuple(args.buy_types.split(",")),
+        post_stop_reentry_block=args.post_stop_reentry_block,
     )
 
     regime_df = None
