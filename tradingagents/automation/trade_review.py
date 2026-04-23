@@ -64,7 +64,10 @@ def _fetch_bars(broker, symbol: str, variant: str, entry_dt: datetime, exit_dt: 
         padding_end = timedelta(days=2)
     elif tf_str == "30m":
         tf = TimeFrame(30, TimeFrameUnit.Minute)
-        padding_start = timedelta(days=2)
+        # Chan structures are computed over ~90 days so the chart window
+        # must match or the BI/ZS/BSP timestamps fall outside the
+        # visible range and silently don't render.
+        padding_start = timedelta(days=90)
         padding_end = timedelta(days=1)
     else:  # 15m intraday
         tf = TimeFrame(15, TimeFrameUnit.Minute)
@@ -237,13 +240,15 @@ def _minervini_criteria_checklist(setup_row: dict, payload: dict) -> list[tuple[
 
 def _build_setup_context(variant: str, setup_row: Optional[dict],
                         signal_metadata_str: Optional[str],
-                        entry_signal: Optional[dict] = None) -> str:
+                        entry_signal: Optional[dict] = None,
+                        chan_structures: Optional[dict] = None) -> str:
     """Human-readable setup summary for the LLM prompt.
 
     Much richer than the v1: pulls the full payload_json from
     setup_candidates (SMAs, ROC, ADX, RSI, fundamentals, sector), surfaces
-    the untruncated entry-signal reasoning, and computes the Minervini
-    criteria checklist so the LLM can explain which rules actually fired.
+    the untruncated entry-signal reasoning, the Minervini criteria
+    checklist, and — for Chan variants — a summary of the Chan
+    structures (BI count, ZS/中枢 bounds, active BSP) visible at entry.
     """
     lines = []
     if _is_minervini(variant) and setup_row:
@@ -321,6 +326,28 @@ def _build_setup_context(variant: str, setup_row: Optional[dict],
                 v = meta.get(k)
                 if v is not None:
                     lines.append(f"  - {k}: {v}")
+        # Chan structures visible at entry — the 中枢 (ZS) + BI + BSP view
+        # the trader was actually looking at.
+        if chan_structures:
+            bi_list = chan_structures.get("bi_list") or []
+            zs_list = chan_structures.get("zs_list") or []
+            bsp_list = chan_structures.get("bsp_list") or []
+            lines.append("")
+            lines.append("Chan structures visible at entry (30m):")
+            lines.append(f"  - {len(bi_list)} bi, {len(zs_list)} zs (中枢), {len(bsp_list)} bsp")
+            if zs_list:
+                for i, zs in enumerate(zs_list[-3:], 1):
+                    lines.append(
+                        f"  - ZS{i}: [{zs.get('begin_time')} → {zs.get('end_time')}] "
+                        f"low=${zs.get('low'):.2f} high=${zs.get('high'):.2f}"
+                    )
+            if bsp_list:
+                for bsp in bsp_list[-2:]:
+                    side = "BUY" if bsp.get("is_buy") else "SELL"
+                    lines.append(
+                        f"  - {side} BSP ({bsp.get('types')}) at "
+                        f"{bsp.get('time')} · ${bsp.get('price'):.2f}"
+                    )
     # Full entry reasoning — untruncated. Critical for "why did we enter?"
     if entry_signal:
         reasoning = (
@@ -334,21 +361,38 @@ def _build_setup_context(variant: str, setup_row: Optional[dict],
 
 
 def _extract_chan_structures_safely(
-    symbol: str, entry_dt, exit_dt, db_path: str = None
+    symbol: str, entry_dt, exit_dt, db_path: str = None,
+    history_days: int = 90,
 ) -> Optional[dict]:
-    """Call extract_chan_structures with defensive fallback.
+    """Extract Chan structures for the trade review.
+
+    Window: [entry_date - history_days, entry_date]. Deliberately cuts at
+    entry so the rendered BI / ZS (中枢) / BSP match what the trader saw
+    when they bought — no post-exit hindsight. Chan needs ~60+ bars to
+    build meaningful pivots, which is why the lookback is weeks, not days.
 
     `db_path` is the DuckDB 30m bars file — same one the live chan
-    orchestrator uses. Default is the chan_v2 broad universe DB.
+    orchestrator uses. Default is the broad intraday DB.
     """
+    from datetime import timedelta
     try:
         from tradingagents.dashboard.chan_structures import extract_chan_structures
         path = db_path or "research_data/intraday_30m_broad.duckdb"
-        begin = entry_dt.strftime("%Y-%m-%d") if hasattr(entry_dt, "strftime") else str(entry_dt)
-        end = exit_dt.strftime("%Y-%m-%d") if hasattr(exit_dt, "strftime") else str(exit_dt)
+        if hasattr(entry_dt, "date"):
+            entry_date = entry_dt.date() if not isinstance(entry_dt, date) else entry_dt
+        else:
+            from dateutil.parser import parse as pd
+            entry_date = pd(str(entry_dt)).date()
+        begin = (entry_date - timedelta(days=history_days)).strftime("%Y-%m-%d")
+        # Cap at entry_date — the rendered structures reflect what was
+        # visible at BUY time, not what we know now with the outcome.
+        end = entry_date.strftime("%Y-%m-%d")
         return extract_chan_structures(symbol, begin, end, path)
     except Exception as e:
-        logger.warning("chan_structures(%s) failed: %s", symbol, e)
+        logger.warning(
+            "chan_structures(%s) failed [%s]: %s",
+            symbol, type(e).__name__, e,
+        )
         return None
 
 
@@ -463,7 +507,9 @@ def run_daily_review(
             # rather than the 80-char tooltip.
             oc_enriched = dict(oc)
             oc_enriched["_setup_context"] = _build_setup_context(
-                variant_name, setup_row, signal_metadata, entry_signal=entry_signal,
+                variant_name, setup_row, signal_metadata,
+                entry_signal=entry_signal,
+                chan_structures=chan_struct,
             )
             oc_enriched["_variant"] = variant_name
 
@@ -481,7 +527,7 @@ def run_daily_review(
             md_path = out_dir / f"{variant_name}_{sym}.md"
             md = _compose_markdown(
                 variant_name, oc, entry_signal, setup_row, signal_metadata,
-                body, chart_path,
+                body, chart_path, chan_structures=chan_struct,
             )
             md_path.write_text(md, encoding="utf-8")
 
@@ -543,6 +589,7 @@ def _compose_markdown(
     signal_metadata_str: Optional[str],
     llm_body: str,
     chart_path: Optional[Path],
+    chan_structures: Optional[dict] = None,
 ) -> str:
     sym = outcome.get("symbol", "?")
     ret = outcome.get("return_pct") or 0.0
@@ -655,6 +702,35 @@ def _compose_markdown(
             f"> {reasoning.strip()}\n\n"
         )
 
+    # Chan 中枢 / BI / BSP summary — the structure the trader saw at entry,
+    # computed over [entry_date - 90d, entry_date] so no post-exit hindsight.
+    chan_block = ""
+    if _is_chan(variant) and chan_structures:
+        bi_list = chan_structures.get("bi_list") or []
+        zs_list = chan_structures.get("zs_list") or []
+        bsp_list = chan_structures.get("bsp_list") or []
+        chan_block = "## Chan structures at entry (30m, last 90d)\n"
+        chan_block += (
+            f"- {len(bi_list)} bi · {len(zs_list)} **中枢 (ZS)** · "
+            f"{len(bsp_list)} BSP\n"
+        )
+        if zs_list:
+            chan_block += "\n**中枢 (last 3):**\n"
+            for i, zs in enumerate(zs_list[-3:], 1):
+                chan_block += (
+                    f"- ZS{i} [{zs.get('begin_time')} → {zs.get('end_time')}] "
+                    f"range **${zs.get('low'):.2f} – ${zs.get('high'):.2f}**\n"
+                )
+        if bsp_list:
+            chan_block += "\n**Buy/Sell structure points (last 3):**\n"
+            for bsp in bsp_list[-3:]:
+                side = "BUY" if bsp.get("is_buy") else "SELL"
+                chan_block += (
+                    f"- {side} BSP `{bsp.get('types')}` at "
+                    f"{bsp.get('time')} · ${bsp.get('price'):.2f}\n"
+                )
+        chan_block += "\n"
+
     happened_block = (
         "## What Happened\n"
         f"- Entry **${outcome.get('entry_price', 0):.2f}** on "
@@ -677,6 +753,7 @@ def _compose_markdown(
         header + link
         + setup_block
         + criteria_block
+        + chan_block
         + reasoning_block
         + happened_block
         + (llm_body or "")
