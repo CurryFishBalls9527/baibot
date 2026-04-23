@@ -276,15 +276,31 @@ class AlpacaBroker(BaseBroker):
     def _refetch_bracket_legs(
         self,
         parent_order_id: str,
-        max_attempts: int = 5,
-        delay_seconds: float = 0.3,
+        max_attempts: int = 30,
+        delay_seconds: float = 0.5,
     ) -> Optional[OrderResult]:
-        """Re-query a bracket parent by ID to populate its SL/TP child leg IDs.
+        """Re-query a bracket parent by ID to populate leg IDs AND capture fill.
 
-        Alpaca's initial submit response for a bracket returns `legs=[]`; the
-        children are created asynchronously after the parent is accepted. This
-        polls briefly so callers can capture both child order IDs.
+        Alpaca's initial submit response for a bracket has `legs=[]` and
+        usually status=`pending_new`. Sequence of state changes:
+
+          1. Parent accepted → legs materialize (leg IDs become available)
+          2. Parent fills → filled_avg_price populates
+
+        Previously this returned as soon as the leg IDs were populated, which
+        meant callers racing a fast fill often saw `filled_avg_price=None` and
+        the caller's post-submit re-anchor (SL/TP shift to actual fill price)
+        silently skipped. On fast movers where fill drifted 2%+ from the
+        pre-order quote, the broker's SL ended up anchored to the stale quote
+        — a compressed effective buffer.
+
+        Now the loop keeps polling until BOTH legs exist AND the parent has
+        either filled (filled_avg_price populated) or reached a terminal
+        status, or the budget is exhausted. Budget defaults bumped from
+        5×0.3s=1.5s to 30×0.5s=15s to cover p99 fills while capping worst-case
+        submit latency.
         """
+        terminal = {"filled", "canceled", "cancelled", "expired", "rejected"}
         last: Optional[OrderResult] = None
         for attempt in range(max_attempts):
             try:
@@ -297,9 +313,19 @@ class AlpacaBroker(BaseBroker):
                 time.sleep(delay_seconds)
                 continue
             last = self._to_order_result(raw)
-            if last.stop_order_id and last.tp_order_id:
+            ids_ready = bool(last.stop_order_id and last.tp_order_id)
+            status_l = str(last.status or "").lower().split(".")[-1]
+            settled = bool(last.filled_avg_price) or status_l in terminal
+            if ids_ready and settled:
                 return last
             time.sleep(delay_seconds)
+        if last is not None and (not last.stop_order_id or not last.filled_avg_price):
+            logger.warning(
+                f"_refetch_bracket_legs({parent_order_id}) timed out: "
+                f"legs_ready={bool(last.stop_order_id and last.tp_order_id)} "
+                f"filled={bool(last.filled_avg_price)} status={last.status}. "
+                f"SL re-anchor will be skipped."
+            )
         return last
 
     def get_open_orders(self, symbol: Optional[str] = None) -> List[OrderResult]:

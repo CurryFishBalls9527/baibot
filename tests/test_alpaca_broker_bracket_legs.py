@@ -121,8 +121,9 @@ class BracketLegIDCaptureTests(unittest.TestCase):
     def test_refetch_gives_up_gracefully_if_legs_never_appear(self):
         """Legs never materialise → warning logged, IDs remain None, no crash."""
         never_populated = _StubParent(legs=[])
-        # submit_bracket_order has max_attempts=5 by default — simulate all empty
-        responses = [never_populated] * 5
+        # _refetch_bracket_legs default max_attempts=30 — supply enough to
+        # exhaust the budget; patched sleep keeps the test instant.
+        responses = [never_populated] * 30
         with patch("tradingagents.broker.alpaca_broker.time.sleep"):
             broker, OrderRequest, client = _build_broker(
                 submit_response=_StubParent(legs=[]),
@@ -137,7 +138,90 @@ class BracketLegIDCaptureTests(unittest.TestCase):
             )
         self.assertIsNone(result.stop_order_id)
         self.assertIsNone(result.tp_order_id)
-        self.assertEqual(client.get_order_by_id.call_count, 5)
+        self.assertEqual(client.get_order_by_id.call_count, 30)
+
+    def test_refetch_waits_for_fill_before_returning(self):
+        """Regression: leg IDs appear before fill → keep polling until fill.
+
+        Pre-fix, refetch returned as soon as leg IDs were populated, even if
+        filled_avg_price was still None. Callers that relied on fill price
+        (re-anchor) silently skipped, so on fast-movers the broker SL stayed
+        anchored to the stale pre-order quote. Now we keep polling until
+        legs AND fill (or terminal status) are both available. This test also
+        exercises the end-to-end chain: wait for fill → detect drift from
+        anchor → replace SL/TP legs.
+        """
+        legs = [
+            _StubLeg("tp-oid", "limit", limit_price=115.0),
+            _StubLeg("sl-oid", "stop", stop_price=95.0),
+        ]
+        # 1st refetch: legs but not filled. 2nd: legs + fill. Should return on 2nd.
+        pending = _StubParent(legs=legs, status="pending_new",
+                              filled_avg_price=None)
+        pending.filled_qty = 0
+        filled = _StubParent(legs=legs, status="filled", filled_avg_price=97.5)
+        # submit_response has filled_avg_price=None too — the fill should come
+        # via refetch, exercising the "copy fill price from refetch" branch.
+        submit_resp = _StubParent(legs=[], status="pending_new",
+                                  filled_avg_price=None)
+        submit_resp.filled_qty = 0
+        with patch("tradingagents.broker.alpaca_broker.time.sleep"):
+            broker, OrderRequest, client = _build_broker(
+                submit_response=submit_resp,
+                get_order_responses=[pending, filled],
+            )
+            # replace_order_by_id mock: return an object whose .id is a plain str.
+            replaced_sl = MagicMock()
+            replaced_sl.id = "sl-oid-reanchored"
+            replaced_tp = MagicMock()
+            replaced_tp.id = "tp-oid-reanchored"
+            client.replace_order_by_id.side_effect = [replaced_sl, replaced_tp]
+            order = OrderRequest(
+                symbol="AAPL", side="buy", qty=10,
+                order_type="market", time_in_force="gtc",
+            )
+            # anchor=100, fill=97.5 → drift=250bps, triggers re-anchor.
+            # Intended SL buffer = (100-95)/100 = 5% → new SL = 97.5*0.95 = 92.63
+            result = broker.submit_bracket_order(
+                order, stop_loss_price=95.0, take_profit_price=115.0,
+                anchor_price=100.0,
+            )
+        # filled_avg_price must propagate from refetch.
+        self.assertEqual(result.filled_avg_price, 97.5)
+        # Refetch polled twice — first pending, second filled.
+        self.assertEqual(client.get_order_by_id.call_count, 2)
+        # Re-anchor fired because drift > 10bps: SL/TP legs replaced.
+        self.assertEqual(result.stop_order_id, "sl-oid-reanchored")
+        self.assertEqual(result.tp_order_id, "tp-oid-reanchored")
+        self.assertAlmostEqual(result.effective_stop_price, 92.62, places=2)
+        # Verify the actual replace request — SL rebased to 5% below fill,
+        # TP to 15% above fill.
+        sl_call = client.replace_order_by_id.call_args_list[0]
+        self.assertEqual(sl_call.args[0], "sl-oid")
+        self.assertAlmostEqual(sl_call.args[1].stop_price, 92.62, places=2)
+
+    def test_refetch_returns_on_terminal_status_even_without_fill(self):
+        """Canceled/rejected parent → don't keep polling, return promptly."""
+        legs = [
+            _StubLeg("tp-oid", "limit", limit_price=115.0),
+            _StubLeg("sl-oid", "stop", stop_price=95.0),
+        ]
+        canceled = _StubParent(legs=legs, status="canceled", filled_avg_price=None)
+        canceled.filled_qty = 0
+        with patch("tradingagents.broker.alpaca_broker.time.sleep"):
+            broker, OrderRequest, client = _build_broker(
+                submit_response=_StubParent(legs=[]),
+                get_order_responses=[canceled],
+            )
+            order = OrderRequest(
+                symbol="AAPL", side="buy", qty=10,
+                order_type="market", time_in_force="gtc",
+            )
+            result = broker.submit_bracket_order(
+                order, stop_loss_price=95.0, take_profit_price=115.0,
+            )
+        self.assertEqual(result.stop_order_id, "sl-oid")
+        self.assertEqual(client.get_order_by_id.call_count, 1)
 
     def test_refetch_skipped_if_initial_response_has_legs(self):
         """If Alpaca populates legs on submit (rare), don't refetch."""
