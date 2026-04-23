@@ -21,7 +21,7 @@ class FakeBroker:
         self._raise_exc = raise_exc
         self.calls = []
 
-    def get_open_orders(self, symbol=None):
+    def get_live_orders(self, symbol=None):
         if self._raise_exc is not None:
             raise self._raise_exc
         self.calls.append(symbol)
@@ -35,13 +35,13 @@ class BrokerWithoutMethod:
 
 
 class BrokerNoSymbolKwarg:
-    """Broker whose get_open_orders signature rejects the symbol kwarg."""
+    """Broker whose get_live_orders signature rejects the symbol kwarg."""
 
     def __init__(self, orders):
         self._orders = orders
         self.call_count = 0
 
-    def get_open_orders(self):
+    def get_live_orders(self):
         self.call_count += 1
         return self._orders
 
@@ -80,7 +80,7 @@ class TestFindExistingOpenOrder:
         # Bypass FakeBroker's pre-filter by querying with the wrong symbol
         # via direct list — recreate broker that returns regardless.
         class AllBroker:
-            def get_open_orders(self, symbol=None):
+            def get_live_orders(self, symbol=None):
                 return [other]
         orch = _make_orch(AllBroker())
         assert orch._find_existing_open_order("NVDA", "buy") is None
@@ -104,7 +104,7 @@ class TestFindExistingOpenOrder:
         match = make_order(symbol="nvda", side="BUY", status="NEW")
 
         class AllBroker:
-            def get_open_orders(self, symbol=None):
+            def get_live_orders(self, symbol=None):
                 return [match]
 
         orch = _make_orch(AllBroker())
@@ -130,6 +130,24 @@ class TestFindExistingOpenOrder:
         match = make_order(symbol="AAPL", side="buy", status="accepted")
         orch = _make_chan(FakeBroker(orders=[match]))
         assert orch._find_existing_open_order("AAPL", "buy") is match
+
+    def test_enum_prefixed_side_and_status_match(self):
+        # AlpacaBroker._to_order_result stores str(enum), so the guard must
+        # handle "OrderSide.SELL" / "OrderStatus.HELD" exactly as it handles
+        # plain "sell" / "held". This test locks in the prefix-strip so the
+        # guard doesn't silently miss bracket legs again (40310000 loop).
+        held_bracket = make_order(
+            symbol="NVDA", side="OrderSide.SELL", status="OrderStatus.HELD"
+        )
+        orch = _make_orch(FakeBroker(orders=[held_bracket]))
+        assert orch._find_existing_open_order("NVDA", "sell") is held_bracket
+
+    def test_enum_prefixed_terminal_status_still_filtered(self):
+        filled = make_order(
+            symbol="NVDA", side="OrderSide.SELL", status="OrderStatus.FILLED"
+        )
+        orch = _make_orch(FakeBroker(orders=[filled]))
+        assert orch._find_existing_open_order("NVDA", "sell") is None
 
     def test_chan_orchestrator_skips_terminal(self):
         filled = make_order(symbol="AAPL", side="buy", status="filled")

@@ -2144,7 +2144,15 @@ class Orchestrator:
         return None
 
     def _find_existing_open_order(self, symbol: str, side: Optional[str] = None):
-        getter = getattr(self.broker, "get_open_orders", None)
+        # Use get_live_orders, not get_open_orders: Alpaca's OPEN status filter
+        # excludes HELD, and bracket SL/TP legs sit in HELD while they wait for
+        # their trigger. Missing them here causes the guard to green-light a
+        # duplicate sell while the OCO leg already holds the full qty, which
+        # Alpaca rejects with 40310000 ("insufficient qty"). get_live_orders
+        # widens the filter to include HELD / replaced / pending_replace.
+        getter = getattr(self.broker, "get_live_orders", None)
+        if not callable(getter):
+            getter = getattr(self.broker, "get_open_orders", None)
         if not callable(getter):
             return None
         try:
@@ -2152,16 +2160,20 @@ class Orchestrator:
         except TypeError:
             orders = getter()
         except Exception as exc:
-            logger.warning("Could not fetch open orders for %s: %s", symbol, exc)
+            logger.warning("Could not fetch live orders for %s: %s", symbol, exc)
             return None
 
         target_symbol = symbol.upper()
         target_side = side.lower() if side else None
         terminal_statuses = {"filled", "canceled", "cancelled", "expired", "rejected"}
+        # AlpacaBroker._to_order_result stores str(enum), e.g. "OrderSide.SELL"
+        # and "OrderStatus.HELD". Strip the enum-class prefix so comparisons
+        # against plain "sell" / "held" work. Without this the guard never
+        # matches and duplicate submissions slip through.
         for order in orders or []:
             order_symbol = str(getattr(order, "symbol", "") or "").upper()
-            order_side = str(getattr(order, "side", "") or "").lower()
-            order_status = str(getattr(order, "status", "") or "").lower()
+            order_side = str(getattr(order, "side", "") or "").lower().split(".")[-1]
+            order_status = str(getattr(order, "status", "") or "").lower().split(".")[-1]
             if order_symbol != target_symbol:
                 continue
             if target_side and order_side != target_side:

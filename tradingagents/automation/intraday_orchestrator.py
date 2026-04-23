@@ -526,10 +526,14 @@ class IntradayOrchestrator:
                 closed.append({"symbol": symbol, "closed": False, "dry_run": True})
                 continue
             try:
+                # get_live_orders (not get_open_orders): OCO/bracket legs sit
+                # in HELD until their trigger fires; OPEN filter misses them,
+                # which leaves held_for_orders == qty and causes close_position
+                # to fail with Alpaca 40310000 on EOD flatten.
                 try:
-                    open_orders = self.broker.get_open_orders(symbol=symbol)
+                    open_orders = self.broker.get_live_orders(symbol=symbol)
                 except TypeError:
-                    open_orders = self.broker.get_open_orders()
+                    open_orders = self.broker.get_live_orders()
                 for o in open_orders or []:
                     if str(getattr(o, "symbol", "")).upper() == symbol.upper():
                         try:

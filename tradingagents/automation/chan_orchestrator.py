@@ -943,13 +943,15 @@ class ChanOrchestrator:
             tp_price = order_result.effective_take_profit_price or tp_price
             logger.info("%s: Bracket order SL=$%.2f TP=$%.2f", symbol, sl_price, tp_price)
         else:
-            # Cancel any open bracket legs pinning the shares, then liquidate.
+            # Cancel any live bracket legs pinning the shares, then liquidate.
             # Plain submit_order on a bracketed position fails with Alpaca 40310000
             # because the SL/TP OCO legs leave held_for_orders == position qty.
+            # get_live_orders is required: OCO legs sit in HELD (not OPEN) until
+            # their trigger fires, so get_open_orders misses them.
             try:
-                open_orders = self.broker.get_open_orders(symbol=symbol)
+                open_orders = self.broker.get_live_orders(symbol=symbol)
             except TypeError:
-                open_orders = self.broker.get_open_orders()
+                open_orders = self.broker.get_live_orders()
             for o in open_orders or []:
                 if str(getattr(o, "symbol", "")).upper() != symbol.upper():
                     continue
@@ -1059,7 +1061,13 @@ class ChanOrchestrator:
         return None
 
     def _find_existing_open_order(self, symbol: str, side: Optional[str] = None):
-        getter = getattr(self.broker, "get_open_orders", None)
+        # Use get_live_orders: Alpaca's OPEN filter excludes HELD, and bracket
+        # SL/TP legs sit in HELD waiting for their trigger. Missing them makes
+        # the guard green-light a duplicate sell while the OCO leg already
+        # holds the full qty — Alpaca then rejects with 40310000.
+        getter = getattr(self.broker, "get_live_orders", None)
+        if not callable(getter):
+            getter = getattr(self.broker, "get_open_orders", None)
         if not callable(getter):
             return None
         try:
@@ -1067,16 +1075,19 @@ class ChanOrchestrator:
         except TypeError:
             orders = getter()
         except Exception as exc:
-            logger.warning("Could not fetch open orders for %s: %s", symbol, exc)
+            logger.warning("Could not fetch live orders for %s: %s", symbol, exc)
             return None
 
         target_symbol = symbol.upper()
         target_side = side.lower() if side else None
         terminal_statuses = {"filled", "canceled", "cancelled", "expired", "rejected"}
+        # AlpacaBroker._to_order_result stores str(enum), e.g. "OrderSide.SELL"
+        # and "OrderStatus.HELD". Strip the enum-class prefix so comparisons
+        # against plain "sell" / "held" work.
         for order in orders or []:
             order_symbol = str(getattr(order, "symbol", "") or "").upper()
-            order_side = str(getattr(order, "side", "") or "").lower()
-            order_status = str(getattr(order, "status", "") or "").lower()
+            order_side = str(getattr(order, "side", "") or "").lower().split(".")[-1]
+            order_status = str(getattr(order, "status", "") or "").lower().split(".")[-1]
             if order_symbol != target_symbol:
                 continue
             if target_side and order_side != target_side:

@@ -33,7 +33,7 @@ def _build_orchestrator(dry_run=True, universe=None, extra_config=None):
             daily_pl_pct=0,
         )
         broker.get_positions.return_value = []
-        broker.get_open_orders.return_value = []
+        broker.get_live_orders.return_value = []
         broker.get_latest_price.return_value = 100.0
         broker.get_clock.return_value = MagicMock(is_open=True, next_open="", next_close="")
         broker.submit_bracket_order.return_value = MagicMock(
@@ -228,7 +228,7 @@ class IntradayOrchestratorTests(unittest.TestCase):
         broker.get_positions.return_value = [
             MagicMock(symbol="AAPL", qty=10),
         ]
-        broker.get_open_orders.return_value = [
+        broker.get_live_orders.return_value = [
             MagicMock(symbol="AAPL", order_id="stop-1"),
             MagicMock(symbol="OTHER", order_id="nope-1"),
         ]

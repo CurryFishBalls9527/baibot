@@ -67,11 +67,11 @@ def _make_orch(broker, db, config=None):
 
 
 class FakeBroker:
-    """Tracks submit_order, supports sequencing of get_open_orders returns."""
+    """Tracks submit_order, supports sequencing of get_live_orders returns."""
 
     def __init__(self, positions=None, open_order_sequence=None):
         self._positions = positions or []
-        # List of lists: each call to get_open_orders returns the next entry.
+        # List of lists: each call to get_live_orders returns the next entry.
         self._open_order_sequence = open_order_sequence or []
         self._get_open_orders_calls = 0
         self.submitted_orders = []
@@ -82,7 +82,7 @@ class FakeBroker:
     def get_positions(self):
         return list(self._positions)
 
-    def get_open_orders(self, symbol=None):
+    def get_live_orders(self, symbol=None):
         idx = min(self._get_open_orders_calls, len(self._open_order_sequence) - 1)
         self._get_open_orders_calls += 1
         orders = self._open_order_sequence[idx] if self._open_order_sequence else []
