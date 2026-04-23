@@ -199,10 +199,17 @@ class TradeChartBuilder:
         return self
 
     def add_chan_bi(self, bi_list: list[dict]) -> Self:
+        # Convert CTime "YYYY/MM/DD HH:MM" strings to Timestamps so they
+        # align with the datetime x-axis (same issue as ZS).
         for bi in bi_list:
             color = "#e91e63" if bi.get("dir") == "up" else "#4caf50"
+            try:
+                x0 = pd.to_datetime(bi["start_time"])
+                x1 = pd.to_datetime(bi["end_time"])
+            except Exception:
+                continue
             self._traces_main.append(go.Scatter(
-                x=[bi["start_time"], bi["end_time"]],
+                x=[x0, x1],
                 y=[bi["start_val"], bi["end_val"]],
                 mode="lines+markers",
                 line=dict(width=1.5, color=color),
@@ -214,8 +221,13 @@ class TradeChartBuilder:
     def add_chan_seg(self, seg_list: list[dict]) -> Self:
         for seg in seg_list:
             color = "#d32f2f" if seg.get("dir") == "up" else "#1b5e20"
+            try:
+                x0 = pd.to_datetime(seg["start_time"])
+                x1 = pd.to_datetime(seg["end_time"])
+            except Exception:
+                continue
             self._traces_main.append(go.Scatter(
-                x=[seg["start_time"], seg["end_time"]],
+                x=[x0, x1],
                 y=[seg["start_val"], seg["end_val"]],
                 mode="lines",
                 line=dict(width=3, color=color, dash="dash"),
@@ -224,13 +236,44 @@ class TradeChartBuilder:
         return self
 
     def add_chan_zs(self, zs_list: list[dict]) -> Self:
+        """Draw 中枢 zones as translucent yellow rectangles with label.
+
+        Chan's CTime.to_str returns "YYYY/MM/DD HH:MM" which Plotly won't
+        coerce onto a datetime x-axis; convert first. A super-narrow ZS
+        (< 0.5% of ZS low) would render as a hairline, so widen it to a
+        minimum visible thickness and still label the true range.
+        """
         for zs in zs_list:
+            try:
+                x0 = pd.to_datetime(zs["begin_time"])
+                x1 = pd.to_datetime(zs["end_time"])
+            except Exception:
+                continue
+            low = float(zs["low"])
+            high = float(zs["high"])
+            # Minimum visible thickness: 1% of ZS low, or $0.50, whichever bigger.
+            # Keeps the true range label but lets the eye find tight ZS.
+            min_thickness = max(0.01 * low, 0.50)
+            y0, y1 = low, high
+            if (high - low) < min_thickness:
+                pad = (min_thickness - (high - low)) / 2
+                y0 -= pad
+                y1 += pad
             self._shapes.append(dict(
                 type="rect",
-                x0=zs["begin_time"], x1=zs["end_time"],
-                y0=zs["low"], y1=zs["high"],
-                fillcolor="rgba(255, 193, 7, 0.15)",
-                line=dict(color="rgba(255, 193, 7, 0.6)", width=1),
+                x0=x0, x1=x1, y0=y0, y1=y1,
+                fillcolor="rgba(255, 193, 7, 0.18)",
+                line=dict(color="rgba(255, 193, 7, 0.7)", width=1.5),
+                layer="below",  # draw behind candles so candles stay readable
+            ))
+            self._annotations.append(dict(
+                x=x1, y=(low + high) / 2,
+                text=f"中枢 ${low:.2f}-${high:.2f}",
+                showarrow=False, xanchor="left", yanchor="middle",
+                font=dict(size=10, color="#ffb74d"),
+                bgcolor="rgba(26, 29, 37, 0.85)",
+                bordercolor="rgba(255, 193, 7, 0.5)", borderwidth=1,
+                borderpad=3,
             ))
         return self
 
@@ -294,11 +337,18 @@ class TradeChartBuilder:
             color = "#2196f3" if is_buy else "#ff5722"
             symbol = "triangle-up" if is_buy else "triangle-down"
             types_str = bsp.get("types", "")
+            try:
+                x = pd.to_datetime(bsp["time"])
+            except Exception:
+                continue
             self._traces_main.append(go.Scatter(
-                x=[bsp["time"]], y=[bsp["price"]],
-                mode="markers",
-                marker=dict(symbol=symbol, size=12, color=color,
+                x=[x], y=[bsp["price"]],
+                mode="markers+text",
+                marker=dict(symbol=symbol, size=14, color=color,
                             line=dict(width=1.5, color="white")),
+                text=[types_str],
+                textposition="top center" if is_buy else "bottom center",
+                textfont=dict(size=9, color=color),
                 hovertext=[f"{'Buy' if is_buy else 'Sell'} BSP: {types_str}"],
                 hoverinfo="text",
                 name=f"BSP {types_str}",
