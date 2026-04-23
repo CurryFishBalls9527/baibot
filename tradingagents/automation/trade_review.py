@@ -311,6 +311,16 @@ def _build_setup_context(variant: str, setup_row: Optional[dict],
             "T1/T2/T2S off a ZS (central symmetry zone). Exits on structural "
             "ZS-low break or opposite BSP."
         )
+        if signal_metadata_str:
+            try:
+                meta = json.loads(signal_metadata_str)
+            except Exception:
+                meta = {}
+            for k in ("t_types", "bsp_reason", "bi_low", "confidence",
+                      "regime_at_entry", "market_score"):
+                v = meta.get(k)
+                if v is not None:
+                    lines.append(f"  - {k}: {v}")
     # Full entry reasoning — untruncated. Critical for "why did we enter?"
     if entry_signal:
         reasoning = (
@@ -591,10 +601,28 @@ def _compose_markdown(
             setup_lines.append(f"- VWAP at entry: **${meta.get('vwap'):.2f}**")
         if meta.get("volume_ratio") is not None:
             setup_lines.append(f"- Volume ratio: {meta.get('volume_ratio'):.2f}")
-    if _is_chan(variant):
+    if _is_chan(variant) and signal_metadata_str:
+        try:
+            meta = json.loads(signal_metadata_str)
+        except Exception:
+            meta = {}
+        t_types = meta.get("t_types") or outcome.get("base_pattern") or "?"
+        setup_lines.append(f"- Chan buy-structure-point: **{t_types}**")
+        if meta.get("bi_low") is not None:
+            setup_lines.append(
+                f"- BI low (structural stop anchor): **${meta['bi_low']:.2f}**"
+            )
+        if meta.get("confidence") is not None:
+            setup_lines.append(
+                f"- Signal confidence: {meta['confidence']:.2f}"
+            )
+        if meta.get("market_score") is not None:
+            setup_lines.append(
+                f"- Market regime score at entry: {meta['market_score']}/10"
+            )
+    elif _is_chan(variant):
         setup_lines.append(
-            "- Chan buy-structure-point (T1/T2/T2S) off a ZS zone. "
-            "Exit on structural break."
+            f"- Chan buy-structure-point: **{outcome.get('base_pattern') or '?'}**"
         )
     setup_lines.append(
         f"- Market regime at entry: {outcome.get('regime_at_entry') or 'n/a'}"

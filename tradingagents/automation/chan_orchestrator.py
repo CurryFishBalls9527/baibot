@@ -304,6 +304,11 @@ class ChanOrchestrator:
             try:
                 buy_signal = self._analyze_chan_entry(symbol, chan_cfg)
                 if buy_signal:
+                    # Load regime for journaling even when the gate is
+                    # disabled — the daily review wants regime_at_entry
+                    # populated regardless of whether we're using it as a
+                    # filter. Cheap (cached per-day in _load_market_regime).
+                    regime_info = self._load_market_regime()
                     result = self._execute_signal(
                         symbol=symbol, action="BUY",
                         confidence=buy_signal["confidence"],
@@ -314,8 +319,24 @@ class ChanOrchestrator:
                         entry_context={
                             "base_pattern": buy_signal.get("types"),
                             "regime_at_entry": (
-                                self._cached_regime.get("market_regime")
-                                if self._cached_regime else None
+                                regime_info.get("market_regime")
+                                if regime_info else None
+                            ),
+                        },
+                        # Extra structured context stashed on the SIGNAL row
+                        # via signal_metadata — feeds the daily review.
+                        signal_metadata={
+                            "t_types": buy_signal.get("types"),
+                            "confidence": buy_signal.get("confidence"),
+                            "bi_low": buy_signal.get("bi_low"),
+                            "bsp_reason": buy_signal.get("reason"),
+                            "regime_at_entry": (
+                                regime_info.get("market_regime")
+                                if regime_info else None
+                            ),
+                            "market_score": (
+                                regime_info.get("market_score")
+                                if regime_info else None
                             ),
                         },
                     )
@@ -820,6 +841,7 @@ class ChanOrchestrator:
         stop_loss_pct: float = 0.05,
         take_profit_pct: float = 0.15,
         entry_context: Optional[Dict] = None,
+        signal_metadata: Optional[Dict] = None,
     ) -> Dict:
         """Size, risk-check, and execute a signal via Alpaca."""
         signal = {
@@ -833,6 +855,25 @@ class ChanOrchestrator:
             "source": "chan_structural",
         }
 
+        # Serialize signal_metadata (BSP time, T-types, BI low, MACD state,
+        # regime) for the daily review. Wrapped + defensive — never blocks
+        # entry on a JSON edge case (NaN, Timestamp, etc).
+        metadata_json = None
+        if signal_metadata:
+            try:
+                import json as _json, math
+                def _clean(v):
+                    if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+                        return None
+                    return v
+                metadata_json = _json.dumps(
+                    {k: _clean(v) for k, v in signal_metadata.items()},
+                    default=str,
+                )
+            except Exception as e:
+                logger.warning("chan signal_metadata serialize failed: %s", e)
+                metadata_json = None
+
         signal_id = self.db.log_signal(
             symbol=symbol,
             action=action,
@@ -841,6 +882,7 @@ class ChanOrchestrator:
             stop_loss=stop_loss_pct,
             take_profit=take_profit_pct,
             timeframe="swing",
+            signal_metadata=metadata_json,
         )
 
         current_price = self.broker.get_latest_price(symbol)

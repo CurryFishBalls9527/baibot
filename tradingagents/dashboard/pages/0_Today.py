@@ -157,21 +157,36 @@ for (variant, db), col in zip(dbs.items(), cols):
             f"{card['daily_pl']:+,.0f}  ({pl_pct:+.2%})" if pl_pct is not None and card["daily_pl"] is not None
             else "—"
         )
+
+        # "Activity" line — if no trades closed today, say so explicitly so
+        # the user doesn't wonder why the Reviews page is empty for this
+        # variant.
+        if card["trades_closed"] > 0:
+            activity_line = (
+                f"<b>{card['trades_closed']}</b> closed today · "
+                f"<span style='color:#26a69a'>{card['wins']}W</span> / "
+                f"<span style='color:#ef5350'>{card['losses']}L</span>"
+            )
+            metrics_line = (
+                f"avg {'%+.2f%%' % (card['avg_return']*100) if card['avg_return'] is not None else '—'} · "
+                f"MFE capture {'%.2f' % card['mfe_capture'] if card['mfe_capture'] is not None else '—'}"
+            )
+        else:
+            activity_line = "<span style='color:#777;'>No trades closed today</span>"
+            metrics_line = (
+                "<span style='color:#666;font-size:11px;'>"
+                "(positions may be open — reviews only fire on exits)"
+                "</span>"
+            )
+
         st.markdown(
             f"<div style='border:1px solid #333;border-radius:6px;padding:10px 12px;"
             f"background:#101418;'>"
             f"<div style='font-size:12px;color:#888;text-transform:uppercase;letter-spacing:.05em;'>{variant}</div>"
             f"<div style='font-size:20px;font-weight:600;margin-top:2px;'>{equity_str}</div>"
             f"<div style='color:{pl_color};font-size:13px;margin-top:2px;'>{pl_str}</div>"
-            f"<div style='font-size:12px;color:#aaa;margin-top:8px;'>"
-            f"<b>{card['trades_closed']}</b> closed today · "
-            f"<span style='color:#26a69a'>{card['wins']}W</span> / "
-            f"<span style='color:#ef5350'>{card['losses']}L</span>"
-            f"</div>"
-            f"<div style='font-size:12px;color:#aaa;margin-top:4px;'>"
-            f"avg {'%+.2f%%' % (card['avg_return']*100) if card['avg_return'] is not None else '—'} · "
-            f"MFE capture {'%.2f' % card['mfe_capture'] if card['mfe_capture'] is not None else '—'}"
-            f"</div>"
+            f"<div style='font-size:12px;color:#aaa;margin-top:8px;'>{activity_line}</div>"
+            f"<div style='font-size:12px;color:#aaa;margin-top:4px;'>{metrics_line}</div>"
             f"</div>",
             unsafe_allow_html=True,
         )
