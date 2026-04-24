@@ -904,16 +904,23 @@ class ChanOrchestrator:
             logger.info("%s: No trade needed (sizer returned None)", symbol)
             return {"symbol": symbol, "action": action, "traded": False}
 
-        existing_open_order = self._find_existing_open_order(symbol, order_request.side)
-        if existing_open_order is not None:
-            reason = (
-                f"Existing open {order_request.side} order "
-                f"{existing_open_order.order_id} [{existing_open_order.status}]"
-            )
-            logger.info("%s: %s", symbol, reason)
-            self.db.mark_signal_rejected(signal_id, reason)
-            return {"symbol": symbol, "action": action, "traded": False,
-                    "screen_rejected": reason}
+        # BUY-only idempotency guard. For SELL exits, the branch at line 945
+        # cancels bracket legs (which this guard would otherwise match) before
+        # calling close_position — that path is idempotent on its own. Having
+        # the guard fire on SELLs caused every legitimate dead-money exit to
+        # be silently denied by a bracket TP leg. See 2026-04-24 chan_v2
+        # stall on COHR/INSW/OUT/PBR.
+        if order_request.side == "buy":
+            existing_open_order = self._find_existing_open_order(symbol, order_request.side)
+            if existing_open_order is not None:
+                reason = (
+                    f"Existing open {order_request.side} order "
+                    f"{existing_open_order.order_id} [{existing_open_order.status}]"
+                )
+                logger.info("%s: %s", symbol, reason)
+                self.db.mark_signal_rejected(signal_id, reason)
+                return {"symbol": symbol, "action": action, "traded": False,
+                        "screen_rejected": reason}
 
         risk_result = self.risk_engine.check_order(
             order_request, account, positions, current_price

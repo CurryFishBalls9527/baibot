@@ -6,6 +6,7 @@ risk checks → order execution → logging.
 
 import logging
 import os
+import time
 import traceback
 import json
 from collections import Counter
@@ -791,12 +792,52 @@ class Orchestrator:
                     warnings.append(f"Weak trend (ADX={features['adx_14']:.1f})")
 
                 if not warnings or not ai_review_enabled:
-                    # Clear HOLD, or AI review disabled (5-min cron).
-                    if decision.updated_state:
-                        self.db.upsert_position_state(pos.symbol, decision.updated_state)
-                    results[pos.symbol] = {
-                        "symbol": pos.symbol, "action": "HOLD", "traded": False,
-                    }
+                    # Clear HOLD, or AI review disabled (5-min cron). Evaluate
+                    # pyramid add-on first (no-op unless enabled + eligible),
+                    # then persist state including any add-on flag update.
+                    add_on_result = self._evaluate_minervini_add_on(
+                        position=pos,
+                        pos_state=pos_state,
+                        regime_label=regime_label_for_exit,
+                        account=account,
+                        positions=stock_positions,
+                    )
+                    final_state = dict(decision.updated_state or {})
+                    # Carry forward existing add-on flags so they survive
+                    # upsert_position_state's merge semantics (the merge
+                    # covers missing keys; we want observed-True to persist).
+                    if pos_state.get("add_on_1_done"):
+                        final_state["add_on_1_done"] = True
+                    if pos_state.get("add_on_2_done"):
+                        final_state["add_on_2_done"] = True
+                    if add_on_result and add_on_result.get("traded"):
+                        lvl = add_on_result.get("add_on_level")
+                        if lvl == 1:
+                            final_state["add_on_1_done"] = True
+                        elif lvl == 2:
+                            # Level 2 supersedes level 1: if we fire level 2
+                            # directly (position gapped past both triggers),
+                            # mark both done. Leaving add_on_1_done=False
+                            # causes the elif branch to re-fire level 1 on
+                            # the next tick → wash-trade reject against the
+                            # just-placed SL.
+                            final_state["add_on_1_done"] = True
+                            final_state["add_on_2_done"] = True
+                        # _resync_protective_stop_after_add_on may have
+                        # mutated pos_state's stop_order_id / tp_order_id;
+                        # pick those up too.
+                        if pos_state.get("stop_order_id") is not None:
+                            final_state["stop_order_id"] = pos_state["stop_order_id"]
+                        if "tp_order_id" in pos_state:
+                            final_state["tp_order_id"] = pos_state["tp_order_id"]
+                    if final_state:
+                        self.db.upsert_position_state(pos.symbol, final_state)
+                    if add_on_result and add_on_result.get("traded"):
+                        results[pos.symbol] = add_on_result
+                    else:
+                        results[pos.symbol] = {
+                            "symbol": pos.symbol, "action": "HOLD", "traded": False,
+                        }
                     continue
 
                 if self.config.get("mechanical_only_mode"):
@@ -2183,6 +2224,309 @@ class Orchestrator:
                 continue
             return order
         return None
+
+    def _calculate_add_on_qty(
+        self,
+        *,
+        account: Account,
+        position: Position,
+        price: float,
+        stop_price: float,
+        add_fraction: float,
+    ) -> int:
+        """Port of backtester `_add_on_qty` for live Minervini pyramiding.
+
+        Caps the add-on buy by three constraints simultaneously:
+          (a) max_position_pct: additional shares cannot push total position
+              market value above equity * max_position_pct.
+          (b) risk_per_trade * add_fraction: dollar risk on the add-on portion
+              cannot exceed the per-trade risk budget scaled by the fraction.
+          (c) available cash.
+
+        Returns 0 when any constraint leaves no room (including pathological
+        stop >= price).
+        """
+        risk_per_share = max(float(price) - float(stop_price), 0.0)
+        if risk_per_share <= 0:
+            return 0
+        equity = float(account.equity or 0.0)
+        cash = float(account.cash or 0.0)
+        max_position_pct = float(self.config.get("max_position_pct", 0.12))
+        risk_per_trade = float(self.config.get("risk_per_trade", 0.012))
+        current_shares = int(float(position.qty or 0))
+        max_position_value = equity * max_position_pct
+        current_value = current_shares * float(price)
+        remaining_capacity = max(0.0, max_position_value - current_value)
+        target_value = min(max_position_value * add_fraction, remaining_capacity, cash)
+        risk_budget = equity * risk_per_trade * add_fraction
+        qty_from_notional = int(target_value / price) if price > 0 else 0
+        qty_from_risk = int(risk_budget / risk_per_share)
+        return max(0, min(qty_from_notional, qty_from_risk))
+
+    def _evaluate_minervini_add_on(
+        self,
+        *,
+        position: Position,
+        pos_state: Dict,
+        regime_label: Optional[str],
+        account: Account,
+        positions: List[Position],
+    ) -> Optional[Dict]:
+        """Evaluate pyramid add-on for a held Minervini position. Returns a
+        result dict when an add-on was submitted, or None when no add-on
+        applies. See plan at plans/live-minervini-pyramid-add-on.md.
+
+        Universe-ambiguity caveat (2026-04-23): seed_universe backtest shows
+        +9.8pp 2023_2025 edge; broad_universe shows -5.4pp. Shipped to
+        mechanical_v2 paper variant as an observational A/B only — kill-switch
+        `minervini_add_on_enabled` gates activation.
+        """
+        if not self.config.get("minervini_add_on_enabled", False):
+            return None
+        if regime_label == "market_correction":
+            return None
+
+        entry_price = float(
+            pos_state.get("entry_price") or position.avg_entry_price or 0.0
+        )
+        current_price = float(position.current_price or 0.0)
+        if entry_price <= 0 or current_price <= 0:
+            return None
+        gain_pct = (current_price - entry_price) / entry_price
+
+        trigger_1 = float(self.config.get("minervini_add_on_trigger_pct_1", 0.025))
+        trigger_2 = float(self.config.get("minervini_add_on_trigger_pct_2", 0.05))
+        fraction_1 = float(self.config.get("minervini_add_on_fraction_1", 0.30))
+        fraction_2 = float(self.config.get("minervini_add_on_fraction_2", 0.20))
+
+        # Prefer the higher-level add-on when both are eligible in the same tick
+        # (e.g. position gapped up past both thresholds in one day).
+        add_on_level: Optional[int] = None
+        add_fraction: Optional[float] = None
+        if not pos_state.get("add_on_2_done") and gain_pct >= trigger_2:
+            add_on_level, add_fraction = 2, fraction_2
+        elif not pos_state.get("add_on_1_done") and gain_pct >= trigger_1:
+            add_on_level, add_fraction = 1, fraction_1
+        if add_on_level is None:
+            return None
+
+        # Idempotency: if a prior cycle's add-on buy is still working at the
+        # broker, skip — we'll revisit next tick.
+        existing_buy = self._find_existing_open_order(position.symbol, "buy")
+        if existing_buy is not None:
+            logger.info(
+                "%s: add-on %d skipped — existing open buy %s [%s]",
+                position.symbol, add_on_level,
+                existing_buy.order_id, existing_buy.status,
+            )
+            return None
+
+        current_stop = float(pos_state.get("current_stop") or 0.0)
+        if current_stop <= 0 or current_stop >= current_price:
+            logger.info(
+                "%s: add-on %d skipped — invalid stop (%.2f vs price %.2f)",
+                position.symbol, add_on_level, current_stop, current_price,
+            )
+            return None
+
+        qty = self._calculate_add_on_qty(
+            account=account,
+            position=position,
+            price=current_price,
+            stop_price=current_stop,
+            add_fraction=add_fraction,
+        )
+        if qty <= 0:
+            return None
+
+        order_request = OrderRequest(
+            symbol=position.symbol,
+            side="buy",
+            qty=float(qty),
+            order_type="market",
+        )
+        risk_result = self.risk_engine.check_order(
+            order_request, account, positions, current_price,
+        )
+        if not risk_result.passed:
+            logger.info(
+                "%s: add-on %d blocked by risk engine: %s",
+                position.symbol, add_on_level, risk_result.reason,
+            )
+            return None
+
+        reasoning = (
+            f"Minervini add-on #{add_on_level}: {position.symbol} up "
+            f"{gain_pct:.1%} from entry ({entry_price:.2f}→{current_price:.2f}); "
+            f"adding {qty} shares with stop at {current_stop:.2f}."
+        )
+        signal_id = self.db.log_signal(
+            symbol=position.symbol,
+            action="BUY",
+            confidence=0.82,
+            reasoning=reasoning,
+            stop_loss=current_stop,
+            timeframe="swing",
+        )
+
+        try:
+            order_result = self.broker.submit_order(order_request)
+        except Exception as exc:
+            self.db.mark_signal_rejected(signal_id, str(exc))
+            logger.error(
+                "%s: add-on %d submit failed: %s",
+                position.symbol, add_on_level, exc, exc_info=True,
+            )
+            return None
+
+        self.risk_engine.record_trade()
+        self.db.log_trade(
+            symbol=position.symbol,
+            side="buy",
+            qty=float(qty),
+            order_type="market",
+            status=order_result.status,
+            filled_qty=order_result.filled_qty,
+            filled_price=order_result.filled_avg_price,
+            order_id=order_result.order_id,
+            signal_id=signal_id,
+            reasoning=reasoning,
+        )
+        self.db.mark_signal_executed(signal_id)
+        self._notify_order(
+            symbol=position.symbol,
+            side="buy",
+            qty=float(qty),
+            status=str(order_result.status),
+            order_id=order_result.order_id,
+            filled_price=order_result.filled_avg_price,
+            reasoning=reasoning,
+            source=f"minervini_add_on_{add_on_level}",
+        )
+
+        # Protective-stop re-sync: cancel existing broker SL/TP legs and
+        # submit a single stop covering projected total qty at the current
+        # ratcheted stop price. Projected qty assumes the market order fills
+        # imminently (true for liquid names); if it fails to fill, the next
+        # exit_manager tick will observe actual qty and ratchet from there.
+        projected_qty = int(float(position.qty or 0)) + int(qty)
+        try:
+            self._resync_protective_stop_after_add_on(
+                symbol=position.symbol,
+                projected_qty=projected_qty,
+                stop_price=current_stop,
+                pos_state=pos_state,
+            )
+        except Exception as exc:
+            logger.error(
+                "%s: CRITICAL add-on %d bought but protective-stop resync failed: %s",
+                position.symbol, add_on_level, exc, exc_info=True,
+            )
+
+        return {
+            "symbol": position.symbol,
+            "action": "BUY",
+            "traded": True,
+            "side": "buy",
+            "qty": float(qty),
+            "order_id": order_result.order_id,
+            "status": order_result.status,
+            "add_on_level": add_on_level,
+            "rule_entry": f"add_on_{add_on_level}",
+        }
+
+    def _resync_protective_stop_after_add_on(
+        self,
+        *,
+        symbol: str,
+        projected_qty: int,
+        stop_price: float,
+        pos_state: Dict,
+    ) -> None:
+        """Drop existing broker SL/TP legs on ``symbol`` and submit a single
+        stop covering ``projected_qty`` at ``stop_price``.
+
+        Architecture note: after pyramiding, the position is managed by
+        ExitManagerV2 alone. The original bracket's TP ceiling is removed —
+        partial-profit and trail-stop logic take over. This mirrors the
+        backtester which runs a single stop per position across lots.
+        """
+        getter = getattr(self.broker, "get_live_orders", None)
+        if not callable(getter):
+            getter = getattr(self.broker, "get_open_orders", None)
+
+        terminal = {"filled", "canceled", "cancelled", "expired", "rejected"}
+
+        def _fetch_live_sell_legs() -> list:
+            if not callable(getter):
+                return []
+            try:
+                orders = getter(symbol=symbol)
+            except TypeError:
+                orders = getter()
+            except Exception as exc:
+                logger.warning(
+                    "%s: fetch live orders for add-on resync failed: %s",
+                    symbol, exc,
+                )
+                return []
+            legs = []
+            for order in orders or []:
+                side = str(getattr(order, "side", "") or "").lower().split(".")[-1]
+                status = str(getattr(order, "status", "") or "").lower().split(".")[-1]
+                if side == "sell" and status not in terminal:
+                    legs.append(order)
+            return legs
+
+        canceled = 0
+        for order in _fetch_live_sell_legs():
+            try:
+                self.broker.cancel_order(order.order_id)
+                canceled += 1
+            except Exception as exc:
+                logger.warning(
+                    "%s: cancel sell leg %s failed: %s",
+                    symbol, getattr(order, "order_id", "?"), exc,
+                )
+
+        # Wait for cancellations to clear before submitting the new stop.
+        # Alpaca's wash-trade guard rejects opposite-side submits while the
+        # old SL lingers in pending_cancel — produces 40310000 rejects.
+        if canceled > 0:
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                if not _fetch_live_sell_legs():
+                    break
+                time.sleep(0.25)
+            else:
+                logger.warning(
+                    "%s: add-on resync cancel-wait timed out after 3s; "
+                    "submitting new stop anyway (may collide)",
+                    symbol,
+                )
+
+        stop_order = OrderRequest(
+            symbol=symbol,
+            side="sell",
+            qty=float(projected_qty),
+            order_type="stop",
+            stop_price=round(float(stop_price), 2),
+            time_in_force="gtc",
+        )
+        try:
+            result = self.broker.submit_order(stop_order)
+        except Exception as exc:
+            logger.error(
+                "%s: add-on stop-resync submit failed (qty=%s price=%.2f): %s",
+                symbol, projected_qty, stop_price, exc,
+            )
+            return
+        pos_state["stop_order_id"] = result.order_id
+        pos_state["tp_order_id"] = None
+        logger.info(
+            "%s: add-on resync — canceled %d sell leg(s), new stop @$%.2f for %d shares (order %s)",
+            symbol, canceled, stop_price, projected_qty, result.order_id,
+        )
 
     def _target_exposure_for_regime(self, regime: Optional[str]) -> float:
         regime = (regime or "").lower()
