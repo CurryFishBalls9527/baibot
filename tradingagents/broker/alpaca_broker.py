@@ -16,6 +16,7 @@ from alpaca.trading.requests import (
     ReplaceOrderRequest,
 )
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, OrderClass, QueryOrderStatus
+from alpaca.common.exceptions import APIError
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestQuoteRequest
 
@@ -178,7 +179,40 @@ class AlpacaBroker(BaseBroker):
             take_profit={"limit_price": tp_submit},
         )
 
-        result = self.trading_client.submit_order(req)
+        try:
+            result = self.trading_client.submit_order(req)
+        except APIError as e:
+            # Stale-quote retry: when our IEX mid lags SIP on a fast-moving
+            # thin name (e.g. small-caps like AAOI/VSCO), the SL computed
+            # from the stale anchor can land above Alpaca's base_price and
+            # hit `stop_loss.stop_price must be <= base_price - 0.01`.
+            # Re-fetch quote, clamp SL to preserve the caller's intended
+            # SL-distance against the fresh price, retry once.
+            msg = str(e)
+            if e.code != 42210000 or "stop_loss" not in msg or "base_price" not in msg:
+                raise
+            fresh_price = self.get_latest_price(order.symbol)
+            if fresh_price <= 0:
+                # Quote fetch failed — can't recover; bubble up.
+                raise
+            sl_pct = (anchor_price - stop_loss_price) / anchor_price if anchor_price else 0.03
+            new_sl = round(min(fresh_price * (1 - sl_pct), fresh_price - 0.01), 2)
+            logger.warning(
+                f"{order.symbol}: SL stale-quote retry "
+                f"(anchor=${anchor_price:.2f} fresh=${fresh_price:.2f} "
+                f"SL=${sl_submit:.2f}->${new_sl:.2f})"
+            )
+            req = MarketOrderRequest(
+                symbol=order.symbol,
+                side=OrderSide.BUY,
+                qty=order.qty,
+                time_in_force=tif,
+                order_class=OrderClass.BRACKET,
+                stop_loss={"stop_price": new_sl},
+                take_profit={"limit_price": tp_submit},
+            )
+            sl_submit = new_sl
+            result = self.trading_client.submit_order(req)
         logger.info(
             f"Bracket order: BUY {order.qty} {order.symbol} "
             f"SL=${sl_submit:.2f} TP=${tp_submit:.2f} -> {result.status}"
@@ -402,9 +436,35 @@ class AlpacaBroker(BaseBroker):
         return self._to_order_result(result)
 
     def close_all_positions(self) -> List[OrderResult]:
-        results = self.trading_client.close_all_positions(cancel_orders=True)
-        logger.info(f"All positions closed ({len(results)} orders)")
-        return [self._to_order_result(r) for r in results if hasattr(r, "id")]
+        """Cancel all open orders and submit market-close orders for every
+        position on this account. Atomic at Alpaca — no race with bracket
+        children that would leave `held_for_orders == qty` and reject the
+        close.
+
+        Alpaca returns ``ClosePositionResponse`` objects (symbol, status,
+        order_id, body=Order|FailedClosePositionDetails). Success entries
+        have an Order in ``body`` which we flatten to OrderResult; failures
+        are warned and skipped.
+        """
+        raw = self.trading_client.close_all_positions(cancel_orders=True)
+        out: List[OrderResult] = []
+        for r in raw:
+            status_code = getattr(r, "status", None)
+            body = getattr(r, "body", None)
+            symbol = getattr(r, "symbol", None)
+            if status_code and 200 <= int(status_code) < 300 and hasattr(body, "id"):
+                out.append(self._to_order_result(body))
+            else:
+                err = getattr(body, "message", None) or str(body) if body else f"http {status_code}"
+                logger.warning(
+                    "close_all_positions: %s failed (status=%s): %s",
+                    symbol, status_code, err,
+                )
+        logger.info(
+            "close_all_positions: %s close order(s) submitted (raw responses=%s)",
+            len(out), len(raw),
+        )
+        return out
 
     # ── Market Data ──────────────────────────────────────────────────
 

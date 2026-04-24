@@ -247,5 +247,125 @@ class BracketLegIDCaptureTests(unittest.TestCase):
         client.get_order_by_id.assert_not_called()
 
 
+class StaleQuoteRetryTests(unittest.TestCase):
+    """Regression: stale IEX mid on thin names can push SL above Alpaca's
+    base_price, triggering 42210000 "stop_loss.stop_price must be <=
+    base_price - 0.01". See 2026-04-24 AAOI incident and 2026-04-20 VSCO.
+    """
+
+    def test_retries_with_fresh_price_on_sl_above_base_reject(self):
+        from alpaca.common.exceptions import APIError
+        first_err = APIError(
+            '{"code":42210000,"base_price":"163.32",'
+            '"message":"stop_loss.stop_price must be <= base_price - 0.01"}'
+        )
+        filled = _StubParent(
+            legs=[
+                _StubLeg("tp-oid", "limit", limit_price=200.0),
+                _StubLeg("sl-oid", "stop", stop_price=155.15),
+            ],
+            status="filled",
+            filled_avg_price=163.0,
+        )
+        with patch("tradingagents.broker.alpaca_broker.TradingClient") as TC, \
+             patch("tradingagents.broker.alpaca_broker.time.sleep"):
+            client = MagicMock()
+            # submit_order: raise on first call, return filled on second.
+            client.submit_order.side_effect = [first_err, filled]
+            client.get_order_by_id.return_value = filled
+            TC.return_value = client
+
+            from tradingagents.broker.alpaca_broker import AlpacaBroker
+            from tradingagents.broker.models import OrderRequest
+
+            broker = AlpacaBroker("k", "s", paper=True)
+            # Stub fresh-quote fetch: SIP price is $163.28 vs anchor $172.56.
+            broker.get_latest_price = MagicMock(return_value=163.28)
+
+            order = OrderRequest(
+                symbol="AAOI", side="buy", qty=70,
+                order_type="market", time_in_force="gtc",
+            )
+            # Anchor $172.56, original SL $163.93 (5% below anchor). Retry
+            # should clamp SL against fresh price $163.28 → $155.12.
+            result = broker.submit_bracket_order(
+                order, stop_loss_price=163.93, take_profit_price=198.44,
+                anchor_price=172.56,
+            )
+
+        # Two submit attempts: first raised, second succeeded.
+        self.assertEqual(client.submit_order.call_count, 2)
+        # Second submit request should carry the clamped SL (≈$155.11),
+        # not the original stale $163.93.
+        second_req = client.submit_order.call_args_list[1].args[0]
+        new_sl_price = float(second_req.stop_loss.stop_price)
+        self.assertLess(new_sl_price, 163.28)
+        self.assertAlmostEqual(new_sl_price, 155.11, places=1)
+        # Retry produced a non-None result (downstream re-anchor may
+        # further mutate stop_order_id; we only care that retry succeeded).
+        self.assertIsNotNone(result)
+
+    def test_does_not_retry_on_unrelated_api_error(self):
+        """Only the specific SL-vs-base_price reject triggers retry. Other
+        42210000 errors (e.g. insufficient buying power) must bubble up."""
+        from alpaca.common.exceptions import APIError
+        unrelated = APIError('{"code":40310000,"message":"some other error"}')
+        with patch("tradingagents.broker.alpaca_broker.TradingClient") as TC, \
+             patch("tradingagents.broker.alpaca_broker.time.sleep"):
+            client = MagicMock()
+            client.submit_order.side_effect = [unrelated]
+            TC.return_value = client
+
+            from tradingagents.broker.alpaca_broker import AlpacaBroker
+            from tradingagents.broker.models import OrderRequest
+
+            broker = AlpacaBroker("k", "s", paper=True)
+            broker.get_latest_price = MagicMock(return_value=100.0)
+
+            order = OrderRequest(
+                symbol="AAPL", side="buy", qty=10,
+                order_type="market", time_in_force="gtc",
+            )
+            with self.assertRaises(APIError):
+                broker.submit_bracket_order(
+                    order, stop_loss_price=95.0, take_profit_price=115.0,
+                    anchor_price=100.0,
+                )
+        # Only one submit attempt — no retry for unrelated errors.
+        self.assertEqual(client.submit_order.call_count, 1)
+
+    def test_abandons_retry_when_fresh_quote_unavailable(self):
+        """If fresh-quote fetch returns 0/negative, the error bubbles up —
+        can't compute a valid clamped SL without a price."""
+        from alpaca.common.exceptions import APIError
+        reject = APIError(
+            '{"code":42210000,"base_price":"90.00",'
+            '"message":"stop_loss.stop_price must be <= base_price - 0.01"}'
+        )
+        with patch("tradingagents.broker.alpaca_broker.TradingClient") as TC, \
+             patch("tradingagents.broker.alpaca_broker.time.sleep"):
+            client = MagicMock()
+            client.submit_order.side_effect = [reject]
+            TC.return_value = client
+
+            from tradingagents.broker.alpaca_broker import AlpacaBroker
+            from tradingagents.broker.models import OrderRequest
+
+            broker = AlpacaBroker("k", "s", paper=True)
+            # Quote fetch returns 0 — broker can't recover.
+            broker.get_latest_price = MagicMock(return_value=0.0)
+
+            order = OrderRequest(
+                symbol="AAPL", side="buy", qty=10,
+                order_type="market", time_in_force="gtc",
+            )
+            with self.assertRaises(APIError):
+                broker.submit_bracket_order(
+                    order, stop_loss_price=95.0, take_profit_price=115.0,
+                    anchor_price=100.0,
+                )
+        self.assertEqual(client.submit_order.call_count, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
