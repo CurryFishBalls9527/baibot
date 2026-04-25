@@ -115,6 +115,10 @@ def parse_args():
 
     p.add_argument("--post-stop-reentry-block", action="store_true",
                     help="Block same-day re-entry after a stop-exit (whipsaw guard)")
+    p.add_argument("--post-stop-reentry-block-days", type=int, default=0,
+                    help="N-calendar-day cooldown after a stop (overrides "
+                         "--post-stop-reentry-block when >0). E.g. 4 ≈ 2 "
+                         "business days; covers cross-day churn like W17 AAOI.")
 
     p.add_argument("--out", default="results/chan_v2/backtest.json")
     return p.parse_args()
@@ -166,6 +170,7 @@ def main():
         divergence_sizing_base=args.divergence_sizing_base,
         divergence_sizing_max_boost=args.divergence_sizing_max_boost,
         post_stop_reentry_block=args.post_stop_reentry_block,
+        post_stop_reentry_block_days=args.post_stop_reentry_block_days,
     )
 
     regime_df = None

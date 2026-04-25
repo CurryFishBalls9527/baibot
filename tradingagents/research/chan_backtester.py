@@ -113,8 +113,13 @@ class ChanBacktestConfig:
     daily_zs_filter: bool = False     # require price above nearest daily ZS low
     daily_bsp_confirm: bool = False   # boost when intraday buy aligns with daily buy BSP
 
-    # Whipsaw guard — block same-day re-entry after a stop-exit
+    # Whipsaw guard — block same-day re-entry after a stop-exit.
+    # `post_stop_reentry_block` is the legacy same-day boolean; when
+    # `post_stop_reentry_block_days > 0` it overrides and blocks for N
+    # calendar days after the stop (covers cross-day churn — e.g. AAOI in
+    # W17 was stopped on 4/22 and re-entered on 4/23 under same-day-only).
     post_stop_reentry_block: bool = False
+    post_stop_reentry_block_days: int = 0
 
 
 @dataclass
@@ -359,8 +364,22 @@ class PortfolioChanBacktester:
 
             # --- Check buy signals → queue for NEXT bar execution ---
             if symbol not in positions and symbol not in pending_entries:
-                if cfg.post_stop_reentry_block and stopped_today.get(symbol) == cur_day:
-                    continue
+                last_stop_day = stopped_today.get(symbol)
+                if last_stop_day is not None:
+                    if cfg.post_stop_reentry_block_days > 0:
+                        # N-calendar-day cooldown overrides same-day boolean.
+                        try:
+                            from datetime import datetime as _dt
+                            days_since = (
+                                _dt.strptime(cur_day, "%Y-%m-%d").date()
+                                - _dt.strptime(last_stop_day, "%Y-%m-%d").date()
+                            ).days
+                        except Exception:
+                            days_since = None
+                        if days_since is not None and days_since < cfg.post_stop_reentry_block_days:
+                            continue
+                    elif cfg.post_stop_reentry_block and last_stop_day == cur_day:
+                        continue
                 daily_ok = True
 
                 if cfg.regime_gate and regime_scores is not None:

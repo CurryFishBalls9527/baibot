@@ -256,8 +256,22 @@ class PortfolioChanV2Backtester(PortfolioChanBacktester):
 
             # --- Check buy signals → queue for NEXT bar execution ---
             if symbol not in positions and symbol not in pending_entries:
-                if cfg.post_stop_reentry_block and stopped_today.get(symbol) == cur_day:
-                    continue
+                last_stop_day = stopped_today.get(symbol)
+                if last_stop_day is not None:
+                    if cfg.post_stop_reentry_block_days > 0:
+                        # N-calendar-day cooldown overrides same-day boolean.
+                        try:
+                            from datetime import datetime as _dt
+                            days_since = (
+                                _dt.strptime(cur_day, "%Y-%m-%d").date()
+                                - _dt.strptime(last_stop_day, "%Y-%m-%d").date()
+                            ).days
+                        except Exception:
+                            days_since = None
+                        if days_since is not None and days_since < cfg.post_stop_reentry_block_days:
+                            continue
+                    elif cfg.post_stop_reentry_block and last_stop_day == cur_day:
+                        continue
                 daily_ok = True
 
                 if cfg.regime_gate and regime_scores is not None:

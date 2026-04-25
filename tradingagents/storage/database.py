@@ -3,7 +3,7 @@
 import sqlite3
 import json
 import logging
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 
@@ -224,6 +224,11 @@ class TradingDatabase:
                 "base_pattern": "TEXT",
                 "rs_at_entry": "REAL",
                 "stage_at_entry": "REAL",
+                # Pyramid add-on tracking. Flipped True once the add-on BUY
+                # for that level has been acked at the broker; reset when the
+                # position fully closes (delete_position_state).
+                "add_on_1_done": "INTEGER DEFAULT 0",
+                "add_on_2_done": "INTEGER DEFAULT 0",
             },
         )
         self._ensure_columns(
@@ -536,6 +541,46 @@ class TradingDatabase:
         ).fetchone()
         return row is not None
 
+    def was_stopped_within_n_days(
+        self, symbol: str, n_days: int, as_of: Optional[str] = None,
+    ) -> bool:
+        """True iff `symbol` had a filled bracket_stop_loss sell within the
+        last `n_days` calendar days ending at `as_of` (inclusive).
+
+        Cross-day variant of `was_stopped_today`. With `n_days=1` the
+        behavior is identical (just today). With `n_days=3`, blocks
+        re-entry for two days after the stop. Use this for chan-style
+        churny names where same-day blocking isn't enough — e.g., W17
+        AAOI was stopped on 4/22 and re-entered 4/23 under same-day-only.
+
+        Relies on reconciler-populated SELL rows. Callers must reconcile
+        before using this.
+        """
+        if n_days <= 1:
+            return self.was_stopped_today(symbol, as_of)
+        end = as_of or date.today().isoformat()
+        try:
+            start = (
+                datetime.strptime(end, "%Y-%m-%d").date()
+                - timedelta(days=n_days - 1)
+            ).isoformat()
+        except Exception:
+            return self.was_stopped_today(symbol, as_of)
+        row = self.conn.execute(
+            """
+            SELECT 1 FROM trades
+            WHERE symbol = ?
+              AND side = 'sell'
+              AND LOWER(COALESCE(reasoning, '')) LIKE '%stop_loss%'
+              AND LOWER(status) LIKE '%filled%'
+              AND COALESCE(filled_qty, 0) > 0
+              AND date(timestamp) BETWEEN ? AND ?
+            LIMIT 1
+            """,
+            (symbol, start, end),
+        ).fetchone()
+        return row is not None
+
     def get_trade_summary(self, trade_date: Optional[str] = None) -> Dict[str, Any]:
         summary_date = trade_date or date.today().isoformat()
         trades = self.get_trades_on_date(summary_date)
@@ -624,6 +669,8 @@ class TradingDatabase:
             return None
         state = dict(row)
         state["partial_taken"] = bool(state.get("partial_taken", 0))
+        state["add_on_1_done"] = bool(state.get("add_on_1_done", 0))
+        state["add_on_2_done"] = bool(state.get("add_on_2_done", 0))
         return state
 
     def upsert_position_state(self, symbol: str, state: Dict):
@@ -638,8 +685,9 @@ class TradingDatabase:
                 partial_taken, stop_type, stop_order_id, tp_order_id,
                 entry_order_id, variant, bars_held,
                 regime_at_entry, base_pattern, rs_at_entry, stage_at_entry,
+                add_on_1_done, add_on_2_done,
                 updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))""",
             (
                 symbol,
                 merged["entry_price"],
@@ -657,6 +705,8 @@ class TradingDatabase:
                 merged.get("base_pattern"),
                 merged.get("rs_at_entry"),
                 merged.get("stage_at_entry"),
+                1 if merged.get("add_on_1_done") else 0,
+                1 if merged.get("add_on_2_done") else 0,
             ),
         )
         self.conn.commit()

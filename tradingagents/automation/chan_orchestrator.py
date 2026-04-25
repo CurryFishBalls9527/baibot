@@ -289,11 +289,24 @@ class ChanOrchestrator:
             cfg_dict["mean_metrics"] = [20, 60]
         chan_cfg = CChanConfig(cfg_dict)
         candidates = sorted(rs_qualifying - held_symbols)
-        blocked_whipsaw = [s for s in candidates if self.db.was_stopped_today(s)]
+        # `chan_post_stop_block_days` extends the guard from same-day to N
+        # calendar days. Default 1 = legacy same-day only. Set to 3 (≈ 2
+        # business days) on chan_v2 to dampen the cross-day churn observed
+        # in W17 (AAOI stopped 4/22, re-entered 4/23 → re-stopped).
+        cooldown_days = max(int(self.config.get("chan_post_stop_block_days", 1)), 1)
+        if cooldown_days > 1:
+            blocked_whipsaw = [
+                s for s in candidates
+                if self.db.was_stopped_within_n_days(s, cooldown_days)
+            ]
+            log_label = f"within {cooldown_days}d"
+        else:
+            blocked_whipsaw = [s for s in candidates if self.db.was_stopped_today(s)]
+            log_label = "today"
         if blocked_whipsaw:
             logger.info(
-                "Chan whipsaw guard: skipping %d symbols stopped today: %s",
-                len(blocked_whipsaw), ",".join(blocked_whipsaw),
+                "Chan whipsaw guard: skipping %d symbols stopped %s: %s",
+                len(blocked_whipsaw), log_label, ",".join(blocked_whipsaw),
             )
             candidates = [s for s in candidates if s not in set(blocked_whipsaw)]
         logger.info("Scanning %d candidates for buy signals...", len(candidates))
