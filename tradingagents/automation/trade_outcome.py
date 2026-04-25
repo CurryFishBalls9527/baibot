@@ -73,6 +73,48 @@ def compute_excursion(
         return (None, None)
 
 
+def _fallback_entry_context(db: Any, symbol: str, entry_date_str: str) -> dict:
+    """Look up the most recent setup_candidates row for `symbol` on or before
+    `entry_date_str`, returning Minervini entry-time context fields.
+
+    Used as a fallback when `position_states.regime_at_entry` etc. are NULL
+    (e.g. when the in-memory preflight cache was empty at entry time, or the
+    scheduler restarted between preflight and entry). For chan / intraday
+    variants there will be no setup_candidates row, so all fields stay None.
+    """
+    if not entry_date_str:
+        return {}
+    try:
+        row = db.conn.execute(
+            """SELECT base_label, stage_number, rs_percentile, market_regime
+               FROM setup_candidates
+               WHERE symbol = ? AND screen_date <= ?
+               ORDER BY screen_date DESC LIMIT 1""",
+            (symbol, entry_date_str),
+        ).fetchone()
+    except Exception:
+        return {}
+    if row is None:
+        return {}
+    r = dict(row)
+    out = {}
+    if r.get("base_label") is not None:
+        out["base_pattern"] = r["base_label"]
+    if r.get("stage_number") is not None:
+        try:
+            out["stage_at_entry"] = float(r["stage_number"])
+        except (TypeError, ValueError):
+            pass
+    if r.get("rs_percentile") is not None:
+        try:
+            out["rs_at_entry"] = float(r["rs_percentile"])
+        except (TypeError, ValueError):
+            pass
+    if r.get("market_regime") is not None:
+        out["regime_at_entry"] = r["market_regime"]
+    return out
+
+
 def log_closed_trade(
     *,
     db: Any,
@@ -87,8 +129,10 @@ def log_closed_trade(
 
     Call AFTER the SELL has filled and BEFORE `delete_position_state`.
     Reads entry-time context directly from `pos_state` (entry_price,
-    entry_date, regime_at_entry, base_pattern, rs_at_entry, stage_at_entry
-    — any NULL-valued keys are preserved as NULL in the outcome row).
+    entry_date, regime_at_entry, base_pattern, rs_at_entry, stage_at_entry).
+    For Minervini variants, falls back to the `setup_candidates` table when
+    pos_state lacks these fields (e.g. preflight cache was empty at entry,
+    scheduler restart, or a code path that bypassed entry_context capture).
 
     Returns the newly-inserted outcome row id, or None on failure. Never
     raises — the exit path must not be blocked by outcome bookkeeping.
@@ -118,6 +162,17 @@ def log_closed_trade(
             enabled=excursion_enabled,
         )
 
+        # Fall back to setup_candidates lookup for any Minervini context
+        # field that pos_state doesn't have. Chan/intraday writes hit this
+        # function too — they just won't have a setup_candidates row, so
+        # the lookup returns {} and pos_state values (including None) win.
+        fallback = _fallback_entry_context(db, symbol, entry_date_str)
+        def _pick(field: str):
+            v = pos_state.get(field)
+            if v is None:
+                return fallback.get(field)
+            return v
+
         return db.log_trade_outcome({
             "symbol": symbol,
             "entry_date": entry_date_str,
@@ -127,10 +182,10 @@ def log_closed_trade(
             "return_pct": round(return_pct, 4),
             "hold_days": hold_days,
             "exit_reason": exit_reason or "closed",
-            "base_pattern": pos_state.get("base_pattern"),
-            "stage_at_entry": pos_state.get("stage_at_entry"),
-            "rs_at_entry": pos_state.get("rs_at_entry"),
-            "regime_at_entry": pos_state.get("regime_at_entry"),
+            "base_pattern": _pick("base_pattern"),
+            "stage_at_entry": _pick("stage_at_entry"),
+            "rs_at_entry": _pick("rs_at_entry"),
+            "regime_at_entry": _pick("regime_at_entry"),
             "max_favorable_excursion": mfe,
             "max_adverse_excursion": mae,
         })

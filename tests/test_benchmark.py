@@ -100,3 +100,26 @@ class TestCompute:
                 strategy_daily_returns=[0.01, 0.01],
                 # No benchmark_returns, no alpaca_credentials
             )
+
+    def test_full_week_alignment_no_drop(self):
+        """5 strategy days + 5 benchmark days → no day dropped on either side.
+
+        Regression for the off-by-one where prior-Friday's close wasn't fetched
+        and the comparison silently dropped Monday from the strategy series.
+        """
+        # chan_v2 W17 actuals: [+1.58, -0.16, -0.42, -2.49, +1.56] %
+        strat = [0.01580, -0.00158, -0.00421, -0.02493, +0.01563]
+        # SPY-like: 5 close-to-close returns covering the same Mon-Fri window
+        bench = [0.0015, 0.0010, -0.0040, 0.0080, 0.0020]
+        result = compute_benchmark_comparison(
+            ticker="SPY",
+            start=date(2026, 4, 20),
+            end=date(2026, 4, 24),
+            strategy_daily_returns=strat,
+            benchmark_returns=bench,
+        )
+        assert result["num_days"] == 5
+        # Strategy compounded across all 5 days (~+0.01%), not just the
+        # last 4 (~-1.55%) which was the buggy behavior.
+        assert result["strategy_return"] == pytest.approx(0.000123, abs=1e-4)
+        assert result["benchmark_return"] == pytest.approx(0.00853, abs=1e-3)

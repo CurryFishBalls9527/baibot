@@ -128,6 +128,94 @@ class TestSharedHelper:
         n = db.conn.execute("SELECT COUNT(*) FROM trade_outcomes").fetchone()[0]
         assert n == 0
 
+    def test_setup_candidates_fallback_populates_null_fields(self, tmp_path):
+        """When pos_state lacks Minervini context, log_closed_trade should
+        fall back to the most recent setup_candidates row on or before
+        entry_date. Regression for W17 trades writing NULL regime_at_entry."""
+        db = _mk_db(tmp_path)
+        # Seed a setup_candidates row that the fallback will find.
+        screen_date = (date.today() - timedelta(days=5)).isoformat()
+        db.save_setup_candidates(
+            [{
+                "symbol": "INTC", "stage_number": 7.0,
+                "rs_percentile": 80.0, "base_label": "none",
+                "market_regime": "confirmed_uptrend",
+                "buy_point": 62.08, "stop_loss": 57.11,
+                "passed_template": True, "rule_entry_candidate": True,
+                "rule_watch_candidate": False, "selected_for_analysis": True,
+            }],
+            screen_date=screen_date,
+            selected_symbols=["INTC"],
+        )
+        # pos_state is missing all four fields (simulates the W17 bug).
+        state = _base_pos_state()
+        oid = log_closed_trade(
+            db=db, symbol="INTC", pos_state=state,
+            exit_price=110.0, exit_reason="bracket_take_profit",
+            broker=None, excursion_enabled=False,
+        )
+        assert oid is not None
+        row = db.conn.execute(
+            "SELECT * FROM trade_outcomes WHERE id = ?", (oid,)
+        ).fetchone()
+        # All four fields should now be populated from setup_candidates.
+        assert row["base_pattern"] == "none"
+        assert row["stage_at_entry"] == 7.0
+        assert row["rs_at_entry"] == 80.0
+        assert row["regime_at_entry"] == "confirmed_uptrend"
+
+    def test_pos_state_overrides_setup_candidates_fallback(self, tmp_path):
+        """If pos_state has a value, it wins — fallback only fills NULLs."""
+        db = _mk_db(tmp_path)
+        screen_date = (date.today() - timedelta(days=5)).isoformat()
+        db.save_setup_candidates(
+            [{
+                "symbol": "AAPL", "stage_number": 2.0,
+                "rs_percentile": 70.0, "base_label": "vcp",
+                "market_regime": "confirmed_uptrend",
+                "buy_point": 100.0, "stop_loss": 95.0,
+                "passed_template": True, "rule_entry_candidate": True,
+                "rule_watch_candidate": False, "selected_for_analysis": True,
+            }],
+            screen_date=screen_date,
+            selected_symbols=["AAPL"],
+        )
+        state = _base_pos_state(
+            base_pattern="cup_handle",
+            regime_at_entry="uptrend_under_pressure",
+            rs_at_entry=99.0, stage_at_entry=3.0,
+        )
+        oid = log_closed_trade(
+            db=db, symbol="AAPL", pos_state=state,
+            exit_price=110.0, exit_reason="trailing_stop",
+            broker=None, excursion_enabled=False,
+        )
+        row = db.conn.execute(
+            "SELECT * FROM trade_outcomes WHERE id = ?", (oid,)
+        ).fetchone()
+        # pos_state values win; setup_candidates ignored.
+        assert row["base_pattern"] == "cup_handle"
+        assert row["regime_at_entry"] == "uptrend_under_pressure"
+        assert row["rs_at_entry"] == 99.0
+        assert row["stage_at_entry"] == 3.0
+
+    def test_no_setup_candidates_row_keeps_null(self, tmp_path):
+        """Chan/intraday symbols with no setup_candidates row stay NULL."""
+        db = _mk_db(tmp_path)
+        state = _base_pos_state()  # all Minervini fields missing
+        oid = log_closed_trade(
+            db=db, symbol="VALE", pos_state=state,
+            exit_price=95.0, exit_reason="bracket_stop_loss",
+            broker=None, excursion_enabled=False,
+        )
+        row = db.conn.execute(
+            "SELECT * FROM trade_outcomes WHERE id = ?", (oid,)
+        ).fetchone()
+        assert row["base_pattern"] is None
+        assert row["regime_at_entry"] is None
+        assert row["rs_at_entry"] is None
+        assert row["stage_at_entry"] is None
+
     def test_broker_failure_does_not_raise(self, tmp_path):
         db = _mk_db(tmp_path)
         state = _base_pos_state()

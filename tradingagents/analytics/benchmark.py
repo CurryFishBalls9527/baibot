@@ -50,10 +50,14 @@ def _fetch_benchmark_daily_returns(
 
     api_key, secret_key = alpaca_credentials
     client = StockHistoricalDataClient(api_key, secret_key)
+    # Look back 5 calendar days so the first close-to-close return covers
+    # the prior trading day → `start`. Without this, a Mon `start` produces
+    # only Mon-Fri bars (5 closes → 4 returns), and the comparison drops
+    # the strategy's first-day (Mon) return when trimming to min length.
     req = StockBarsRequest(
         symbol_or_symbols=[ticker],
         timeframe=TimeFrame.Day,
-        start=datetime.combine(start - timedelta(days=1), datetime.min.time()),
+        start=datetime.combine(start - timedelta(days=5), datetime.min.time()),
         end=datetime.combine(end + timedelta(days=1), datetime.min.time()),
         # Paper-account credentials aren't authorized for recent SIP data;
         # IEX-only is the documented workaround.

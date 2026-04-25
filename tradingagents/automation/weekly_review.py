@@ -323,7 +323,7 @@ def _build_prompt(
         return (
             f"  trades={s['count']} · "
             f"win_rate={s['win_rate']:.0%} · "
-            f"total_return={s['total_return']:+.2%} · "
+            f"sum_trade_returns_pct={s['total_return']:+.2%} · "
             f"avg={s['avg_return']:+.2%} · "
             f"PF={s['profit_factor']}"
         )
@@ -356,13 +356,18 @@ Write the weekly review for ONE strategy variant.
 Variant: **{variant_name}**
 Window: {window_start} → {window_end}
 
-## Aggregate stats
+## Aggregate stats (closed-trade level)
 {_fmt_stats(stats)}
 avg_MFE={stats.get('avg_mfe')}  avg_MAE={stats.get('avg_mae')}  avg_hold_days={stats.get('avg_hold_days'):.1f}
 
-## Benchmark comparison
+## Benchmark comparison (portfolio-equity level)
 SPY: strategy_return={spy_cmp.get('strategy_return'):+.2%}, benchmark_return={spy_cmp.get('benchmark_return'):+.2%}, excess={spy_cmp.get('excess_return'):+.2%}, correlation={spy_cmp.get('correlation')}
 QQQ: benchmark_return={qqq_cmp.get('benchmark_return'):+.2%}, excess={qqq_cmp.get('excess_return'):+.2%}, correlation={qqq_cmp.get('correlation')}
+
+> **Metric definitions — these are NOT the same number.**
+> - `sum_trade_returns_pct` (Aggregate stats): sum of per-trade %-returns for trades that **closed** in the window. Each trade's return is `(exit_price - entry_price) / entry_price` weighted equally per trade. Ignores positions opened before the window or still open at window end. Ignores cash drag and position sizing.
+> - `strategy_return` (Benchmark comparison): compounded daily portfolio-equity returns from `daily_snapshots.daily_pl_pct`, which is Alpaca's `(equity - last_equity) / last_equity`. Reflects the **whole account**, including unrealized P&L on still-open positions, cash drag, and position-sizing effects.
+> They legitimately diverge when (a) trades open before the window are still appreciating/declining inside it, (b) positions are sized small relative to total equity, or (c) trades cross the window boundary. Do NOT compute "excess return" by subtracting `sum_trade_returns_pct` from `benchmark_return` — only the `strategy_return` line is comparable to benchmarks.
 
 ## By regime
 {_fmt_buckets(regime_stats)}
