@@ -39,13 +39,31 @@ variants:
       minervini_enabled: true
 
   - name: llm
-    description: Full 13-call agent graph pipeline (analysts → debaters → risk)
+    description: Full 13-call agent graph pipeline (analysts → debaters → risk) + ExitManager v2
     alpaca_api_key: "${ALPACA_LLM_API_KEY}"
     alpaca_secret_key: "${ALPACA_LLM_SECRET_KEY}"
     db_path: trading_llm.db
     config_overrides:
       mechanical_only_mode: false
       minervini_enabled: true
+      # 2026-04-25: enabled v2 ExitManager. v1 only updates internal
+      # current_stop; v2 calls broker.replace_order so the bracket SL leg
+      # actually moves to the ratcheted price. W17 llm/AAOI gave back +14%
+      # MFE → -0.06% SL because v1's ratcheted breakeven stop wasn't
+      # visible to Alpaca. Same B4L parity settings as mechanical_v2.
+      # Pyramid add-on intentionally NOT enabled here (untested with llm
+      # signal coupling; see memory/project_pyramid_survivorship.md).
+      exit_manager_version: v2
+      dead_money_enabled: true
+      dead_money_min_gain_pct: 0.03
+      dead_money_max_days: 10
+      partial_profit_fraction: 0.0
+      breakeven_trigger_pct: 0.08
+      breakeven_lock_offset_pct: 0.01
+      regime_aware_trail: true
+      trail_stop_pct_uptrend: 0.10
+      trail_stop_pct_pressure: 0.10
+      trail_stop_pct_correction: 0.07
 
   - name: chan
     description: Chan 缠论 structural signals with RS top-15% filter
@@ -88,6 +106,11 @@ variants:
       trail_stop_pct_uptrend: 0.10
       trail_stop_pct_pressure: 0.10
       trail_stop_pct_correction: 0.07
+      # 2026-04-23: paper-observational pyramid add-on (+2.5%/+30%, +5%/+20%).
+      # Universe-ambiguous signal: seed +9.8pp 23_25 vs broad -5.4pp 23_25.
+      # Kill-switch — flip false to revert without DB migration.
+      # See memory/project_pyramid_survivorship.md.
+      minervini_add_on_enabled: true
 
   - name: chan_v2
     description: Chan v2 — dead money stop at 150 bars (only validated improvement)
