@@ -368,6 +368,8 @@ QQQ: benchmark_return={qqq_cmp.get('benchmark_return'):+.2%}, excess={qqq_cmp.ge
 > - `sum_trade_returns_pct` (Aggregate stats): sum of per-trade %-returns for trades that **closed** in the window. Each trade's return is `(exit_price - entry_price) / entry_price` weighted equally per trade. Ignores positions opened before the window or still open at window end. Ignores cash drag and position sizing.
 > - `strategy_return` (Benchmark comparison): compounded daily portfolio-equity returns from `daily_snapshots.daily_pl_pct`, which is Alpaca's `(equity - last_equity) / last_equity`. Reflects the **whole account**, including unrealized P&L on still-open positions, cash drag, and position-sizing effects.
 > They legitimately diverge when (a) trades open before the window are still appreciating/declining inside it, (b) positions are sized small relative to total equity, or (c) trades cross the window boundary. Do NOT compute "excess return" by subtracting `sum_trade_returns_pct` from `benchmark_return` — only the `strategy_return` line is comparable to benchmarks.
+>
+> **Important: the gap is mostly arithmetic, not a bug.** With `max_single_position_pct = 0.10` (hard risk gate per CLAUDE.md), a trade returning +15% contributes ~+1.5% to portfolio. So a 3-trade week with `sum_trade_returns_pct = +45%` translates to roughly +4.5% portfolio impact — that's expected, not "sizing/cash drag mystery." Only flag a sizing/exposure concern if (i) avg gross exposure across the window is materially below the implicit `max_total_exposure ≈ 80%` cap **and** (ii) max_positions count was NOT being hit. Otherwise the variant is operating as designed under its risk gates.
 
 ## By regime
 {_fmt_buckets(regime_stats)}
