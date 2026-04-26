@@ -25,10 +25,11 @@ import json
 import logging
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import pandas as pd
 
+from tradingagents.automation.events import Categories, emit_event
 from tradingagents.automation.notifier import build_notifier
 from tradingagents.broker.alpaca_broker import AlpacaBroker
 from tradingagents.broker.models import Account, OrderRequest, Position
@@ -113,6 +114,12 @@ class IntradayOrchestrator:
         # Per-day dedup: (symbol, date) -> bar timestamp of the entry we took.
         # Cleared each session by flatten_all.
         self._entered_today: Dict[str, pd.Timestamp] = {}
+
+        # Daily-cached Minervini regime label. Computed once per session date
+        # from SPY (close > SMA50 AND > SMA200 AND SMA200 rising). Used as a
+        # pre-scan gate when bt_config.minervini_regime_filter is set. See
+        # memory/project_intraday_minervini_gate.md for backtest evidence.
+        self._minervini_regime_cache: Optional[Tuple[date, str]] = None
 
     # ------------------------------------------------------------------ universe
 
@@ -212,6 +219,62 @@ class IntradayOrchestrator:
                     frames[universe_sym] = sym_df
         return frames
 
+    # ------------------------------------------------------------------ regime gate
+
+    def _minervini_regime_today(self) -> Optional[str]:
+        """Minervini market regime label for the prior trading session.
+
+        Cached per session date so the daily warehouse is queried once per
+        scheduler tick day, not per scan tick. Returns None when the gate
+        is disabled, the warehouse is missing, or SPY history is too short.
+        """
+        if self.bt_config.minervini_regime_filter is None:
+            return None
+        today = date.today()
+        if (
+            self._minervini_regime_cache is not None
+            and self._minervini_regime_cache[0] == today
+        ):
+            return self._minervini_regime_cache[1]
+        try:
+            # Fetch a year of SPY daily bars and reuse the same classifier the
+            # backtester uses (`<` boundary — prior session's regime, never
+            # today's close).
+            series = self.backtester._load_minervini_regime(
+                begin=(today - timedelta(days=400)).isoformat(),
+                end=today.isoformat(),
+            )
+            if series.empty:
+                self._minervini_regime_cache = (today, "unknown")
+                return "unknown"
+            today_ts = pd.Timestamp(today)
+            valid = series.loc[series.index < today_ts]
+            label = str(valid.iloc[-1]) if not valid.empty else "unknown"
+        except Exception as e:
+            logger.warning("Minervini regime lookup failed: %s", e)
+            label = "unknown"
+        self._minervini_regime_cache = (today, label)
+        return label
+
+    def _minervini_regime_allows_entry(self) -> bool:
+        """True iff today's prior-session Minervini regime passes the gate.
+
+        Mirrors the backtester logic: with `confirmed_uptrend_only`, only
+        confirmed_uptrend passes; with `any_uptrend`, both confirmed_uptrend
+        and uptrend_under_pressure pass. None / unknown filter → permissive.
+        """
+        filter_mode = self.bt_config.minervini_regime_filter
+        if filter_mode is None:
+            return True
+        regime = self._minervini_regime_today()
+        if regime is None:
+            return True
+        if filter_mode == "confirmed_uptrend_only":
+            return regime == "confirmed_uptrend"
+        if filter_mode == "any_uptrend":
+            return regime in ("confirmed_uptrend", "uptrend_under_pressure")
+        return True
+
     # ------------------------------------------------------------------ scan
 
     def scan(self) -> Dict[str, Any]:
@@ -220,6 +283,19 @@ class IntradayOrchestrator:
         if not self.broker.is_market_open():
             logger.info("Market closed — skipping intraday scan")
             return {"status": "market_closed", "entries": []}
+
+        if not self._minervini_regime_allows_entry():
+            regime = self._minervini_regime_today()
+            logger.info(
+                "Minervini regime gate: skipping scan (regime=%s, filter=%s)",
+                regime, self.bt_config.minervini_regime_filter,
+            )
+            return {
+                "status": "regime_blocked",
+                "regime": regime,
+                "filter": self.bt_config.minervini_regime_filter,
+                "entries": [],
+            }
 
         try:
             account = self.broker.get_account()
@@ -368,7 +444,11 @@ class IntradayOrchestrator:
         # Far-away take-profit so the bracket doesn't short-circuit the EOD
         # flatten exit. NR4 research showed no TP in the winning config; we
         # keep TP as a placeholder to satisfy Alpaca's bracket requirement.
-        tp_pct = float(self.config.get("intraday_bracket_tp_pct", 1.0))
+        # 2026-04-23: default tightened from 1.0 (100% = $1,192 limit on $596
+        # STX, alarming on the dashboard) to 0.20. Still unreachable intraday,
+        # and if a position ever gets stranded overnight the TP is merely
+        # "above a plausible ceiling" rather than in fantasy territory.
+        tp_pct = float(self.config.get("intraday_bracket_tp_pct", 0.20))
 
         try:
             current_price = self.broker.get_latest_price(symbol)
@@ -507,95 +587,149 @@ class IntradayOrchestrator:
     # ------------------------------------------------------------------ flatten
 
     def flatten_all(self) -> Dict[str, Any]:
-        """End-of-day exit: cancel open child orders and market-close positions."""
-        logger.info("=== Intraday Orchestrator: EOD Flatten (dry_run=%s) ===",
-                     self.dry_run)
+        """End-of-day exit: atomically cancel all open orders and market-close
+        every position on this intraday account.
+
+        Uses ``broker.close_all_positions(cancel_orders=True)`` so Alpaca
+        handles the cancel-then-close atomically. The prior per-symbol
+        cancel loop was racing the bracket children — ``get_live_orders``
+        sometimes missed the OCO stop leg, and even when it did cancel,
+        ``close_position`` could fire before Alpaca released
+        ``held_for_orders`` and get rejected with 40310000 (2026-04-23:
+        KDP 420sh and STX 20sh stranded overnight).
+        """
+        logger.info(
+            "=== Intraday Orchestrator: EOD Flatten (dry_run=%s) ===",
+            self.dry_run,
+        )
+        variant_name = self.config.get("variant_name", "intraday_mechanical")
         try:
             positions = self.broker.get_positions()
         except Exception as e:
             logger.error("flatten_all: get_positions failed: %s", e)
+            emit_event(
+                Categories.JOB_FAILED,
+                level="error",
+                variant=variant_name,
+                message="flatten_all: get_positions failed",
+                context={"error": str(e)},
+            )
             return {"error": str(e), "closed": []}
 
+        if not positions:
+            logger.info("flatten_all: no positions to close")
+            self._entered_today.clear()
+            return {"closed": [], "positions_closed": 0, "dry_run": self.dry_run}
+
+        # Capture entry context BEFORE the close so the trade_outcome hook
+        # can use it even if delete_position_state runs first.
+        pos_by_symbol = {p.symbol: p for p in positions}
+        state_by_symbol = {
+            sym: self.db.get_position_state(sym) for sym in pos_by_symbol
+        }
+
         closed: List[Dict[str, Any]] = []
-        for pos in positions:
-            symbol = pos.symbol
-            if self.dry_run:
-                logger.info(
-                    "DRY_RUN: would CLOSE %s %s shares", pos.qty, symbol
-                )
+        if self.dry_run:
+            for symbol, pos in pos_by_symbol.items():
+                logger.info("DRY_RUN: would CLOSE %s %s shares", pos.qty, symbol)
                 closed.append({"symbol": symbol, "closed": False, "dry_run": True})
-                continue
-            try:
-                # get_live_orders (not get_open_orders): OCO/bracket legs sit
-                # in HELD until their trigger fires; OPEN filter misses them,
-                # which leaves held_for_orders == qty and causes close_position
-                # to fail with Alpaca 40310000 on EOD flatten.
-                try:
-                    open_orders = self.broker.get_live_orders(symbol=symbol)
-                except TypeError:
-                    open_orders = self.broker.get_live_orders()
-                for o in open_orders or []:
-                    if str(getattr(o, "symbol", "")).upper() == symbol.upper():
-                        try:
-                            self.broker.cancel_order(o.order_id)
-                        except Exception as e:
-                            logger.debug("cancel_order(%s) failed: %s", o.order_id, e)
-                # Capture entry context BEFORE the SELL so the outcome hook
-                # has it even if delete_position_state races.
-                pos_state_before = self.db.get_position_state(symbol)
-                result = self.broker.close_position(symbol)
-                closed.append({
-                    "symbol": symbol, "closed": True,
-                    "status": getattr(result, "status", None),
-                })
-                fill_price = getattr(result, "filled_avg_price", None)
-                self.db.log_trade(
+            self._entered_today.clear()
+            self._notify_flatten(closed)
+            return {
+                "closed": closed,
+                "positions_closed": len(closed),
+                "dry_run": self.dry_run,
+            }
+
+        try:
+            results = self.broker.close_all_positions()
+        except Exception as e:
+            logger.error("flatten_all: close_all_positions failed: %s", e, exc_info=True)
+            for symbol in pos_by_symbol:
+                emit_event(
+                    Categories.POSITION_STRANDED,
+                    level="error",
+                    variant=variant_name,
                     symbol=symbol,
-                    side="sell",
-                    qty=int(float(pos.qty)),
-                    order_type="market",
-                    status=getattr(result, "status", "submitted"),
-                    filled_qty=getattr(result, "filled_qty", None),
-                    filled_price=fill_price,
-                    order_id=getattr(result, "order_id", None),
-                    reasoning="intraday EOD flatten",
+                    message="flatten_all close_all_positions raised",
+                    context={"error": str(e), "qty": pos_by_symbol[symbol].qty},
                 )
-                # Log the closed-trade outcome for the daily/weekly reviews.
-                # Kill-switched + try/except at the helper level — a hook
-                # failure cannot block the EOD flatten loop.
-                if (
-                    self.config.get("trade_outcome_live_hook_intraday_enabled", True)
-                    and pos_state_before
-                ):
-                    try:
-                        from tradingagents.automation.trade_outcome import log_closed_trade
-                        exit_px = float(fill_price) if fill_price else float(pos.current_price)
-                        log_closed_trade(
-                            db=self.db,
-                            symbol=symbol,
-                            pos_state=pos_state_before,
-                            exit_price=exit_px,
-                            exit_reason="eod_flatten",
-                            broker=self.broker,
-                            excursion_enabled=self.config.get(
-                                "trade_outcome_excursion_enabled", False
-                            ),
-                        )
-                    except Exception as e:
-                        logger.warning(
-                            "intraday flatten trade_outcome hook failed %s: %s",
-                            symbol, e,
-                        )
-                # Always delete the state after a live flatten — the position
-                # is gone at broker, ghost row would confuse the reconciler.
-                self.db.delete_position_state(symbol)
-            except Exception as e:
-                logger.warning("flatten_all: close_position(%s) failed: %s", symbol, e)
-                closed.append({"symbol": symbol, "closed": False, "error": str(e)})
+            self._notify_flatten([])
+            return {"error": str(e), "closed": [], "positions_closed": 0}
+
+        results_by_symbol = {r.symbol.upper(): r for r in results if getattr(r, "symbol", None)}
+
+        for symbol, pos in pos_by_symbol.items():
+            result = results_by_symbol.get(symbol.upper())
+            if result is None:
+                logger.warning(
+                    "flatten_all: no close response for %s — Alpaca may have "
+                    "rejected this one. Position likely still held.",
+                    symbol,
+                )
+                emit_event(
+                    Categories.POSITION_STRANDED,
+                    level="error",
+                    variant=variant_name,
+                    symbol=symbol,
+                    message="flatten_all: no close response from Alpaca",
+                    context={"qty": pos.qty, "avg_entry_price": pos.avg_entry_price},
+                )
+                closed.append({
+                    "symbol": symbol, "closed": False,
+                    "error": "no close response from Alpaca",
+                })
+                continue
+
+            fill_price = getattr(result, "filled_avg_price", None)
+            closed.append({
+                "symbol": symbol, "closed": True,
+                "status": getattr(result, "status", None),
+            })
+            self.db.log_trade(
+                symbol=symbol,
+                side="sell",
+                qty=int(float(pos.qty)),
+                order_type="market",
+                status=getattr(result, "status", "submitted"),
+                filled_qty=getattr(result, "filled_qty", None),
+                filled_price=fill_price,
+                order_id=getattr(result, "order_id", None),
+                reasoning="intraday EOD flatten",
+            )
+            pos_state_before = state_by_symbol.get(symbol)
+            if (
+                self.config.get("trade_outcome_live_hook_intraday_enabled", True)
+                and pos_state_before
+            ):
+                try:
+                    from tradingagents.automation.trade_outcome import log_closed_trade
+                    exit_px = float(fill_price) if fill_price else float(pos.current_price)
+                    log_closed_trade(
+                        db=self.db,
+                        symbol=symbol,
+                        pos_state=pos_state_before,
+                        exit_price=exit_px,
+                        exit_reason="eod_flatten",
+                        broker=self.broker,
+                        excursion_enabled=self.config.get(
+                            "trade_outcome_excursion_enabled", False
+                        ),
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "intraday flatten trade_outcome hook failed %s: %s",
+                        symbol, e,
+                    )
+            self.db.delete_position_state(symbol)
 
         self._entered_today.clear()
         self._notify_flatten(closed)
-        return {"closed": closed, "positions_closed": len(closed), "dry_run": self.dry_run}
+        return {
+            "closed": closed,
+            "positions_closed": sum(1 for c in closed if c.get("closed")),
+            "dry_run": self.dry_run,
+        }
 
     # ------------------------------------------------------------------ aliases / stubs
 

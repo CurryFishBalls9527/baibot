@@ -201,6 +201,17 @@ variants:
         # 1/5 bps is the realistic cost floor we validated against
         execution_half_spread_bps: 1.0
         execution_stop_slippage_bps: 5.0
+        # 2026-04-25: Minervini SPY regime gate (close > SMA50 AND > SMA200
+        # AND SMA200 rising). Blocks the whole intraday scan on days when
+        # the prior session is not confirmed_uptrend. Backtest evidence:
+        # IS R/DD 2.31 → 2.64; 2020 OOS -13.87% → -11.22%; 2018 OOS
+        # -3.70% → -1.45%. Probe passes (no lookahead). Trade count drops
+        # ~30-40%. Both OOS still negative — strategy remains fair-weather
+        # but less bad. See memory/project_intraday_minervini_gate.md.
+        minervini_regime_filter: confirmed_uptrend_only
+        # Minervini regime needs SPY daily history; the orchestrator's
+        # warehouse path is set here (defaults to research_data/market_data.duckdb
+        # in IntradayBacktestConfig — keep that default for live use).
       # Sizer/risk parameters for the orchestrator layer
       max_positions: 6
       default_stop_loss_pct: 0.03

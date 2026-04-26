@@ -223,20 +223,68 @@ class IntradayOrchestratorTests(unittest.TestCase):
         broker.close_position.assert_not_called()
         self.assertEqual(orch._entered_today, {})
 
-    def test_flatten_all_live_cancels_orders_then_closes(self):
+    def test_flatten_all_live_uses_atomic_close_all(self):
+        """Live path delegates to broker.close_all_positions() — atomic
+        cancel+close. The per-symbol cancel loop that raced bracket
+        children (see project_intraday_flatten_race 2026-04-23) is gone."""
         orch, broker, _, _ = _build_orchestrator(dry_run=False)
         broker.get_positions.return_value = [
-            MagicMock(symbol="AAPL", qty=10),
+            MagicMock(symbol="AAPL", qty=10, current_price=150.0),
         ]
-        broker.get_live_orders.return_value = [
-            MagicMock(symbol="AAPL", order_id="stop-1"),
-            MagicMock(symbol="OTHER", order_id="nope-1"),
+        broker.close_all_positions.return_value = [
+            MagicMock(
+                symbol="AAPL", qty=10, order_id="close-1", status="accepted",
+                filled_qty=0, filled_avg_price=None,
+            ),
         ]
         result = orch.flatten_all()
         self.assertEqual(result["positions_closed"], 1)
-        # Only the AAPL open order should be canceled
-        broker.cancel_order.assert_called_once_with("stop-1")
-        broker.close_position.assert_called_once_with("AAPL")
+        broker.close_all_positions.assert_called_once()
+        # Old per-symbol methods are NOT used in the atomic path.
+        broker.close_position.assert_not_called()
+        broker.cancel_order.assert_not_called()
+
+    def test_flatten_all_empty_is_noop(self):
+        orch, broker, _, _ = _build_orchestrator(dry_run=False)
+        broker.get_positions.return_value = []
+        result = orch.flatten_all()
+        self.assertEqual(result["positions_closed"], 0)
+        broker.close_all_positions.assert_not_called()
+
+    def test_flatten_all_missing_close_response_marks_unclosed(self):
+        """If Alpaca drops a symbol from the close-all response, flag it."""
+        orch, broker, _, _ = _build_orchestrator(dry_run=False)
+        broker.get_positions.return_value = [
+            MagicMock(symbol="AAPL", qty=10, current_price=150.0),
+            MagicMock(symbol="MSFT", qty=20, current_price=400.0),
+        ]
+        broker.close_all_positions.return_value = [
+            MagicMock(
+                symbol="AAPL", qty=10, order_id="c-1", status="accepted",
+                filled_qty=0, filled_avg_price=None,
+            ),
+            # MSFT missing — Alpaca rejected close for that one.
+        ]
+        result = orch.flatten_all()
+        closed = {c["symbol"]: c for c in result["closed"]}
+        self.assertTrue(closed["AAPL"]["closed"])
+        self.assertFalse(closed["MSFT"]["closed"])
+        self.assertIn("error", closed["MSFT"])
+        self.assertEqual(result["positions_closed"], 1)
+
+    def test_tp_placeholder_default_is_20pct_not_100pct(self):
+        """Regression: bracket TP placeholder used to be 1.0 (100%) which
+        produced $1,192 limits on $596 stocks. Must be 0.20."""
+        from tradingagents.automation.intraday_orchestrator import IntradayOrchestrator
+        # Inspect the config lookup default by constructing an inert orch via
+        # __new__ and reading config with no override — no broker required.
+        orch = IntradayOrchestrator.__new__(IntradayOrchestrator)
+        orch.config = {}
+        # The default is read inline in _execute_entry via config.get. Ensure
+        # nobody bumps it back up.
+        import inspect
+        src = inspect.getsource(IntradayOrchestrator._execute_entry)
+        self.assertIn('"intraday_bracket_tp_pct", 0.20', src)
 
     def test_aliases_and_stubs(self):
         orch, broker, _, _ = _build_orchestrator()
@@ -248,6 +296,67 @@ class IntradayOrchestratorTests(unittest.TestCase):
         # Noop stubs
         self.assertEqual(orch.run_daily_reflection(), {})
         self.assertEqual(orch.take_market_snapshot(), {})
+
+    def test_minervini_regime_gate_blocks_scan_when_correction(self):
+        """Pre-scan gate returns regime_blocked when filter is set and the
+        live regime label fails. _check_symbol_signal is never called."""
+        orch, broker, _, _ = _build_orchestrator(
+            universe=["AAPL"], dry_run=True,
+            extra_config={"intraday_backtest_config": {
+                "max_positions": 4,
+                "max_position_pct": 0.08,
+                "stop_loss_pct": 0.03,
+                "trail_stop_pct": 0.04,
+                "interval_minutes": 15,
+                "minervini_regime_filter": "confirmed_uptrend_only",
+            }},
+        )
+        # Stub the regime lookup to return market_correction.
+        with patch.object(orch.backtester, "_load_minervini_regime") as load_reg, \
+             patch.object(orch, "_check_symbol_signal") as check_sym:
+            load_reg.return_value = pd.Series(
+                ["market_correction"],
+                index=[pd.Timestamp("2026-04-24")],
+            )
+            result = orch.scan()
+        self.assertEqual(result["status"], "regime_blocked")
+        self.assertEqual(result["filter"], "confirmed_uptrend_only")
+        self.assertEqual(result["entries"], [])
+        check_sym.assert_not_called()  # short-circuited before symbol scan
+
+    def test_minervini_regime_gate_allows_scan_when_uptrend(self):
+        """When regime is confirmed_uptrend, scan proceeds normally."""
+        orch, broker, _, _ = _build_orchestrator(
+            universe=["AAPL"], dry_run=True,
+            extra_config={"intraday_backtest_config": {
+                "max_positions": 4,
+                "max_position_pct": 0.08,
+                "stop_loss_pct": 0.03,
+                "trail_stop_pct": 0.04,
+                "interval_minutes": 15,
+                "minervini_regime_filter": "confirmed_uptrend_only",
+            }},
+        )
+        frame = _make_nr4_signal_frame()
+        with patch.object(orch.backtester, "_load_minervini_regime") as load_reg, \
+             patch.object(orch, "_fetch_bars", return_value={"AAPL": frame}), \
+             patch.object(orch.backtester, "prepare_signals", return_value=frame):
+            load_reg.return_value = pd.Series(
+                ["confirmed_uptrend"],
+                index=[pd.Timestamp("2026-04-24")],
+            )
+            result = orch.scan()
+        # regime allows → at least the entries pipeline ran
+        self.assertNotEqual(result.get("status"), "regime_blocked")
+        self.assertEqual(len(result["entries"]), 1)
+
+    def test_minervini_regime_filter_disabled_is_noop(self):
+        """When filter is None (default), scan never queries the regime."""
+        orch, broker, _, _ = _build_orchestrator(universe=["AAPL"], dry_run=True)
+        with patch.object(orch.backtester, "_load_minervini_regime") as load_reg, \
+             patch.object(orch, "_fetch_bars", return_value={}):
+            orch.scan()
+        load_reg.assert_not_called()
 
     def test_get_status_contains_strategy_tag(self):
         orch, broker, _, _ = _build_orchestrator(
