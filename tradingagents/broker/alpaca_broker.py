@@ -22,6 +22,7 @@ from alpaca.data.requests import StockLatestQuoteRequest
 
 from .base_broker import BaseBroker
 from .models import OrderRequest, OrderResult, Position, Account, MarketClock
+from tradingagents.automation.events import Categories, emit_event
 
 logger = logging.getLogger(__name__)
 
@@ -134,7 +135,30 @@ class AlpacaBroker(BaseBroker):
         else:
             raise ValueError(f"Unsupported order type: {order.order_type}")
 
-        result = self.trading_client.submit_order(req)
+        try:
+            result = self.trading_client.submit_order(req)
+        except APIError as e:
+            code = getattr(e, "code", None)
+            category = (
+                Categories.WASH_TRADE_REJECT
+                if code == 40310000
+                else Categories.ORDER_REJECT
+            )
+            emit_event(
+                category,
+                level="error",
+                symbol=order.symbol,
+                code=str(code or ""),
+                message=f"submit_order rejected: {e}",
+                context={
+                    "side": order.side,
+                    "qty": order.qty,
+                    "order_type": order.order_type,
+                    "stop_price": order.stop_price,
+                    "limit_price": order.limit_price,
+                },
+            )
+            raise
         logger.info(f"Order submitted: {order.side} {order.qty or order.notional} {order.symbol} -> {result.status}")
         return self._to_order_result(result)
 
@@ -190,10 +214,31 @@ class AlpacaBroker(BaseBroker):
             # SL-distance against the fresh price, retry once.
             msg = str(e)
             if e.code != 42210000 or "stop_loss" not in msg or "base_price" not in msg:
+                emit_event(
+                    Categories.ORDER_REJECT,
+                    level="error",
+                    symbol=order.symbol,
+                    code=str(getattr(e, "code", "") or ""),
+                    message=f"bracket submit rejected: {e}",
+                    context={
+                        "anchor_price": anchor_price,
+                        "sl_submit": sl_submit,
+                        "tp_submit": tp_submit,
+                        "tif": str(tif),
+                    },
+                )
                 raise
             fresh_price = self.get_latest_price(order.symbol)
             if fresh_price <= 0:
                 # Quote fetch failed — can't recover; bubble up.
+                emit_event(
+                    Categories.ORDER_REJECT,
+                    level="error",
+                    symbol=order.symbol,
+                    code="42210000",
+                    message="stale-quote retry aborted — fresh quote unavailable",
+                    context={"anchor_price": anchor_price, "sl_submit": sl_submit},
+                )
                 raise
             sl_pct = (anchor_price - stop_loss_price) / anchor_price if anchor_price else 0.03
             new_sl = round(min(fresh_price * (1 - sl_pct), fresh_price - 0.01), 2)
@@ -212,7 +257,36 @@ class AlpacaBroker(BaseBroker):
                 take_profit={"limit_price": tp_submit},
             )
             sl_submit = new_sl
-            result = self.trading_client.submit_order(req)
+            try:
+                result = self.trading_client.submit_order(req)
+            except APIError as retry_e:
+                emit_event(
+                    Categories.ORDER_REJECT,
+                    level="error",
+                    symbol=order.symbol,
+                    code=str(getattr(retry_e, "code", "") or "42210000"),
+                    message=f"stale-quote retry exhausted: {retry_e}",
+                    context={
+                        "anchor_price": anchor_price,
+                        "fresh_price": fresh_price,
+                        "sl_old": stop_loss_price,
+                        "sl_new": new_sl,
+                    },
+                )
+                raise
+            emit_event(
+                Categories.STALE_QUOTE_RETRY,
+                level="info",
+                symbol=order.symbol,
+                code="42210000",
+                message="stale-quote retry recovered",
+                context={
+                    "anchor_price": anchor_price,
+                    "fresh_price": fresh_price,
+                    "sl_old": stop_loss_price,
+                    "sl_new": new_sl,
+                },
+            )
         logger.info(
             f"Bracket order: BUY {order.qty} {order.symbol} "
             f"SL=${sl_submit:.2f} TP=${tp_submit:.2f} -> {result.status}"
@@ -240,6 +314,18 @@ class AlpacaBroker(BaseBroker):
                 f"{order.symbol}: bracket submitted but leg IDs still missing after "
                 f"refetch (stop={out.stop_order_id} tp={out.tp_order_id}). Broker-side "
                 f"stop ratcheting will be disabled for this position until backfill."
+            )
+            emit_event(
+                Categories.BRACKET_LEG_MISSING,
+                level="error",
+                symbol=order.symbol,
+                message="bracket submitted but leg IDs missing after refetch",
+                context={
+                    "parent_id": str(result.id),
+                    "stop_order_id": out.stop_order_id,
+                    "tp_order_id": out.tp_order_id,
+                    "filled_avg_price": out.filled_avg_price,
+                },
             )
         out.effective_stop_price = sl_submit
         out.effective_take_profit_price = tp_submit
@@ -284,6 +370,10 @@ class AlpacaBroker(BaseBroker):
 
         Used by ExitManagerV2 to ratchet the stop leg of a bracket OCO as the
         trailing stop moves up. Returns the new OrderResult or None on failure.
+
+        Failures emit `WASH_TRADE_REJECT` (code 40310000) or `ORDER_REJECT`
+        events at error-level so the watchdog's `check_event_tail` escalates
+        them — silent ratchet rejects were a known watchdog blind spot.
         """
         kwargs = {}
         if stop_price is not None:
@@ -297,8 +387,30 @@ class AlpacaBroker(BaseBroker):
         req = ReplaceOrderRequest(**kwargs)
         try:
             raw = self.trading_client.replace_order_by_id(order_id, req)
+        except APIError as e:
+            code = getattr(e, "code", None)
+            category = (
+                Categories.WASH_TRADE_REJECT
+                if code == 40310000
+                else Categories.ORDER_REJECT
+            )
+            emit_event(
+                category,
+                level="error",
+                code=str(code or ""),
+                message=f"replace_order rejected: {e}",
+                context={"order_id": order_id, **kwargs},
+            )
+            logger.error(f"replace_order({order_id}, {kwargs}) failed: {e}")
+            return None
         except Exception as e:
-            logger.warning(f"replace_order({order_id}, {kwargs}) failed: {e}")
+            emit_event(
+                Categories.ORDER_REJECT,
+                level="error",
+                message=f"replace_order failed (non-API): {e}",
+                context={"order_id": order_id, **kwargs},
+            )
+            logger.error(f"replace_order({order_id}, {kwargs}) failed: {e}")
             return None
         logger.info(f"Order replaced: {order_id} {kwargs} -> {raw.id}")
         return self._to_order_result(raw)

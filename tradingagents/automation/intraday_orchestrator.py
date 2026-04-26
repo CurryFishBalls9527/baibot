@@ -251,7 +251,11 @@ class IntradayOrchestrator:
             valid = series.loc[series.index < today_ts]
             label = str(valid.iloc[-1]) if not valid.empty else "unknown"
         except Exception as e:
-            logger.warning("Minervini regime lookup failed: %s", e)
+            # Error-level (not warning) so the watchdog log_error_sweep
+            # escalates this. Falling through to "unknown" label is
+            # permissive (allows entries) — silent fall-through was a
+            # known watchdog blind spot.
+            logger.error("Minervini regime lookup failed: %s", e)
             label = "unknown"
         self._minervini_regime_cache = (today, label)
         return label
