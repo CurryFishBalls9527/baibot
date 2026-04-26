@@ -1779,6 +1779,66 @@ def test_backtest_atr_falls_back_to_pct_when_atr_missing(monkeypatch):
     assert abs(float(trade["exit_price"]) - 97.0) < 1e-6
 
 
+def test_minervini_regime_filter_disabled_returns_empty(monkeypatch):
+    """When `minervini_regime_filter` is None, _load_minervini_regime is a
+    no-op and returns an empty Series — no MarketDataWarehouse open."""
+    cfg = IntradayBacktestConfig(minervini_regime_filter=None)
+    bt = IntradayBreakoutBacktester(cfg)
+    out = bt._load_minervini_regime("2024-01-01", "2024-12-31")
+    assert out.empty
+
+
+def test_minervini_regime_filter_classifies_correctly(monkeypatch):
+    """End-to-end Minervini regime label given a synthetic SPY frame.
+
+    confirmed_uptrend  = close > sma_50 AND close > sma_200 AND sma_200 rising
+    uptrend_pressure   = close > sma_200 (but failing one of the others)
+    market_correction  = close <= sma_200
+    """
+    cfg = IntradayBacktestConfig(
+        minervini_regime_filter="any_uptrend",
+        daily_db_path="/dev/null",  # never read; warehouse is monkeypatched
+    )
+    bt = IntradayBreakoutBacktester(cfg)
+
+    # SPY frame needs 200 + 20 warm-up bars before sma_200_20d_ago is defined,
+    # then enough post-warmup bars to test classification. Use 500 bars: 220
+    # of slow uptrend (warm-up + early trend), then 250 of strong uptrend
+    # (clear confirmed_uptrend), then 30 of correction.
+    n = 500
+    dates = pd.date_range("2023-01-02", periods=n, freq="B")
+    close = pd.Series(100.0, index=dates)
+    for i in range(1, 470):
+        close.iloc[i] = close.iloc[i - 1] * 1.002  # slow steady uptrend
+    for i in range(470, n):
+        close.iloc[i] = close.iloc[i - 1] * 0.99   # sharp correction
+    spy = pd.DataFrame({
+        "open": close, "high": close * 1.001, "low": close * 0.999,
+        "close": close, "adj_close": close, "volume": 1_000_000,
+    })
+    spy.index.name = "trade_date"
+
+    class StubWarehouse:
+        def __init__(self, *a, **kw): ...
+        def get_daily_bars(self, sym, b, e):
+            return spy if sym == "SPY" else None
+        def close(self): ...
+
+    monkeypatch.setattr(
+        "tradingagents.research.intraday_backtester.MarketDataWarehouse",
+        StubWarehouse,
+    )
+
+    regime = bt._load_minervini_regime("2024-06-01", "2024-12-31")
+    counts = regime.value_counts().to_dict()
+    # Clear uptrend window post-warmup should produce many confirmed_uptrend.
+    assert counts.get("confirmed_uptrend", 0) > 100
+    # The 30-bar crash at the end produces some market_correction labels.
+    assert counts.get("market_correction", 0) >= 5
+    # Warmup bars before SMA200/SMA200_20d_ago are defined are masked unknown.
+    assert counts.get("unknown", 0) > 0
+
+
 def test_prepare_symbol_features_computes_atr_column():
     """ATR is a rolling mean of true range; verifiable on a hand-built frame."""
     config = IntradayBacktestConfig(atr_period_bars=3)

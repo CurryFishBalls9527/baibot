@@ -133,6 +133,14 @@ class IntradayBacktestConfig:
     # market_score >= this threshold. None disables. Uses same `<` boundary as
     # daily_trend_filter to avoid same-day lookahead.
     market_context_min_score: Optional[int] = None
+    # Minervini regime gate (SPY price > SMA50 AND > SMA200 AND SMA200 rising)
+    # from tradingagents.research.minervini.analyze_market_regime. Different
+    # signal from the SPY/QQQ composite above. Values:
+    #   None                       - disabled (default)
+    #   "any_uptrend"              - allow confirmed_uptrend OR uptrend_under_pressure
+    #   "confirmed_uptrend_only"   - allow confirmed_uptrend only
+    # Uses same `<` boundary as daily_trend_filter to avoid same-day lookahead.
+    minervini_regime_filter: Optional[str] = None
     daily_db_path: str = "research_data/market_data.duckdb"
 
 
@@ -929,6 +937,47 @@ class IntradayBreakoutBacktester:
             warehouse.close()
         return trend_map
 
+    def _load_minervini_regime(self, begin: str, end: str) -> pd.Series:
+        """Per-session Minervini regime label from SPY daily bars.
+
+        Computes for each session the Minervini market regime
+        (`confirmed_uptrend` / `uptrend_under_pressure` / `market_correction`)
+        using SPY's close vs SMA50/SMA200 + SMA200 rising — the same rule as
+        `MinerviniPreScreener.analyze_market_regime`. Pre-buffers SMA200 with
+        ~250 trading days. Indexed by date (midnight-normalized) and intended
+        to be queried with strict `<` boundary against the intraday session
+        date — same convention as `daily_trend_filter` to avoid lookahead.
+
+        Returns empty Series when filter disabled or SPY unavailable.
+        """
+        if self.config.minervini_regime_filter is None:
+            return pd.Series(dtype="object")
+        # Pre-buffer ~400 trading days for SMA200 + 20-day-prior comparison.
+        buffer_begin = (pd.Timestamp(begin) - pd.Timedelta(days=400)).strftime("%Y-%m-%d")
+        warehouse = MarketDataWarehouse(self.config.daily_db_path, read_only=True)
+        try:
+            spy = warehouse.get_daily_bars("SPY", buffer_begin, end)
+        finally:
+            warehouse.close()
+        if spy is None or spy.empty:
+            return pd.Series(dtype="object")
+        spy = spy.copy().sort_index()
+        # Compute the same fields MinerviniPreScreener.prepare_features uses:
+        # close, sma_50, sma_200, sma_200_20d_ago.
+        spy["sma_50"] = spy["close"].rolling(50, min_periods=50).mean()
+        spy["sma_200"] = spy["close"].rolling(200, min_periods=200).mean()
+        spy["sma_200_20d_ago"] = spy["sma_200"].shift(20)
+        above_50 = spy["close"] > spy["sma_50"]
+        above_200 = spy["close"] > spy["sma_200"]
+        rising_200 = spy["sma_200"] > spy["sma_200_20d_ago"]
+        regime = pd.Series("market_correction", index=spy.index, dtype="object")
+        regime[above_200] = "uptrend_under_pressure"
+        regime[above_50 & above_200 & rising_200] = "confirmed_uptrend"
+        # Mask sessions where SMA hasn't warmed up.
+        regime[spy["sma_200"].isna() | spy["sma_50"].isna()] = "unknown"
+        regime.index = pd.to_datetime(regime.index).normalize()
+        return regime
+
     def _load_market_context_score(self, begin: str, end: str) -> pd.Series:
         """Composite SPY/QQQ/IWM/SMH/^VIX score (0-8) per session date.
 
@@ -996,6 +1045,7 @@ class IntradayBreakoutBacktester:
         data_by_symbol = self._load_intraday_bars(db_path, symbols, begin, end)
         daily_trend = self._load_daily_trend_filter(symbols, begin, end)
         market_context_score = self._load_market_context_score(begin, end)
+        minervini_regime_series = self._load_minervini_regime(begin, end)
         prepared = {
             symbol: self._prepare_symbol_features(df)
             for symbol, df in data_by_symbol.items()
@@ -1376,6 +1426,29 @@ class IntradayBreakoutBacktester:
                         ctx_valid = market_context_score.loc[market_context_score.index < ctx_day]
                         if ctx_valid.empty or int(ctx_valid.iloc[-1]) < int(self.config.market_context_min_score):
                             candidate["filter_reason"] = "market_context_filter"
+                            candidate_log.append(candidate)
+                            continue
+                    if self.config.minervini_regime_filter is not None:
+                        if minervini_regime_series.empty:
+                            candidate["filter_reason"] = "missing_minervini_regime"
+                            candidate_log.append(candidate)
+                            continue
+                        mreg_day = pd.Timestamp(ts.date())
+                        # Same `<` boundary — prior session's regime label.
+                        mreg_valid = minervini_regime_series.loc[minervini_regime_series.index < mreg_day]
+                        if mreg_valid.empty:
+                            candidate["filter_reason"] = "missing_minervini_regime"
+                            candidate_log.append(candidate)
+                            continue
+                        prior_regime = str(mreg_valid.iloc[-1])
+                        if self.config.minervini_regime_filter == "confirmed_uptrend_only":
+                            allowed = prior_regime == "confirmed_uptrend"
+                        elif self.config.minervini_regime_filter == "any_uptrend":
+                            allowed = prior_regime in ("confirmed_uptrend", "uptrend_under_pressure")
+                        else:
+                            allowed = True  # unknown filter value → permissive
+                        if not allowed:
+                            candidate["filter_reason"] = "minervini_regime_filter"
                             candidate_log.append(candidate)
                             continue
                     if self.config.allow_relative_volume_filter:
