@@ -127,6 +127,85 @@ class DuckDBIntradayAPI(CCommonStockApi):
 DEFAULT_DAILY_DB_PATH = "research_data/market_data.duckdb"
 
 
+class DuckDBWeeklyAPI(CCommonStockApi):
+    """Feed chan.py weekly bars resampled on the fly from market_data.duckdb daily bars.
+
+    Each emitted bar represents one ISO week (Mon-Sun grouping):
+        open   = first daily open in the week
+        high   = max daily high
+        low    = min daily low
+        close  = last daily close
+        volume = sum daily volume
+        time   = last trading date in the week (typically Friday)
+    """
+
+    DB_PATH: str = DEFAULT_DAILY_DB_PATH
+
+    def __init__(self, code, k_type=KL_TYPE.K_WEEK, begin_date=None, end_date=None, autype=None):
+        super().__init__(code, k_type, begin_date, end_date, autype)
+
+    def get_kl_data(self) -> Iterator[CKLine_Unit]:
+        if self.k_type != KL_TYPE.K_WEEK:
+            raise ValueError(f"DuckDBWeeklyAPI only supports K_WEEK (got {self.k_type})")
+        if not Path(self.DB_PATH).exists():
+            raise FileNotFoundError(f"Daily warehouse not found: {self.DB_PATH}")
+
+        conn = duckdb.connect(self.DB_PATH, read_only=True)
+        try:
+            sql = """
+                WITH d AS (
+                    SELECT trade_date, open, high, low, close, volume,
+                           date_trunc('week', trade_date) AS week_start
+                    FROM daily_bars
+                    WHERE symbol = ?
+            """
+            params: list = [self.code]
+            if self.begin_date:
+                sql += " AND trade_date >= ?"
+                params.append(self.begin_date)
+            if self.end_date:
+                sql += " AND trade_date <= ?"
+                params.append(self.end_date)
+            sql += """
+                )
+                SELECT
+                    MAX(trade_date)                            AS week_end,
+                    arg_min(open, trade_date)                  AS open,
+                    MAX(high)                                  AS high,
+                    MIN(low)                                   AS low,
+                    arg_max(close, trade_date)                 AS close,
+                    SUM(COALESCE(volume, 0))                   AS volume
+                FROM d
+                GROUP BY week_start
+                ORDER BY week_end
+            """
+            rows = conn.execute(sql, params).fetchall()
+        finally:
+            conn.close()
+
+        for dt, o, h, l, c, v in rows:
+            item = {
+                DATA_FIELD.FIELD_TIME: CTime(dt.year, dt.month, dt.day, 0, 0),
+                DATA_FIELD.FIELD_OPEN: float(o),
+                DATA_FIELD.FIELD_HIGH: float(h),
+                DATA_FIELD.FIELD_LOW: float(l),
+                DATA_FIELD.FIELD_CLOSE: float(c),
+                DATA_FIELD.FIELD_VOLUME: float(v) if v else 0.0,
+            }
+            yield CKLine_Unit(item)
+
+    def SetBasciInfo(self):
+        pass
+
+    @classmethod
+    def do_init(cls):
+        pass
+
+    @classmethod
+    def do_close(cls):
+        pass
+
+
 class DuckDBDailyAPI(CCommonStockApi):
     """Feed chan.py from daily bars in market_data.duckdb."""
 

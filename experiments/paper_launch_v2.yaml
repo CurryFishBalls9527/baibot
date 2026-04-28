@@ -11,22 +11,27 @@ status: running
 reconciler_enabled: true
 reconciler_interval_minutes: 5
 
-# Six-variant paper trading:
+# Six-active variant paper trading:
 #   mechanical         — pure Minervini rule-based entries, ExitManager v1 (existing)
 #   llm                — full agent pipeline, ExitManager v1 (existing)
-#   chan               — Chan 缠论 structural signals + RS filter (existing)
+#   chan (RETIRED 2026-04-27 — Alpaca paper account deleted; chan_daily uses fresh account)
 #   mechanical_v2      — same as mechanical + ExitManager v2 (B1→B4L parity)
 #   chan_v2            — Chan + dead money stop, MA trend filter, regime gate
-#   intraday_mechanical — NR4 + gap-reclaim 15m breakout, EOD flatten (new)
+#   intraday_mechanical — NR4 + gap-reclaim 15m breakout, EOD flatten
+#   chan_daily         — Daily-bar Donchian + seg-BSP candidate (NEW 2026-04-27)
+#                          — driven by ChanDailyOrchestrator (strategy_type=chan_daily)
+#                          — auto-scheduled via swing_analysis tick (15:30 ET)
+#                          — uses its own fresh Alpaca paper account
 #
 # Each variant uses a SEPARATE Alpaca paper account and SQLite db.
 # Set these env vars in .env before running:
 #   ALPACA_MECHANICAL_API_KEY,      ALPACA_MECHANICAL_SECRET_KEY
 #   ALPACA_LLM_API_KEY,             ALPACA_LLM_SECRET_KEY
-#   ALPACA_CHAN_API_KEY,            ALPACA_CHAN_SECRET_KEY
+#   ALPACA_CHAN_API_KEY,            ALPACA_CHAN_SECRET_KEY        (RETIRED — chan v1 account deleted)
 #   ALPACA_MECHANICAL_V2_API_KEY,   ALPACA_MECHANICAL_V2_SECRET_KEY
 #   ALPACA_CHAN_V2_API_KEY,         ALPACA_CHAN_V2_SECRET_KEY
 #   ALPACA_V2_INTRADAY_API_KEY,     ALPACA_V2_INTRADAY_SECRET_KEY
+#   ALPACA_CHAN_DAILY_API_KEY,      ALPACA_CHAN_DAILY_SECRET_KEY
 
 variants:
   - name: mechanical
@@ -65,23 +70,28 @@ variants:
       trail_stop_pct_pressure: 0.10
       trail_stop_pct_correction: 0.07
 
-  - name: chan
-    description: Chan 缠论 structural signals with RS top-15% filter
-    alpaca_api_key: "${ALPACA_CHAN_API_KEY}"
-    alpaca_secret_key: "${ALPACA_CHAN_SECRET_KEY}"
-    db_path: trading_chan.db
-    config_overrides:
-      strategy_type: chan
-      chan_intraday_db: research_data/intraday_30m_broad.duckdb
-      chan_daily_db: research_data/market_data.duckdb
-      chan_rs_top_pct: 0.15
-      chan_rs_lookback_days: 126
-      chan_buy_types: ["T1", "T2", "T2S"]
-      chan_filter_macd_zero: true
-      chan_filter_divergence_max: 0.6
-      max_positions: 8
-      default_stop_loss_pct: 0.05
-      default_take_profit_pct: 0.15
+  # 2026-04-27: chan variant PAUSED — chan_daily reuses this Alpaca account
+  # (avoid opening a new paper account). chan v1's existing positions can stay
+  # open; they'll close via their own bracket stops. chan_daily ignores any
+  # held symbol not in its 16-ETF universe (single-stock chan v1 holdings are
+  # safe — chan_daily skips them automatically). To resume chan v1, uncomment.
+  # - name: chan
+  #   description: Chan 缠论 structural signals with RS top-15% filter
+  #   alpaca_api_key: "${ALPACA_CHAN_API_KEY}"
+  #   alpaca_secret_key: "${ALPACA_CHAN_SECRET_KEY}"
+  #   db_path: trading_chan.db
+  #   config_overrides:
+  #     strategy_type: chan
+  #     chan_intraday_db: research_data/intraday_30m_broad.duckdb
+  #     chan_daily_db: research_data/market_data.duckdb
+  #     chan_rs_top_pct: 0.15
+  #     chan_rs_lookback_days: 126
+  #     chan_buy_types: ["T1", "T2", "T2S"]
+  #     chan_filter_macd_zero: true
+  #     chan_filter_divergence_max: 0.6
+  #     max_positions: 8
+  #     default_stop_loss_pct: 0.05
+  #     default_take_profit_pct: 0.15
 
   - name: mechanical_v2
     description: Mechanical + ExitManager v2 (B4L parity — regime trail, breakeven +8%, dead-money, partial-off, broker stop ratcheting)
@@ -132,6 +142,29 @@ variants:
       # v2 addition: dead money at 150 bars (+10.9pp return in backtest)
       chan_dead_money_bars: 150
       chan_dead_money_min_gain: 0.05
+
+  - name: chan_daily
+    description: |
+      Daily-bar Donchian-30 breakout OR segment-level Chan BSP entries on 16
+      macro+sector ETFs. Chan T1 sell exit + structural stop + 100-bar time stop.
+      ATR-parity sizing 4x (risk 2% / position cap 25%) with momentum-priority
+      queue. Driver: ChanDailyOrchestrator via swing_analysis cron (15:30 ET).
+      Backtest: 9.5% annual / -11% max DD / Calmar 1.18 across 2014-2025.
+      See SUMMARY_OPTIMIZATION_FINAL.md.
+    alpaca_api_key: "${ALPACA_CHAN_DAILY_API_KEY}"
+    alpaca_secret_key: "${ALPACA_CHAN_DAILY_SECRET_KEY}"
+    db_path: trading_chan_daily.db
+    config_overrides:
+      strategy_type: chan_daily
+      # NEW NEW OPTIMAL config from research sweeps. Do NOT change without re-running
+      # backtests in scripts/sweep_chan_optimization.py + scripts/sweep_chan_phase2.py.
+      risk_per_trade: 0.020
+      position_pct: 0.25
+      max_positions: 6
+      daily_db_path: research_data/market_data.duckdb
+      chan_daily_universe:
+        [SPY, QQQ, IWM, DIA, GLD, SLV, TLT, USO,
+         XLF, XLE, XLK, XLV, XLI, XLY, XLP, XLU]
 
   - name: intraday_mechanical
     description: ORB + NR4 + gap-reclaim 15m breakout on broad250, EOD flatten

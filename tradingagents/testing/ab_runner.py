@@ -23,6 +23,9 @@ def _build_orchestrator(variant_config: dict):
     if strategy_type == "chan":
         from tradingagents.automation.chan_orchestrator import ChanOrchestrator
         return ChanOrchestrator(variant_config)
+    if strategy_type == "chan_daily":
+        from tradingagents.automation.chan_daily_orchestrator import ChanDailyOrchestrator
+        return ChanDailyOrchestrator(variant_config)
     if strategy_type == "intraday_mechanical":
         from tradingagents.automation.intraday_orchestrator import IntradayOrchestrator
         return IntradayOrchestrator(variant_config)
@@ -43,15 +46,21 @@ def _shared_writer_key(orch) -> str:
     with multiple columns to the single column adj_close"). IntradayOrchestrator
     fetches bars per-scan directly from Alpaca so it has no shared writer.
     """
+    import os
     from tradingagents.automation.chan_orchestrator import ChanOrchestrator
+    from tradingagents.automation.chan_daily_orchestrator import ChanDailyOrchestrator
     from tradingagents.automation.orchestrator import Orchestrator
     if isinstance(orch, ChanOrchestrator):
-        return f"chan_intraday:{orch.intraday_db}"
+        return f"chan_intraday:{os.path.abspath(orch.intraday_db)}"
+    if isinstance(orch, ChanDailyOrchestrator):
+        # Daily strategy contends on market_data.duckdb during _refresh_daily_data —
+        # serialize against minervini variants that also write daily bars.
+        return f"minervini:{os.path.abspath(orch.daily_db)}"
     if isinstance(orch, Orchestrator):
         db_path = orch.config.get(
             "minervini_db_path", "research_data/market_data.duckdb"
         )
-        return f"minervini:{db_path}"
+        return f"minervini:{os.path.abspath(db_path)}"
     return f"indep:{id(orch)}"
 
 
@@ -190,11 +199,18 @@ class ABRunner:
 
     def run_intraday_scan(self) -> Dict[str, Dict]:
         """Run intraday scans (Chan: 30m signals; intraday_mechanical: 15m NR4 scan;
-        others: Minervini entry price checks)."""
+        others: Minervini entry price checks).
+
+        chan_daily is skipped here — it's a daily-cadence strategy that does its
+        scan via run_daily_analysis (called from the daily cron tick), not here.
+        """
         from tradingagents.automation.chan_orchestrator import ChanOrchestrator
+        from tradingagents.automation.chan_daily_orchestrator import ChanDailyOrchestrator
         from tradingagents.automation.intraday_orchestrator import IntradayOrchestrator
 
         def _dispatch(_name: str, orch) -> Dict:
+            if isinstance(orch, ChanDailyOrchestrator):
+                return {"status": "not_applicable_daily_cadence"}
             if isinstance(orch, ChanOrchestrator):
                 return orch.run_daily_analysis()
             if isinstance(orch, IntradayOrchestrator):

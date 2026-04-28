@@ -14,6 +14,10 @@ VARIANT_COLORS = {
     "mechanical": "#4caf50",
     "llm": "#2196f3",
     "chan": "#ff9800",
+    "mechanical_v2": "#8bc34a",        # lighter green
+    "chan_v2": "#ffb74d",              # lighter orange
+    "intraday_mechanical": "#9c27b0",  # purple
+    "chan_daily": "#e91e63",           # pink — distinct from chan/chan_v2 oranges
 }
 
 _DEFAULT_EXPERIMENT = "experiments/paper_launch_v2.yaml"
