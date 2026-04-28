@@ -116,6 +116,7 @@ def _make_config(args: argparse.Namespace) -> ChanDailyBacktestConfig:
         volume_confirm_lookback=args.volume_confirm_lookback,
         volume_confirm_mult=args.volume_confirm_mult,
         trend_type_filter_mode=args.trend_type_filter,
+        require_bi_up_at_entry=args.require_bi_up,
     )
 
 
@@ -308,6 +309,9 @@ def parse_args() -> argparse.Namespace:
                    help="走势类型 gate. trend_only=block during active ZS (consolidation). "
                         "up_segseg_only=require confirmed up segseg. "
                         "up_trend_strict=both.")
+    p.add_argument("--require-bi-up", action="store_true",
+                   help="同级别分解: only enter when last bi is confirmed UP "
+                        "(pullback bottomed). Avoids chasing mid-decline.")
     p.add_argument("--out-dir", default="results/chan_daily_etf")
     return p.parse_args()
 

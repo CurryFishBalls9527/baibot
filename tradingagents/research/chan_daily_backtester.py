@@ -145,6 +145,12 @@ class ChanDailyBacktestConfig:
     volume_confirm_lookback: int = 20
     volume_confirm_mult: float = 1.5
 
+    # Same-level decomposition (同级别分解): only enter when most recent bi is
+    # confirmed UP — i.e., a pullback has bottomed and reversed. Avoids "chasing"
+    # entries mid-decline. This is the canonical Chan workflow: signal at level X
+    # tells you direction; sub-structure (latest confirmed up-bi) gives timing.
+    require_bi_up_at_entry: bool = False
+
     # Trend-type gate (走势类型): refines segseg gate with ZS-state condition.
     # Modes:
     #   "off"           — no filter (default)
@@ -458,6 +464,17 @@ class PortfolioChanDailyBacktester:
                         segseg_dir = None
                         segseg_is_sure = None
 
+                    # ----- Last bi direction + sure (同级别分解 timing signal) -----
+                    last_bi_dir: Optional[str] = None
+                    last_bi_sure: Optional[bool] = None
+                    try:
+                        if lvl.bi_list and len(lvl.bi_list) > 0:
+                            lb = lvl.bi_list[-1]
+                            last_bi_dir = "up" if lb.dir.name == "UP" else "down"
+                            last_bi_sure = bool(getattr(lb, "is_sure", False))
+                    except Exception:
+                        pass
+
                     # ----- Last ZS state (中枢 metadata) -----
                     zs_div: Optional[bool] = None
                     zs_broken: Optional[bool] = None
@@ -497,7 +514,7 @@ class PortfolioChanDailyBacktester:
 
                     if (buy_match or sell_match or seg_buy_match or seg_sell_match
                             or segseg_dir is not None or zs_div is not None or zs_broken is not None
-                            or zs_high is not None):
+                            or zs_high is not None or last_bi_dir is not None):
                         sym_signals[date] = {
                             "buy": buy_match, "sell": sell_match,
                             "seg_buy": seg_buy_match, "seg_sell": seg_sell_match,
@@ -509,6 +526,8 @@ class PortfolioChanDailyBacktester:
                             "zs_low": zs_low,
                             "zs_sure": zs_sure,
                             "zs_active": zs_active,
+                            "last_bi_dir": last_bi_dir,
+                            "last_bi_sure": last_bi_sure,
                         }
             except Exception as e:
                 log.warning("Daily Chan failed for %s: %s", sym, e)
@@ -1029,6 +1048,13 @@ class PortfolioChanDailyBacktester:
                         weekly_long_ok = wd == "up"
                         weekly_short_ok = wd == "down"
 
+                # Same-level decomposition gate: only enter when last bi is up + sure
+                bi_timing_ok = True
+                if cfg.require_bi_up_at_entry:
+                    lbd = sig.get("last_bi_dir")
+                    lbs = sig.get("last_bi_sure")
+                    bi_timing_ok = (lbd == "up") and bool(lbs)
+
                 # Trend-type gate (走势类型)
                 trend_type_long_ok = True
                 if cfg.trend_type_filter_mode != "off":
@@ -1204,7 +1230,7 @@ class PortfolioChanDailyBacktester:
                     if sig.get("sell"):
                         short_signal = {"types_str": sig["sell"]["types_str"], "ref_price": sig["sell"]["bi_high"]}
 
-                if cfg.enable_longs and long_signal and trend_long_ok and momentum_long_ok and weekly_long_ok and segseg_long_ok and zs_div_ok and vix_ok and trend_type_long_ok:
+                if cfg.enable_longs and long_signal and trend_long_ok and momentum_long_ok and weekly_long_ok and segseg_long_ok and zs_div_ok and vix_ok and trend_type_long_ok and bi_timing_ok:
                     pending_entries.append({
                         "symbol": sym,
                         "direction": "long",
