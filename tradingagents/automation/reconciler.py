@@ -12,8 +12,12 @@ the DB/broker divergence modes documented in
   - ID mismatch (DB leg IDs point to cancelled orders) → update to live
   - orphan positions (Alpaca has position, DB has no row) → insert
 
-Additive by design at the broker level: this reads broker state and
-writes ONLY to local SQLite. It never submits, cancels, or modifies orders.
+Mostly read-only at the broker level: it reads broker state and writes
+to local SQLite. The broker-side actions are narrowly scoped to keep the
+DB and broker in sync:
+  - `_sync_broker_stops` → replace_order to push a DB-ratcheted stop.
+  - `_recover_stale_stop` → submit a fresh stop when DB has an order_id
+    but the broker has no live SL leg (auto-recovers from naked positions).
 """
 
 from __future__ import annotations
@@ -22,7 +26,9 @@ import logging
 from datetime import date, datetime, timedelta
 from typing import List, Optional
 
+from tradingagents.automation.events import Categories, emit_event
 from tradingagents.broker.base_broker import BaseBroker
+from tradingagents.broker.models import OrderRequest
 from tradingagents.storage.database import TradingDatabase
 
 logger = logging.getLogger(__name__)
@@ -424,6 +430,14 @@ class OrderReconciler:
             try:
                 self.db.delete_position_state(sym)
                 ghosts += 1
+                emit_event(
+                    Categories.DRIFT_DETECTED,
+                    level="info",
+                    variant=self.variant,
+                    symbol=sym,
+                    message="ghost position_state deleted (no broker position held)",
+                    context={"mode": "ghost"},
+                )
                 logger.info(
                     "reconciler[%s]: ghost position_state deleted for %s "
                     "(no broker position held)",
@@ -481,6 +495,19 @@ class OrderReconciler:
                 try:
                     self.db.upsert_position_state(sym, state)
                     orphans += 1
+                    emit_event(
+                        Categories.DRIFT_DETECTED,
+                        level="info",
+                        variant=self.variant,
+                        symbol=sym,
+                        message="orphan position imported into DB",
+                        context={
+                            "mode": "orphan",
+                            "entry_price": entry_price,
+                            "stop_price": float(stop_price),
+                            "qty": float(pos.qty),
+                        },
+                    )
                     logger.info(
                         "reconciler[%s]: imported orphan position %s "
                         "(entry=$%.2f, stop=$%.2f, qty=%s)",
@@ -518,6 +545,19 @@ class OrderReconciler:
                     try:
                         self.db.upsert_position_state(sym, updates)
                         id_fixes += 1
+                        emit_event(
+                            Categories.DRIFT_DETECTED,
+                            level="info",
+                            variant=self.variant,
+                            symbol=sym,
+                            message="position_state leg IDs reconciled",
+                            context={
+                                "mode": "id_drift",
+                                "updates": {
+                                    k: str(v)[:8] for k, v in updates.items()
+                                },
+                            },
+                        )
                         logger.info(
                             "reconciler[%s]: %s leg IDs updated (%s)",
                             self.variant or "-", sym,
@@ -531,12 +571,231 @@ class OrderReconciler:
                             "reconciler: upsert IDs %s failed: %s", sym, e
                         )
 
+            # Stale stop-id recovery: DB has a stop_order_id but no live SL
+            # exists at the broker. The recorded order is terminal — replaced,
+            # cancelled, expired, or filled (after a partial). Production
+            # case: DELL 2026-04-24 — bracket parent was cancelled during an
+            # add-on flow and the wash-trade guard rejected the fresh stop
+            # submit, leaving the position naked. Without this auto-fix,
+            # exit_manager retries replace_order on the dead ID every 5 min
+            # forever and the position has no resting broker stop.
+            #
+            # Recovery: clear the stale ID first (so even if attach fails we
+            # don't keep retrying the broken replace_order), then attempt to
+            # attach a fresh resting stop at DB current_stop. If submit fails
+            # (wash trade, etc.), leave stop_order_id NULL — exit_manager
+            # falls back to local-stop tracking and the next reconciler tick
+            # retries the attach.
+            existing_stop_id = existing.get("stop_order_id")
+            already_updating_stop = "stop_order_id" in updates
+            if (
+                existing_stop_id
+                and live_sl_id is None
+                and not already_updating_stop
+            ):
+                outcome = self._recover_stale_stop(sym, pos, existing, dry_run)
+                id_fixes += outcome.get("id_fixes", 0)
+                errors += outcome.get("errors", 0)
+
+            # Stale tp-id cleanup: DB has tp_order_id but no live TP at the
+            # broker. Mirror failure mode of the stop case (terminal order
+            # left behind by an add-on cancel that didn't fully clear DB
+            # legs). Cleared without reattach: post-add-on positions are
+            # intentionally stop-only per orchestrator design (`orchestrator
+            # .py:2572` clears tp_order_id), and we don't track a TP price
+            # in position_states to reattach against.
+            existing_tp_id = existing.get("tp_order_id")
+            already_updating_tp = "tp_order_id" in updates
+            if (
+                existing_tp_id
+                and live_tp_id is None
+                and not already_updating_tp
+            ):
+                outcome = self._clear_stale_tp(sym, existing, dry_run)
+                id_fixes += outcome.get("id_fixes", 0)
+                errors += outcome.get("errors", 0)
+
         return {
             "ghosts": ghosts,
             "id_fixes": id_fixes,
             "orphans": orphans,
             "errors": errors,
         }
+
+    def _recover_stale_stop(
+        self,
+        sym: str,
+        pos,
+        existing: dict,
+        dry_run: bool,
+    ) -> dict:
+        """Clear a stale stop_order_id and attempt to reattach a fresh stop.
+
+        Called when DB.position_states has a stop_order_id but the broker
+        reports no live SL order for the symbol. See `_reconcile_position_states`
+        for the production motivation. Safety bounds mirror `_sync_broker_stops`.
+        """
+        id_fixes = 0
+        errors = 0
+        existing_stop_id = existing.get("stop_order_id")
+        db_stop = existing.get("current_stop")
+        try:
+            current_price = float(pos.current_price)
+        except (TypeError, ValueError):
+            current_price = None
+        try:
+            qty = float(pos.qty)
+        except (TypeError, ValueError):
+            qty = None
+
+        if dry_run:
+            logger.info(
+                "reconciler[%s] DRY-RUN: would clear stale stop_order_id %s "
+                "for %s and attempt reattach @ $%.2f",
+                self.variant or "-", str(existing_stop_id)[:8], sym,
+                float(db_stop) if db_stop else 0.0,
+            )
+            return {"id_fixes": 1, "errors": 0}
+
+        # Step 1: clear the stale ID so the broken replace_order stops firing.
+        try:
+            self.db.upsert_position_state(sym, {"stop_order_id": None})
+            id_fixes += 1
+            emit_event(
+                Categories.DRIFT_DETECTED,
+                level="warning",
+                variant=self.variant,
+                symbol=sym,
+                message="stale stop_order_id cleared (no live broker SL)",
+                context={
+                    "mode": "stale_stop_cleared",
+                    "old_stop_id": str(existing_stop_id)[:8],
+                    "db_current_stop": float(db_stop) if db_stop else None,
+                },
+            )
+            logger.warning(
+                "reconciler[%s]: %s cleared stale stop_order_id %s "
+                "(no live broker SL); attempting reattach",
+                self.variant or "-", sym, str(existing_stop_id)[:8],
+            )
+        except Exception as e:
+            errors += 1
+            logger.warning(
+                "reconciler[%s]: %s clear stale stop_order_id failed: %s",
+                self.variant or "-", sym, e,
+            )
+            return {"id_fixes": id_fixes, "errors": errors}
+
+        # Step 2: attempt to attach a fresh resting stop at DB current_stop.
+        # Bail out if the inputs aren't safe to act on.
+        if not db_stop or not qty or qty <= 0:
+            return {"id_fixes": id_fixes, "errors": errors}
+        if current_price is not None and float(db_stop) >= current_price:
+            logger.warning(
+                "reconciler[%s]: %s skipping reattach — DB stop $%.2f >= "
+                "current price $%.2f (would trigger immediately).",
+                self.variant or "-", sym, float(db_stop), current_price,
+            )
+            return {"id_fixes": id_fixes, "errors": errors}
+        # Race guard: if Alpaca already shows the entire qty held by a
+        # pending sell (bracket child mid-cancel, EOD flatten in flight,
+        # manual close), submitting another sell will trip the wash-trade
+        # guard (code 40310000). Observed during the 15:55 ET intraday
+        # flatten — reconciler's */5 cron overlaps with the flatten by
+        # seconds and a bracket child is still in pending_cancel. Position
+        # gets exited by whatever's already in flight; nothing to add here.
+        qty_available = getattr(pos, "qty_available", None)
+        if qty_available is not None and float(qty_available) <= 0:
+            logger.info(
+                "reconciler[%s]: %s skipping reattach — qty_available=0 "
+                "(pending sell order already in flight)",
+                self.variant or "-", sym,
+            )
+            return {"id_fixes": id_fixes, "errors": errors}
+
+        stop_request = OrderRequest(
+            symbol=sym,
+            side="sell",
+            qty=qty,
+            order_type="stop",
+            stop_price=round(float(db_stop), 2),
+            time_in_force="gtc",
+        )
+        try:
+            new_order = self.broker.submit_order(stop_request)
+        except Exception as e:
+            errors += 1
+            logger.warning(
+                "reconciler[%s]: %s reattach submit failed @ $%.2f qty=%s: %s",
+                self.variant or "-", sym, float(db_stop), qty, e,
+            )
+            return {"id_fixes": id_fixes, "errors": errors}
+
+        new_id = getattr(new_order, "order_id", None)
+        if not new_id:
+            return {"id_fixes": id_fixes, "errors": errors}
+        try:
+            self.db.upsert_position_state(sym, {"stop_order_id": new_id})
+            logger.info(
+                "reconciler[%s]: %s reattached stop @ $%.2f qty=%s "
+                "(new order %s)",
+                self.variant or "-", sym, float(db_stop), qty,
+                str(new_id)[:8],
+            )
+        except Exception as e:
+            errors += 1
+            logger.warning(
+                "reconciler[%s]: %s persist new stop_id %s failed: %s",
+                self.variant or "-", sym, str(new_id)[:8], e,
+            )
+        return {"id_fixes": id_fixes, "errors": errors}
+
+    def _clear_stale_tp(
+        self,
+        sym: str,
+        existing: dict,
+        dry_run: bool,
+    ) -> dict:
+        """Clear a stale tp_order_id when no live TP exists at the broker.
+
+        No reattach: post-add-on positions are intentionally stop-only per
+        orchestrator design, and position_states does not track a TP price
+        to use for reattachment. Just clean up the stale DB ID so drift
+        reports stop flagging it and exit logic doesn't try to act on a
+        dead order.
+        """
+        existing_tp_id = existing.get("tp_order_id")
+        if dry_run:
+            logger.info(
+                "reconciler[%s] DRY-RUN: would clear stale tp_order_id %s for %s",
+                self.variant or "-", str(existing_tp_id)[:8], sym,
+            )
+            return {"id_fixes": 1, "errors": 0}
+        try:
+            self.db.upsert_position_state(sym, {"tp_order_id": None})
+            emit_event(
+                Categories.DRIFT_DETECTED,
+                level="info",
+                variant=self.variant,
+                symbol=sym,
+                message="stale tp_order_id cleared (no live broker TP)",
+                context={
+                    "mode": "stale_tp_cleared",
+                    "old_tp_id": str(existing_tp_id)[:8],
+                },
+            )
+            logger.warning(
+                "reconciler[%s]: %s cleared stale tp_order_id %s "
+                "(no live broker TP)",
+                self.variant or "-", sym, str(existing_tp_id)[:8],
+            )
+            return {"id_fixes": 1, "errors": 0}
+        except Exception as e:
+            logger.warning(
+                "reconciler[%s]: %s clear stale tp_order_id failed: %s",
+                self.variant or "-", sym, e,
+            )
+            return {"id_fixes": 0, "errors": 1}
 
     def _sync_broker_stops(
         self,
@@ -788,4 +1047,20 @@ class OrderReconciler:
                 stop_summary["synced"],
                 stop_summary["skipped"],
             )
+        # Liveness pulse: even an all-zero pass tells the watchdog the
+        # reconciler is alive. Watchdog alerts on absence of these.
+        emit_event(
+            Categories.RECONCILER_TICK,
+            level="info",
+            variant=self.variant,
+            message="reconciler pass complete",
+            context={
+                "checked": checked,
+                "drifted": drifted,
+                "ghosts": pos_summary["ghosts"],
+                "id_fixes": pos_summary["id_fixes"],
+                "orphans": pos_summary["orphans"],
+                "stops_synced": stop_summary["synced"],
+            },
+        )
         return summary

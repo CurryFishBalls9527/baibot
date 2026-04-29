@@ -57,6 +57,12 @@ class Position:
     market_value: float
     unrealized_pl: float
     unrealized_plpc: float
+    # Shares not currently held by a pending sell order.
+    # `qty_available == 0` means a sell order (bracket leg, manual stop, or
+    # EOD flatten) is already in flight on the entire position — submitting
+    # another sell will hit Alpaca's wash-trade guard with code 40310000.
+    # Default = qty (best-effort fallback for older brokers / fixtures).
+    qty_available: Optional[float] = None
 
 
 @dataclass

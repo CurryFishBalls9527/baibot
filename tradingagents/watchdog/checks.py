@@ -17,6 +17,7 @@ import os
 import re
 import sqlite3
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
@@ -36,10 +37,12 @@ ET = ZoneInfo("US/Eastern")
 VARIANTS: Sequence[Tuple[str, str, str, str]] = (
     ("mechanical",          "trading_mechanical.db",          "ALPACA_MECHANICAL_API_KEY",      "ALPACA_MECHANICAL_SECRET_KEY"),
     ("llm",                 "trading_llm.db",                 "ALPACA_LLM_API_KEY",             "ALPACA_LLM_SECRET_KEY"),
-    ("chan",                "trading_chan.db",                "ALPACA_CHAN_API_KEY",            "ALPACA_CHAN_SECRET_KEY"),
     ("mechanical_v2",       "trading_mechanical_v2.db",       "ALPACA_MECHANICAL_V2_API_KEY",   "ALPACA_MECHANICAL_V2_SECRET_KEY"),
     ("chan_v2",             "trading_chan_v2.db",             "ALPACA_CHAN_V2_API_KEY",         "ALPACA_CHAN_V2_SECRET_KEY"),
     ("intraday_mechanical", "trading_intraday_mechanical.db", "ALPACA_V2_INTRADAY_API_KEY",     "ALPACA_V2_INTRADAY_SECRET_KEY"),
+    # chan v1 retired 2026-04-27 (paper_launch_v2.yaml). chan_daily replaces it
+    # in the active mix and uses its own Alpaca paper account + DB.
+    ("chan_daily",          "trading_chan_daily.db",          "ALPACA_CHAN_DAILY_API_KEY",      "ALPACA_CHAN_DAILY_SECRET_KEY"),
 )
 
 
@@ -115,6 +118,62 @@ def is_scheduler_active_window(now: Optional[datetime] = None) -> bool:
     return time(4, 0) <= now.time() <= time(18, 0)
 
 
+# NYSE full-close holidays. Refresh annually from
+# https://www.nyse.com/markets/hours-calendars. Maintained as a static
+# set so the watchdog has no network/dep on a market-calendars library.
+_NYSE_HOLIDAYS: frozenset = frozenset({
+    # 2026
+    date(2026, 1, 1),    # New Year's Day
+    date(2026, 1, 19),   # MLK Day
+    date(2026, 2, 16),   # Presidents Day
+    date(2026, 4, 3),    # Good Friday
+    date(2026, 5, 25),   # Memorial Day
+    date(2026, 6, 19),   # Juneteenth
+    date(2026, 7, 3),    # Independence Day (observed; 7/4 = Saturday)
+    date(2026, 9, 7),    # Labor Day
+    date(2026, 11, 26),  # Thanksgiving
+    date(2026, 12, 25),  # Christmas
+    # 2027
+    date(2027, 1, 1),
+    date(2027, 1, 18),
+    date(2027, 2, 15),
+    date(2027, 3, 26),   # Good Friday
+    date(2027, 5, 31),
+    date(2027, 6, 18),   # Juneteenth observed (6/19 = Saturday)
+    date(2027, 7, 5),    # Independence Day observed (7/4 = Sunday)
+    date(2027, 9, 6),
+    date(2027, 11, 25),
+    date(2027, 12, 24),  # Christmas observed (12/25 = Saturday)
+})
+
+
+def is_nyse_trading_day(d: date) -> bool:
+    return d.weekday() < 5 and d not in _NYSE_HOLIDAYS
+
+
+def _scheduler_launchd_alive() -> Optional[bool]:
+    """Best-effort check that launchd holds com.tradingagents.scheduler with a live PID.
+
+    Returns True/False if confident, None if launchctl is unavailable —
+    callers should treat None as "unknown" and fall back to log-staleness.
+    """
+    try:
+        out = subprocess.run(
+            ["launchctl", "list", "com.tradingagents.scheduler"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    if out.returncode != 0:
+        return False
+    m = re.search(r'"PID"\s*=\s*(\d+);', out.stdout)
+    if not m:
+        return False
+    return int(m.group(1)) > 0
+
+
 # ── File tailing ──────────────────────────────────────────────────────
 
 
@@ -180,6 +239,15 @@ def check_scheduler_liveness(state: WatchdogState) -> List[Alert]:
                 ttl_hours=6,
             )
         ]
+
+    # Non-trading day: the log naturally idles for 24h+ between Friday's
+    # post-close jobs and Monday's pre-market jobs (and longer around
+    # holidays). Skip the staleness check entirely as long as launchd
+    # confirms the scheduler is still loaded with a live PID. If
+    # launchctl is unavailable we get None back and fall through to the
+    # log-based check, which keeps existing CI behavior.
+    if not is_nyse_trading_day(now_et().date()) and _scheduler_launchd_alive() is True:
+        return []
     try:
         mtime = datetime.fromtimestamp(log_path.stat().st_mtime, tz=ET)
     except OSError:
@@ -209,6 +277,16 @@ def check_scheduler_liveness(state: WatchdogState) -> List[Alert]:
     if market_hrs and last_done_age_min is not None and last_done_age_min < 30:
         # Active recently enough — log mtime may have stalled but jobs are running.
         return []
+
+    # Off-market hours inside the active window (e.g. 04:00–09:30 ET): the
+    # scheduler can be idle for an hour+ between pre-market cron jobs even
+    # though it's running fine. If launchctl confirms a live PID and the
+    # last JOB DONE is within the same ~14h cutoff used for non-trading
+    # days, treat as healthy. Without this we fired false positives at
+    # 03:00 / 05:00 ET on a healthy scheduler.
+    if not market_hrs and _scheduler_launchd_alive() is True:
+        if last_done_age_min is not None and last_done_age_min < 14 * 60:
+            return []
 
     bucket = now_et().hour // 6
     return [
@@ -365,8 +443,13 @@ def check_drift(state: WatchdogState) -> List[Alert]:
     if not script.exists():
         return []
     try:
+        # sys.executable points at the watchdog's own venv python — bare
+        # "python" doesn't resolve under launchd on macOS Sequoia (Apple
+        # removed /usr/bin/python; only python3 is on PATH). Using
+        # sys.executable also guarantees the script runs against the same
+        # site-packages the watchdog is using.
         proc = subprocess.run(
-            ["python", str(script), "--json"],
+            [sys.executable, str(script), "--json"],
             cwd=str(_repo_root()),
             capture_output=True,
             text=True,
@@ -536,7 +619,10 @@ _EXPECTED_JOB_COUNTS = {
     "Daily Swing Analysis": 1,
     "Market Open Snapshot": 1,
     "Exit Check Pass": 80,
-    "Reconciler Pass": 60,
+    # Scheduler logs this label as "Order Reconciliation" (not "Reconciler
+    # Pass") — keep this string in sync with run_trading.py / scheduler.py
+    # JOB DONE markers or the count silently shows 0 and fires false alerts.
+    "Order Reconciliation": 60,
     "Daily Trade Review": 1,
 }
 
@@ -576,7 +662,10 @@ def check_job_execution_sanity(state: WatchdogState) -> List[Alert]:
         alerts.append(
             Alert(
                 category="job_shortfall",
-                title=f"Job shortfall: {label} ran {actual}× (expected ≥{expected})",
+                # Stay ASCII-only: ntfy puts the title in an HTTP header
+                # which urllib encodes as latin-1; characters like ≥ blow up
+                # the whole notification with a UnicodeEncodeError.
+                title=f"Job shortfall: {label} ran {actual}x (expected >={expected})",
                 body=(
                     f"Cron '{label}' fired only {actual} times by 16:30 ET. "
                     f"Variant cron may be silently broken."
@@ -625,7 +714,7 @@ def check_daily_activity_sanity(state: WatchdogState) -> List[Alert]:
                 category=Categories.ACTIVITY_GAP,
                 title=f"No daily_snapshots row for {variant} ({today_iso})",
                 body=(
-                    f"{variant} did not write a daily_snapshots row by 11:00 ET. "
+                    f"{variant} did not write a daily_snapshots row by post-close. "
                     "Repro of the 2026-04-13 chan-silence incident."
                 ),
                 dedupe_key=f"activity_gap:{variant}:{today_iso}",

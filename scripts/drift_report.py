@@ -42,11 +42,13 @@ from alpaca.trading.enums import QueryOrderStatus
 
 
 VARIANTS = [
-    ("mechanical",    "trading_mechanical.db",    "ALPACA_MECHANICAL_API_KEY",      "ALPACA_MECHANICAL_SECRET_KEY"),
-    ("llm",           "trading_llm.db",           "ALPACA_LLM_API_KEY",             "ALPACA_LLM_SECRET_KEY"),
-    ("chan",          "trading_chan.db",          "ALPACA_CHAN_API_KEY",            "ALPACA_CHAN_SECRET_KEY"),
-    ("mechanical_v2", "trading_mechanical_v2.db", "ALPACA_MECHANICAL_V2_API_KEY",   "ALPACA_MECHANICAL_V2_SECRET_KEY"),
-    ("chan_v2",       "trading_chan_v2.db",       "ALPACA_CHAN_V2_API_KEY",         "ALPACA_CHAN_V2_SECRET_KEY"),
+    ("mechanical",          "trading_mechanical.db",          "ALPACA_MECHANICAL_API_KEY",      "ALPACA_MECHANICAL_SECRET_KEY"),
+    ("llm",                 "trading_llm.db",                 "ALPACA_LLM_API_KEY",             "ALPACA_LLM_SECRET_KEY"),
+    ("mechanical_v2",       "trading_mechanical_v2.db",       "ALPACA_MECHANICAL_V2_API_KEY",   "ALPACA_MECHANICAL_V2_SECRET_KEY"),
+    ("chan_v2",             "trading_chan_v2.db",             "ALPACA_CHAN_V2_API_KEY",         "ALPACA_CHAN_V2_SECRET_KEY"),
+    ("intraday_mechanical", "trading_intraday_mechanical.db", "ALPACA_V2_INTRADAY_API_KEY",     "ALPACA_V2_INTRADAY_SECRET_KEY"),
+    # chan v1 retired 2026-04-27 (paper_launch_v2.yaml). chan_daily replaces it.
+    ("chan_daily",          "trading_chan_daily.db",          "ALPACA_CHAN_DAILY_API_KEY",      "ALPACA_CHAN_DAILY_SECRET_KEY"),
 ]
 
 LIVE_STATUSES = {
@@ -100,7 +102,8 @@ def scan_variant(name: str, dbfile: str, api_key: str, secret_key: str) -> List[
     db_rows = {
         r["symbol"]: dict(r)
         for r in con.execute(
-            "SELECT symbol, entry_price, current_stop, stop_order_id, tp_order_id FROM position_states"
+            "SELECT symbol, entry_price, current_stop, stop_order_id, "
+            "tp_order_id, add_on_1_done, add_on_2_done FROM position_states"
         ).fetchall()
     }
     con.close()
@@ -131,10 +134,18 @@ def scan_variant(name: str, dbfile: str, api_key: str, secret_key: str) -> List[
         # Source #3: ghost — DB row, no broker position
         if db and not pos:
             row.issues.append("ghost")
+        # Post-add-on positions are intentionally stop-only per orchestrator
+        # design (`orchestrator.py:2572` clears tp_order_id after a successful
+        # add-on resync). Suppress TP-related drift flags for those — they
+        # would be permanent false positives otherwise.
+        post_add_on = bool(
+            db and (db.get("add_on_1_done") or db.get("add_on_2_done"))
+        )
+
         # Source #1: NULL leg IDs (only meaningful when DB + position both exist)
         if db and pos and not db["stop_order_id"]:
             row.issues.append("null_stop_id")
-        if db and pos and not db["tp_order_id"]:
+        if db and pos and not db["tp_order_id"] and not post_add_on:
             row.issues.append("null_tp_id")
         # Source #4: OCO-mismatch — DB ID doesn't match live broker ID
         if db and pos and db["stop_order_id"] and sl and db["stop_order_id"] != sl[0]:
@@ -149,7 +160,7 @@ def scan_variant(name: str, dbfile: str, api_key: str, secret_key: str) -> List[
         # Broker position but no active SL at all — unprotected
         if pos and not sl:
             row.issues.append("unprotected_no_sl")
-        if pos and not tp:
+        if pos and not tp and not post_add_on:
             row.issues.append("no_active_tp")
 
         if row.issues:

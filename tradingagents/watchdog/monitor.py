@@ -105,10 +105,12 @@ class Watchdog:
             misfire_grace_time=600,
         )
 
-        # 7. Daily activity sanity: 11:00 ET Mon-Fri.
+        # 7. Daily activity sanity: 16:35 ET Mon-Fri. Swing variants write
+        # their daily_snapshots row post-close (Daily Reflection runs ~15:30
+        # ET); 11:00 ET was too early and fired routine false positives.
         self.scheduler.add_job(
             wrap(checks.check_daily_activity_sanity, "daily_activity_sanity"),
-            trigger=CronTrigger(day_of_week="mon-fri", hour=11, minute=0),
+            trigger=CronTrigger(day_of_week="mon-fri", hour=16, minute=35),
             id="daily_activity_sanity",
             misfire_grace_time=600,
         )

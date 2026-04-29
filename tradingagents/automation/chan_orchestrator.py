@@ -447,11 +447,20 @@ class ChanOrchestrator:
             logger.warning("Daily DB not found for bulk refresh: %s", self.daily_db)
             return {"status": "no_daily_db"}
 
-        # NOTE: connect RW (not read_only) to match MarketDataWarehouse,
-        # which other variants (mechanical/llm/...) open on this same file
-        # in the same process. DuckDB rejects mixed RO/RW configs → chan_v2
-        # scans fail with "different configuration than existing connections".
-        daily_conn = duckdb.connect(self.daily_db)
+        # Pure read path — open RO so we coexist with parallel RO opens
+        # from other variant threads. If ab_runner is mid-minervini preflight
+        # with the file open RW, this RO open raises "different configuration"
+        # — treat as transient and skip; the next refresh tick retries.
+        try:
+            daily_conn = duckdb.connect(self.daily_db, read_only=True)
+        except duckdb.ConnectionException as e:
+            if "different configuration" in str(e):
+                logger.warning(
+                    "Bulk 30m refresh: daily_db busy — skipping fresh-symbol "
+                    "lookup, will retry next tick"
+                )
+                return {"status": "daily_db_busy"}
+            raise
         try:
             freshness_cutoff = (date.today() - timedelta(days=10)).isoformat()
             fresh_symbols = [r[0] for r in daily_conn.execute(
@@ -582,8 +591,22 @@ class ChanOrchestrator:
             logger.warning("Daily DB not found: %s", self.daily_db)
             return set()
 
-        # RW to match MarketDataWarehouse — see note at bulk_refresh_30m_data.
-        conn = duckdb.connect(self.daily_db)
+        # Pure read path — no INSERT/UPDATE here. Open RO so we can coexist
+        # with another RO opener; if ab_runner is running a parallel
+        # minervini-group thread that has the same file open RW (preflight
+        # downloading daily bars), DuckDB rejects the mixed config. Skip
+        # this tick rather than crash; RS ranking re-runs on the next 10-min
+        # scan and the chan-intraday group converges next pass.
+        try:
+            conn = duckdb.connect(self.daily_db, read_only=True)
+        except duckdb.ConnectionException as e:
+            if "different configuration" in str(e):
+                logger.warning(
+                    "RS ranking: daily_db busy with concurrent writer "
+                    "(parallel minervini group?) — skipping this tick"
+                )
+                return set()
+            raise
         today = date.today()
         lookback_start = today - timedelta(days=int(self.rs_lookback_days * 1.6) + 30)
 

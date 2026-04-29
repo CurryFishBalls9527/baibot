@@ -73,6 +73,7 @@ class AlpacaBroker(BaseBroker):
 
     @staticmethod
     def _to_position(p) -> Position:
+        qty_avail = getattr(p, "qty_available", None)
         return Position(
             symbol=p.symbol,
             qty=abs(float(p.qty)),
@@ -82,6 +83,7 @@ class AlpacaBroker(BaseBroker):
             market_value=abs(float(p.market_value)),
             unrealized_pl=float(p.unrealized_pl),
             unrealized_plpc=float(p.unrealized_plpc),
+            qty_available=abs(float(qty_avail)) if qty_avail is not None else None,
         )
 
     # ── Orders ───────────────────────────────────────────────────────
@@ -486,9 +488,16 @@ class AlpacaBroker(BaseBroker):
     # Alpaca's QueryOrderStatus.OPEN does NOT include HELD — bracket / OCO
     # stop-loss legs sit in HELD while they wait for their trigger. Reconciler
     # needs to see them to match DB position_states against live broker state.
+    #
+    # NOTE: "replaced" is NOT included — it's a terminal status indicating the
+    # order was superseded by a new one. The replacement order has its own ID
+    # and will appear with one of the live statuses below. Including
+    # "replaced" caused stale-ID drift (DELL 2026-04-24): _find_live_sl_tp
+    # surfaced a dead order as if it were live, so the reconciler kept
+    # writing a cancelled order_id back into position_states.
     _LIVE_ORDER_STATUSES = {
         "new", "accepted", "pending_new", "accepted_for_bidding",
-        "held", "replaced", "pending_replace",
+        "held", "pending_replace",
     }
 
     def get_live_orders(self, symbol: Optional[str] = None) -> List[OrderResult]:

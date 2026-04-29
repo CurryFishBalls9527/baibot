@@ -9,6 +9,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -17,6 +19,11 @@ from typing import Any, Dict, Optional
 logger = logging.getLogger(__name__)
 
 _DEDUPE_TTL_DAYS = 14
+
+# APScheduler runs every check on its own thread, so two jobs scheduled on
+# the same minute boundary (e.g. scheduler_liveness + log_error_sweep) can
+# race on the .tmp → state.json rename. Serialize save_state to one writer.
+_SAVE_LOCK = threading.Lock()
 
 
 @dataclass
@@ -98,9 +105,12 @@ def save_state(state: WatchdogState) -> None:
     }
     path = state_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    # Per-write unique tmp name keeps concurrent writers from racing on the
+    # same .tmp path; the lock serializes the rename so the last writer wins.
+    tmp = path.with_suffix(path.suffix + f".tmp.{uuid.uuid4().hex}")
     tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    os.replace(tmp, path)
+    with _SAVE_LOCK:
+        os.replace(tmp, path)
 
 
 def _prune_dedupe(dedupe: Dict[str, str]) -> Dict[str, str]:

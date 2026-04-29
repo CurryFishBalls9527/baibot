@@ -311,7 +311,8 @@ def test_scheduler_liveness_silent_on_weekend(tmp_path):
     _os.utime(log, (old_ts, old_ts))
 
     state = _make_state(tmp_path)
-    with mock.patch("tradingagents.watchdog.checks.now_et", return_value=fake_now):
+    with mock.patch("tradingagents.watchdog.checks.now_et", return_value=fake_now), \
+         mock.patch("tradingagents.watchdog.checks._scheduler_launchd_alive", return_value=None):
         alerts = checks.check_scheduler_liveness(state)
     assert alerts == []
 
@@ -328,10 +329,62 @@ def test_scheduler_liveness_fires_when_dead_overnight(tmp_path):
     _os.utime(log, (old_ts, old_ts))
 
     state = _make_state(tmp_path)
-    with mock.patch("tradingagents.watchdog.checks.now_et", return_value=fake_now):
+    # Force the launchd probe to report unknown/dead so we exercise the
+    # log-based path; otherwise a dev box with the real scheduler loaded
+    # would suppress this alert.
+    with mock.patch("tradingagents.watchdog.checks.now_et", return_value=fake_now), \
+         mock.patch("tradingagents.watchdog.checks._scheduler_launchd_alive", return_value=False):
         alerts = checks.check_scheduler_liveness(state)
     assert len(alerts) == 1
     assert "stale" in alerts[0].title.lower()
+
+
+def test_scheduler_liveness_silent_on_weekend_when_launchd_alive(tmp_path):
+    """Sunday with stale log but launchd reports a live PID: suppress."""
+    log = tmp_path / "service_logs" / "automation_service.out.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    fake_now = datetime(2026, 4, 26, 11, 0, tzinfo=ET)  # Sunday
+    # Last JOB DONE 25h ago — would normally fire the >14h off-hours rule.
+    last_done = (fake_now - timedelta(hours=25)).strftime("%Y-%m-%d %H:%M:%S")
+    log.write_text(f"{last_done} INFO scheduler: JOB DONE: Weekly Heartbeat — ok\n")
+    import os as _os
+    old_ts = (fake_now - timedelta(hours=25)).timestamp()
+    _os.utime(log, (old_ts, old_ts))
+
+    state = _make_state(tmp_path)
+    with mock.patch("tradingagents.watchdog.checks.now_et", return_value=fake_now), \
+         mock.patch("tradingagents.watchdog.checks._scheduler_launchd_alive", return_value=True):
+        alerts = checks.check_scheduler_liveness(state)
+    assert alerts == []
+
+
+def test_scheduler_liveness_fires_on_holiday_when_launchd_dead(tmp_path):
+    """Holiday with stale log AND launchd reports no PID: alert still fires."""
+    log = tmp_path / "service_logs" / "automation_service.out.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    fake_now = datetime(2026, 4, 3, 11, 0, tzinfo=ET)  # Good Friday 2026
+    last_done = (fake_now - timedelta(hours=20)).strftime("%Y-%m-%d %H:%M:%S")
+    log.write_text(f"{last_done} INFO scheduler: JOB DONE: Stale — ok\n")
+    import os as _os
+    old_ts = (fake_now - timedelta(hours=20)).timestamp()
+    _os.utime(log, (old_ts, old_ts))
+
+    state = _make_state(tmp_path)
+    with mock.patch("tradingagents.watchdog.checks.now_et", return_value=fake_now), \
+         mock.patch("tradingagents.watchdog.checks._scheduler_launchd_alive", return_value=False):
+        alerts = checks.check_scheduler_liveness(state)
+    assert len(alerts) == 1
+    assert "stale" in alerts[0].title.lower()
+
+
+def test_is_nyse_trading_day():
+    from datetime import date as _date
+    assert checks.is_nyse_trading_day(_date(2026, 4, 24)) is True   # Friday
+    assert checks.is_nyse_trading_day(_date(2026, 4, 25)) is False  # Saturday
+    assert checks.is_nyse_trading_day(_date(2026, 4, 26)) is False  # Sunday
+    assert checks.is_nyse_trading_day(_date(2026, 4, 3)) is False   # Good Friday
+    assert checks.is_nyse_trading_day(_date(2026, 12, 25)) is False  # Christmas
+    assert checks.is_nyse_trading_day(_date(2026, 7, 3)) is False    # July 4 observed
 
 
 def test_scheduler_liveness_off_hours_silent_with_recent_job(tmp_path):
@@ -349,6 +402,47 @@ def test_scheduler_liveness_off_hours_silent_with_recent_job(tmp_path):
     with mock.patch("tradingagents.watchdog.checks.now_et", return_value=fake_now):
         alerts = checks.check_scheduler_liveness(state)
     assert alerts == []
+
+
+def test_scheduler_liveness_pre_market_silent_when_launchd_alive(tmp_path):
+    """Weekday 04:00 ET inside active window: scheduler quiet between
+    pre-market crons. Used to fire false positives at 03:00/05:00 ET on
+    a healthy scheduler. With launchctl confirming a live PID and the
+    last JOB DONE within the 14h off-hours cutoff, suppress."""
+    log = tmp_path / "service_logs" / "automation_service.out.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    fake_now = datetime(2026, 4, 28, 4, 0, tzinfo=ET)  # Tuesday 04:00 ET
+    # Last JOB DONE 11h ago (yesterday's Daily Reflection ~17:00 ET).
+    last_done = (fake_now - timedelta(hours=11)).strftime("%Y-%m-%d %H:%M:%S")
+    log.write_text(f"{last_done} INFO scheduler: JOB DONE: Daily Review — ok\n")
+    import os as _os
+    old_ts = (fake_now - timedelta(hours=11)).timestamp()
+    _os.utime(log, (old_ts, old_ts))
+
+    state = _make_state(tmp_path)
+    with mock.patch("tradingagents.watchdog.checks.now_et", return_value=fake_now), \
+         mock.patch("tradingagents.watchdog.checks._scheduler_launchd_alive", return_value=True):
+        alerts = checks.check_scheduler_liveness(state)
+    assert alerts == []
+
+
+def test_scheduler_liveness_pre_market_fires_when_launchd_dead(tmp_path):
+    """Same scenario, but launchctl confirms scheduler is NOT alive: alert."""
+    log = tmp_path / "service_logs" / "automation_service.out.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    fake_now = datetime(2026, 4, 28, 4, 0, tzinfo=ET)  # Tuesday 04:00 ET
+    last_done = (fake_now - timedelta(hours=11)).strftime("%Y-%m-%d %H:%M:%S")
+    log.write_text(f"{last_done} INFO scheduler: JOB DONE: Daily Review — ok\n")
+    import os as _os
+    old_ts = (fake_now - timedelta(hours=11)).timestamp()
+    _os.utime(log, (old_ts, old_ts))
+
+    state = _make_state(tmp_path)
+    with mock.patch("tradingagents.watchdog.checks.now_et", return_value=fake_now), \
+         mock.patch("tradingagents.watchdog.checks._scheduler_launchd_alive", return_value=False):
+        alerts = checks.check_scheduler_liveness(state)
+    assert len(alerts) == 1
+    assert "stale" in alerts[0].title.lower()
 
 
 # ── Check 7: daily activity sanity ────────────────────────────────

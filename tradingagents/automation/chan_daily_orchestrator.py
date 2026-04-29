@@ -617,14 +617,16 @@ class ChanDailyOrchestrator:
             exits = results.get("exits", [])
             if not entries and not exits:
                 return
-            lines = [f"ChanDaily: {len(entries)} entries, {len(exits)} exits"]
+            title = f"ChanDaily: {len(entries)} entries, {len(exits)} exits"
+            body_lines = []
             for e in entries:
                 if e.get("traded"):
-                    lines.append(f"  + BUY {e['symbol']} ({e.get('qty', '?')})")
+                    body_lines.append(f"+ BUY {e['symbol']} ({e.get('qty', '?')})")
             for e in exits:
                 if e.get("traded"):
-                    lines.append(f"  - SELL {e['symbol']}")
-            self.notifier.notify("\n".join(lines))
+                    body_lines.append(f"- SELL {e['symbol']}")
+            body = "\n".join(body_lines) if body_lines else "(no fills)"
+            self.notifier.send(title, body)
         except Exception as e:
             logger.warning("Notify failed: %s", e)
 
@@ -742,8 +744,13 @@ class ChanDailyOrchestrator:
         )
         return reconciler.reconcile_once()
 
-    def run_exit_check_pass(self) -> Dict:
+    def run_exit_check_pass(self, **kwargs) -> Dict:
         """Mid-day exit check pass — for chan_daily this is a no-op since
         we only act on end-of-day decisions; structural stops are already
-        on the broker as bracket SL legs and fire intraday autonomously."""
+        on the broker as bracket SL legs and fire intraday autonomously.
+
+        Accepts **kwargs so the shared ab_runner caller (which passes
+        ai_review_enabled=False to disable LLM exits on rule-based variants)
+        doesn't error on chan_daily's narrower interface.
+        """
         return {"status": "noop_chan_daily_runs_once_per_day"}
