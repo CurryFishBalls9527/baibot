@@ -133,6 +133,61 @@ CHANGES = {
     "cap_20": {"max_positions": 20},  # for research flavor (scales w/ 12 base)
     "cap_8": {"max_positions": 8},    # milder bump for live
     "cap_16": {"max_positions": 16},  # milder bump for research
+    # mechanical_v2 sizing sweep (2026-04-28): chan_daily blueprint —
+    # let the 2% risk-budget be binding instead of the 8-12% position cap.
+    # Currently the per-position cap binds for tight-stop names, leaving
+    # high-conviction setups under-deployed. Each variant pairs the cap
+    # with risk_per_trade=0.02 (matches live mechanical_v2 setting more
+    # closely than the 0.012/0.01 backtester defaults).
+    "atr_parity_15": {"max_position_pct": 0.15, "risk_per_trade": 0.02},
+    "atr_parity_20": {"max_position_pct": 0.20, "risk_per_trade": 0.02},
+    "atr_parity_25": {"max_position_pct": 0.25, "risk_per_trade": 0.02},  # chan_daily-equivalent
+    # Regime-conditional sizing: full 25% cap in confirmed uptrend, scaled
+    # to ~10% (baseline) in pressure/correction. Existing pattern from
+    # `[Chan v2 regime gate]`: bigger size only when regime confirms; tail
+    # protection in chop. atr_parity_25 unconditional was 2/4 pass with
+    # 2018 (-18.5pp) and 2015 (-0.3pp DD blow) failing — both weak-regime
+    # periods. Hypothesis: gating fixes the 2 fails without giving up the
+    # +20pp 2020 / +23.8pp 2023_25 wins.
+    "atr_parity_25_regime": {
+        "max_position_pct": 0.25,
+        "risk_per_trade": 0.02,
+        "scale_exposure_in_weak_market": True,
+        "weak_market_position_scale": 0.40,  # 25% × 0.40 = 10% in weak regime
+    },
+    # max_hold_days relaxation (untested per [Minervini B0→B4L ceiling]).
+    # Current 60-day cap fires for ALL positions, including winners still
+    # trending. Subtractive change — let winners run, dead-money already
+    # cuts the laggards at 10d. Per memory: subtractive accepts more often.
+    "max_hold_90": {"max_hold_days": 90},
+    "max_hold_120": {"max_hold_days": 120},
+    "max_hold_180": {"max_hold_days": 180},
+    # Pre-earnings blackout (Idea G — 2026-04-29).
+    # `[ER-blackout null]` memory tested INTRADAY last-safe-bar flatten only.
+    # These are DAILY-swing variants: skip entry within N days of an ER, and
+    # /or force-exit positions K days before ER. Different mechanism (event
+    # risk avoidance vs intraday timing). Uses earnings_blackout module +
+    # warehouse earnings_events table — both shipped in commit d1f87a0.
+    "er_skip_entry_3d": {"earnings_blackout_entry_days": 3},
+    "er_skip_entry_5d": {"earnings_blackout_entry_days": 5},
+    "er_flatten_1d":    {"earnings_flatten_days_before": 1},
+    "er_flatten_2d":    {"earnings_flatten_days_before": 2},
+    "er_skip3_flatten1": {
+        "earnings_blackout_entry_days": 3,
+        "earnings_flatten_days_before": 1,
+    },
+    # Regime-driven exit (untested per memory). Default OFF: entries are
+    # blocked in correction, but held positions stay through the regime
+    # transition — exit only on individual stop/dead-money triggers. Test:
+    # exit ALL positions when market regime flips to correction. Could
+    # save 2018 (-5pp baseline drag from late-Q4 correction) but might
+    # also exit at the bottom of dips. Binary subtractive change.
+    "exit_on_correction": {"exit_on_market_correction": True},
+    # Loosen entry gate during correction. Counter to require_market_regime.
+    # Could add trades in 2018 / 2015 if any setups exist; could also
+    # capture early V-recovery signals before regime confirms uptrend
+    # (2020 March). Risky in pure-bear scenarios.
+    "entries_in_correction": {"allow_new_entries_in_correction": True},
     # Change #11 (Wave 2): continuation entry — pick up trending names on EMA
     # pullbacks that never form a fresh base. Raw defaults (template≥7, ≤10%
     # from high, ROC60≥10%, ATR≤6%) produce +460 trades on 2023_2025 but blow

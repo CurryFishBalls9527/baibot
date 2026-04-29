@@ -7,6 +7,7 @@ basic end-to-end validation on intraday data, not optimization.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import asdict, dataclass
 from typing import Dict, Optional
 
@@ -14,6 +15,8 @@ import duckdb
 import pandas as pd
 
 from .warehouse import MarketDataWarehouse
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -113,6 +116,19 @@ class IntradayBacktestConfig:
     orb_earliest_entry_bar: int = 2
     orb_latest_entry_bar: int = 10
     orb_require_above_vwap: bool = True
+    # Chan-structural 15m signal — segment-level type-1 BSP as a 4th OR
+    # entry path. Different mechanism (structural reversal) vs. the post-
+    # open breakout signals above. Adapter computes per-symbol via
+    # `intraday_chan_signals.compute_seg_bsp_long_signals` and merges as
+    # a `chan_seg_bsp_long` column. lag_bars=1 enables the standard
+    # future-blanked probe per CLAUDE.md edge-claim mandates.
+    allow_chan_seg_bsp_long: bool = False
+    chan_seg_bsp_lag_bars: int = 0
+    chan_seg_bsp_only_unsure: bool = False
+    chan_seg_bsp_min_volume_ratio: float = 0.0
+    chan_seg_bsp_require_above_vwap: bool = False
+    chan_seg_bsp_earliest_entry_bar: int = 1
+    chan_seg_bsp_latest_entry_bar: int = 25  # most of the session
     execution_half_spread_bps: float = 0.0
     execution_stop_slippage_bps: float = 0.0
     execution_impact_coeff_bps: float = 0.0
@@ -294,6 +310,29 @@ class IntradayBreakoutBacktester:
                 df = self._filter_regular_session(df)
                 if df.empty:
                     continue
+                # Optional Chan-structural 15m signal — precompute and merge
+                # as a boolean column. Heavy: runs a full CChan pass per
+                # symbol. Only invoked when the flag is set so the default
+                # path (gap_reclaim/NR4/ORB only) stays fast.
+                if self.config.allow_chan_seg_bsp_long:
+                    try:
+                        from .intraday_chan_signals import compute_seg_bsp_long_signals
+                        sigs = compute_seg_bsp_long_signals(
+                            symbol=symbol,
+                            db_path=db_path,
+                            begin=begin,
+                            end=end,
+                            lag_bars=int(self.config.chan_seg_bsp_lag_bars),
+                            only_unsure=bool(self.config.chan_seg_bsp_only_unsure),
+                        )
+                        # Align to df.index (will be False where no signal).
+                        df["chan_seg_bsp_long"] = sigs.reindex(df.index).fillna(False).astype(bool)
+                    except Exception as exc:
+                        logger.warning(
+                            "chan_seg_bsp signals failed for %s: %s — disabling for this symbol",
+                            symbol, exc,
+                        )
+                        df["chan_seg_bsp_long"] = False
                 frames[symbol] = df
         finally:
             conn.close()
@@ -455,6 +494,8 @@ class IntradayBreakoutBacktester:
             frame = self._apply_nr4_breakout(frame)
         if self.config.allow_orb_breakout:
             frame = self._apply_orb_breakout(frame)
+        if self.config.allow_chan_seg_bsp_long:
+            frame = self._apply_chan_seg_bsp_long(frame)
         if self.config.allow_vwap_reversion_long:
             frame = self._apply_vwap_reversion_long(frame)
         if self.config.use_expansion_confirmation_entry:
@@ -779,6 +820,62 @@ class IntradayBreakoutBacktester:
 
         frame.loc[orb_mask, "entry_signal"] = True
         frame.loc[orb_mask, "setup_family"] = "orb_breakout"
+        return frame
+
+    def _apply_chan_seg_bsp_long(self, frame: pd.DataFrame) -> pd.DataFrame:
+        """Mark entries on bars where the precomputed Chan seg-level long
+        BSP signal fires. Subject to the same RVOL / VWAP / session-window
+        guards as other intraday setups, with knobs prefixed
+        `chan_seg_bsp_*` so each can be tuned independently.
+        """
+        if "chan_seg_bsp_long" not in frame.columns:
+            return frame
+
+        min_vol = float(self.config.chan_seg_bsp_min_volume_ratio)
+        earliest = int(self.config.chan_seg_bsp_earliest_entry_bar)
+        latest = int(self.config.chan_seg_bsp_latest_entry_bar)
+        require_above_vwap = bool(self.config.chan_seg_bsp_require_above_vwap)
+
+        signal_ok = frame["chan_seg_bsp_long"].fillna(False).astype(bool)
+        volume_ok = (
+            frame["volume_ratio"].fillna(0) >= min_vol
+            if min_vol > 0
+            else pd.Series(True, index=frame.index)
+        )
+        bar_ok = (
+            (frame["bar_in_session"] >= earliest)
+            & (frame["bar_in_session"] <= latest)
+        )
+        if require_above_vwap and "vwap" in frame.columns:
+            vwap_ok = frame["close"] > frame["vwap"]
+        else:
+            vwap_ok = pd.Series(True, index=frame.index)
+
+        # Don't override an already-assigned setup — we want chan_seg_bsp
+        # to fill bars where no breakout-style signal fired (it's the
+        # complementary OR clause, not a re-classifier).
+        already_assigned = frame["setup_family"].isin(
+            {
+                "opening_drive_continuation",
+                "opening_drive_expansion",
+                "opening_drive_overextended",
+                "pullback_vwap",
+                "gap_reclaim_long",
+                "nr4_breakout",
+                "orb_breakout",
+            }
+        )
+
+        chan_mask = (
+            signal_ok
+            & volume_ok
+            & bar_ok
+            & vwap_ok
+            & (~already_assigned)
+        ).fillna(False)
+
+        frame.loc[chan_mask, "entry_signal"] = True
+        frame.loc[chan_mask, "setup_family"] = "chan_seg_bsp_long"
         return frame
 
     def _build_relative_volume_universe(
@@ -1471,7 +1568,7 @@ class IntradayBreakoutBacktester:
                             continue
                     if (
                         self.config.min_entry_strength_breakout_pct is not None
-                        and candidate["setup_family"] not in {"pullback_vwap", "gap_reclaim_long", "nr4_breakout"}
+                        and candidate["setup_family"] not in {"pullback_vwap", "gap_reclaim_long", "nr4_breakout", "chan_seg_bsp_long"}
                         and (
                             candidate["breakout_distance_pct"] is None
                             or candidate["breakout_distance_pct"] < self.config.min_entry_strength_breakout_pct
@@ -1482,7 +1579,7 @@ class IntradayBreakoutBacktester:
                         continue
                     if (
                         self.config.min_entry_strength_vwap_distance_pct is not None
-                        and candidate["setup_family"] not in {"pullback_vwap", "gap_reclaim_long", "nr4_breakout"}
+                        and candidate["setup_family"] not in {"pullback_vwap", "gap_reclaim_long", "nr4_breakout", "chan_seg_bsp_long"}
                         and (
                             candidate["distance_from_vwap_pct"] is None
                             or candidate["distance_from_vwap_pct"] < self.config.min_entry_strength_vwap_distance_pct
