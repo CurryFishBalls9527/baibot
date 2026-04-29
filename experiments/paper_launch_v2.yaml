@@ -196,10 +196,13 @@ variants:
       intraday_allowed_families:
         - gap_reclaim_long
         - nr4_breakout
-        - orb_breakout
-      # ORB sweep winner: orb_vol_2.5 (R/DD 2.14 / 0.50 / 0.88 on 2023-25 / 2020 / 2018,
-      # all DDs <43%). Adds 2023-25 alpha without collapsing on 2018 like orb_base does.
-      # See scripts/run_intraday_orb_tightening.py.
+        # orb_breakout DISABLED 2026-04-29 — memory `[Pure-intraday bundle null]`
+        # said dead, today's broad250/2018 backtest quantified: ORB alone produced
+        # 629 of 737 trades and -$10.6k of -$14.7k loss. With ORB off, broad250/2018
+        # baseline DD drops 64%→6%, return -14.65%→-4.33%. ORB sweep winner
+        # (orb_vol_2.5) was originally retained for 2023-25 lift but the same
+        # 2018 collapse pattern reappears in live data; no signal worth the tail.
+        # Original ORB sweep: scripts/run_intraday_orb_tightening.py.
       intraday_backtest_config:
         initial_cash: 100000
         max_positions: 6
@@ -230,7 +233,7 @@ variants:
         nr4_earliest_entry_bar: 1
         nr4_latest_entry_bar: 12
         nr4_min_volume_ratio: 1.3
-        allow_orb_breakout: true
+        allow_orb_breakout: false  # 2026-04-29: signal validated dead per [Pure-intraday bundle null] + today's data
         orb_range_bars: 2
         orb_min_volume_ratio: 2.5
         orb_min_breakout_distance_pct: 0.001

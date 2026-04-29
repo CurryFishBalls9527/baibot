@@ -391,6 +391,29 @@ class AlpacaBroker(BaseBroker):
             raw = self.trading_client.replace_order_by_id(order_id, req)
         except APIError as e:
             code = getattr(e, "code", None)
+            msg = str(e).lower()
+            # Benign 42210000 sub-cases that signal the system already
+            # converged to the desired state. Don't escalate to ERROR or
+            # emit ORDER_REJECT (the watchdog tail-watch picks those up
+            # and pages). Both observed live on NOK 2026-04-29:
+            #   "order already replaced" — exit_manager_v2 + reconciler
+            #     race on the same 5-min tick; one wins, the other hits
+            #     the now-terminal old order_id.
+            #   "order parameters are not changed" — float-precision diff
+            #     in stop_price > 1e-6 but rounds to the same 2-decimal
+            #     broker price.
+            # Other 42210000 sub-cases (e.g. "stop_loss.stop_price must
+            # be <= base_price - 0.01") remain ERROR — those are real
+            # entry-side rejections.
+            if code == 42210000 and (
+                "already replaced" in msg
+                or "parameters are not changed" in msg
+            ):
+                logger.info(
+                    "replace_order(%s, %s) benign-skip: %s",
+                    order_id, kwargs, e,
+                )
+                return None
             category = (
                 Categories.WASH_TRADE_REJECT
                 if code == 40310000

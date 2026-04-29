@@ -93,8 +93,15 @@ class ExitManagerV2:
         """
         if self.broker is None or not stop_order_id:
             return
-        # Only ratchet UP — never loosen the broker stop.
-        if new_stop_price <= prev_stop_price + 1e-6:
+        # Only ratchet UP — never loosen the broker stop. Round to 2 decimals
+        # FIRST: Alpaca rounds the stored stop_price to 2 decimals, so a
+        # float-precision diff (e.g. 11.1199999 vs 11.12) passes the > guard
+        # but submits a no-op replace that broker rejects with code 42210000
+        # "order parameters are not changed". Live NOK example 2026-04-29:
+        # ratcheted $11.12 -> $11.12 multiple times during exit checks.
+        prev_rounded = round(float(prev_stop_price), 2)
+        new_rounded = round(float(new_stop_price), 2)
+        if new_rounded <= prev_rounded:
             return
         try:
             self.broker.replace_order(stop_order_id, stop_price=round(new_stop_price, 2))
