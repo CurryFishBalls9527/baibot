@@ -401,13 +401,14 @@ class PortfolioChanV2Backtester(PortfolioChanBacktester):
         cfg: ChanV2BacktestConfig,
     ) -> list[tuple[datetime, str, dict]]:
         """Preload events with v2-specific data (oscillation count, divergence_rate)."""
+        intraday_k_type = self._intraday_k_type(cfg.intraday_interval_minutes)
         events = []
         for sym in symbols:
             try:
                 chan = CChan(
                     code=sym, begin_time=begin, end_time=end,
                     data_src="custom:DuckDBAPI.DuckDB30mAPI",
-                    lv_list=[KL_TYPE.K_30M], config=chan_cfg, autype=AUTYPE.QFQ,
+                    lv_list=[intraday_k_type], config=chan_cfg, autype=AUTYPE.QFQ,
                 )
                 hlc_history: list[tuple[float, float, float]] = []
                 bar_idx = 0

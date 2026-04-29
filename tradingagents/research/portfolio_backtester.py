@@ -27,8 +27,13 @@ class PortfolioMinerviniBacktester(MinerviniBacktester):
         self,
         screener: MinerviniScreener | None = None,
         config: BacktestConfig | None = None,
+        earnings_blackout=None,
     ):
-        super().__init__(screener=screener, config=config)
+        super().__init__(
+            screener=screener,
+            config=config,
+            earnings_blackout=earnings_blackout,
+        )
 
     def backtest_portfolio(
         self,
@@ -38,8 +43,10 @@ class PortfolioMinerviniBacktester(MinerviniBacktester):
         trade_start_date: Optional[str] = None,
         candidate_schedule: Optional[Dict] = None,
         cross_asset_df: Optional[pd.DataFrame] = None,
+        market_extension_frame: Optional[pd.DataFrame] = None,
     ) -> PortfolioBacktestResult:
         self._candidate_schedule = candidate_schedule
+        self._market_extension_frame = market_extension_frame
         prepared_frames = {}
         for symbol, df in data_by_symbol.items():
             prepared = self.screener.prepare_features(df)
@@ -511,7 +518,9 @@ class PortfolioMinerviniBacktester(MinerviniBacktester):
                 continue
 
             exit_reason = None
-            if price <= position["stop_price"]:
+            if self._earnings_flatten_triggered(symbol, trade_date):
+                exit_reason = "earnings_flatten"
+            elif price <= position["stop_price"]:
                 exit_reason = "stop"
             elif self.config.exit_on_market_correction and regime_label == "market_correction":
                 exit_reason = "market_regime"
@@ -570,6 +579,34 @@ class PortfolioMinerviniBacktester(MinerviniBacktester):
             return set()
         return self._candidate_schedule[dates[idx]]
 
+    def _market_is_extended(self, trade_date) -> bool:
+        if not self.config.market_extension_filter_enabled:
+            return False
+        frame = getattr(self, "_market_extension_frame", None)
+        if frame is None or frame.empty:
+            return False
+        lag = int(self.config.market_extension_lag_bars or 0)
+        if lag > 0:
+            if trade_date not in frame.index:
+                return False
+            pos = frame.index.get_loc(trade_date)
+            if pos - lag < 0:
+                return False
+            row = frame.iloc[pos - lag]
+        else:
+            if trade_date not in frame.index:
+                return False
+            row = frame.loc[trade_date]
+        above = row.get("qqq_above_ema21_pct")
+        roc_5 = row.get("qqq_roc_5")
+        max_above = float(self.config.market_extension_max_qqq_above_ema21_pct)
+        max_roc_5 = float(self.config.market_extension_max_qqq_roc_5)
+        if pd.notna(above) and float(above) > max_above:
+            return True
+        if pd.notna(roc_5) and float(roc_5) > max_roc_5:
+            return True
+        return False
+
     def _compute_vol_scalar(self, equity_history: list) -> float:
         """Barroso & Santa-Clara style vol scalar computed from strategy equity.
 
@@ -615,6 +652,8 @@ class PortfolioMinerviniBacktester(MinerviniBacktester):
     ) -> None:
         if regime_label == "market_correction" and not self.config.allow_new_entries_in_correction:
             return
+        if self._market_is_extended(trade_date):
+            return
         effective_target_exposure = min(1.0, target_exposure * vol_scalar)
 
         candidates = []
@@ -645,6 +684,8 @@ class PortfolioMinerviniBacktester(MinerviniBacktester):
                 and self._row_passes_leader_continuation_entry(row, price)
             )
             if not (breakout_ok or continuation_ok or leader_cont_ok):
+                continue
+            if self._earnings_entry_blocked(symbol, trade_date):
                 continue
             if breakout_ok:
                 entry_type = "breakout"

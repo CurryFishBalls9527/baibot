@@ -16,6 +16,7 @@ from typing import Dict, List, Optional, Set
 import pandas as pd
 
 from .backtester import BacktestConfig
+from .earnings_blackout import EarningsBlackout
 from .market_context import build_market_context
 from .minervini import MinerviniConfig, MinerviniScreener
 from .portfolio_backtester import PortfolioBacktestResult, PortfolioMinerviniBacktester
@@ -114,7 +115,15 @@ class WalkForwardBacktester:
             if self.backtest_config.cross_asset_enabled
             else None
         )
-        extras = [benchmark] + ([cross_asset_symbol] if cross_asset_symbol else [])
+        # QQQ needed for the upstream-inspired market-extension entry filter.
+        # Load even when the filter is off so the regime_frame has it available
+        # for future experiments; cost is one extra index symbol.
+        index_extras = ["QQQ"]
+        extras = (
+            [benchmark]
+            + ([cross_asset_symbol] if cross_asset_symbol else [])
+            + index_extras
+        )
         logger.info(f"Loading data for {len(seed_symbols)} symbols + {extras}...")
         all_symbols = sorted(set(seed_symbols + extras))
         all_data = self.warehouse.get_daily_bars_bulk(all_symbols, start_date, end_date)
@@ -127,6 +136,11 @@ class WalkForwardBacktester:
         cross_asset_df = (
             all_data.pop(cross_asset_symbol, None) if cross_asset_symbol else None
         )
+        index_frames: Dict[str, pd.DataFrame] = {benchmark: benchmark_df}
+        for idx_sym in index_extras:
+            idx_df = all_data.pop(idx_sym, None)
+            if idx_df is not None and not idx_df.empty:
+                index_frames[idx_sym] = idx_df
         data_by_symbol = {
             sym: df for sym, df in all_data.items()
             if len(df) >= self.wf_config.min_data_bars
@@ -166,8 +180,28 @@ class WalkForwardBacktester:
             f"({len(rebalance_dates)} rebalance points)"
         )
 
-        # Build regime frame once (needs SPY at minimum)
+        # Build regime frame once (needs SPY at minimum). Kept SPY-only to
+        # preserve the existing screening regime classification. QQQ metrics
+        # for the market-extension filter flow through a separate frame below.
         regime_frame = build_market_context({benchmark: benchmark_df})
+
+        # Build a QQQ extension frame when QQQ loaded. Passed to the portfolio
+        # backtester so the market-extension entry filter can gate new-position
+        # opens. Does NOT affect screening or regime classification.
+        qqq_frame = index_frames.get("QQQ")
+        if qqq_frame is not None and not qqq_frame.empty:
+            qqq_sorted = qqq_frame.sort_index()
+            qqq_close = qqq_sorted["close"]
+            qqq_ema_21 = qqq_close.ewm(span=21, adjust=False).mean()
+            market_extension_frame = pd.DataFrame(
+                {
+                    "qqq_above_ema21_pct": qqq_close / qqq_ema_21 - 1.0,
+                    "qqq_roc_5": qqq_close.pct_change(5),
+                },
+                index=qqq_sorted.index,
+            )
+        else:
+            market_extension_frame = None
 
         # 4. Build candidate schedule (point-in-time screening)
         logger.info("Screening at each rebalance point (point-in-time)...")
@@ -181,9 +215,17 @@ class WalkForwardBacktester:
 
         # 5. Run portfolio backtest with the schedule
         logger.info("Running portfolio backtest with dynamic universe...")
+        earnings_blackout = None
+        if (
+            self.backtest_config.earnings_blackout_entry_days > 0
+            or self.backtest_config.earnings_flatten_days_before > 0
+            or self.backtest_config.earnings_flatten_last_bar_only
+        ):
+            earnings_blackout = EarningsBlackout(warehouse=self.warehouse)
         backtester = PortfolioMinerviniBacktester(
             config=self.backtest_config,
             screener=self.screener,
+            earnings_blackout=earnings_blackout,
         )
 
         portfolio_result = backtester.backtest_portfolio(
@@ -192,6 +234,7 @@ class WalkForwardBacktester:
             trade_start_date=trade_start_ts.strftime("%Y-%m-%d"),
             candidate_schedule=candidate_schedule,
             cross_asset_df=cross_asset_df,
+            market_extension_frame=market_extension_frame,
         )
 
         # 6. Build universe snapshots dict

@@ -123,7 +123,7 @@ variants:
       minervini_add_on_enabled: true
 
   - name: chan_v2
-    description: Chan v2 — dead money stop at 150 bars (only validated improvement)
+    description: Chan v2 — dead money + regime gate (asymmetric bear protection)
     alpaca_api_key: "${ALPACA_CHAN_V2_API_KEY}"
     alpaca_secret_key: "${ALPACA_CHAN_V2_SECRET_KEY}"
     db_path: trading_chan_v2.db
@@ -142,6 +142,12 @@ variants:
       # v2 addition: dead money at 150 bars (+10.9pp return in backtest)
       chan_dead_money_bars: 150
       chan_dead_money_min_gain: 0.05
+      # 2026-04-28: regime gate (asymmetric bear protection). Block new entries
+      # when SPY composite score <= 3. Validated on broad universe (R/DD 3.44 →
+      # 5.61) + multi-period (2018: -18% → -7%; 2025: -29% → -19%). Cost: 2020-style
+      # V-recovery returns -16pp. Reversible — delete these two lines to disable.
+      chan_regime_gate_enabled: true
+      chan_regime_min_score: 3
 
   - name: chan_daily
     description: |
@@ -158,8 +164,13 @@ variants:
       strategy_type: chan_daily
       # NEW NEW OPTIMAL config from research sweeps. Do NOT change without re-running
       # backtests in scripts/sweep_chan_optimization.py + scripts/sweep_chan_phase2.py.
+      # 2026-04-28: 4x sizing confirmed safe after MTM-bug fix invalidated the prior
+      # "2026-04-15 risk-off" tail-risk concern (was an artifact of zeroing missing
+      # data). Real 2026 YTD at 4x: +13.57% / -9.56% DD / R/DD +1.42.
       risk_per_trade: 0.020
-      position_pct: 0.25
+      position_pct: 0.25       # backtester-internal sizing key (kept for parity)
+      max_position_pct: 0.25   # LIVE per-position cap (read by PositionSizer + RiskEngine)
+      max_total_exposure: 1.50 # 6 × 25% = 150% gross max; default 0.72 would block 4x
       max_positions: 6
       daily_db_path: research_data/market_data.duckdb
       chan_daily_universe:

@@ -72,6 +72,36 @@ class ChanDailyBacktestConfig:
     stop_atr_mult: float = 2.0
     structural_stop: bool = True   # use bi-low/bi-high if closer than ATR cap
     time_stop_bars: int = 60       # ~3 months daily
+    # Per-signal-type stops (Test 3): when > 0, override stop_atr_mult / time_stop_bars
+    # for seg-bsp branch entries (entry types_str starts with "seg:").
+    # 0 = use main values for both branches.
+    stop_atr_mult_seg: float = 0.0
+    time_stop_bars_seg: int = 0
+
+    # Vol-adaptive exit overlay. When ATR(today) / ATR(entry) >= vol_expansion_ratio,
+    # take action. Modes:
+    #   "off"          — no-op
+    #   "tighten_stop" — set stop to max(current_stop, close - vol_tightened_atr_mult * atr_today)
+    #   "exit"         — close at next open immediately
+    vol_adaptive_exit_mode: str = "off"
+    vol_expansion_ratio: float = 1.5
+    vol_tightened_atr_mult: float = 1.0
+
+    # Re-entry after stop overlay. After a stop-loss exit, if price recovers above
+    # the original entry-trigger level within reentry_window_bars, allow ONE re-entry
+    # without requiring a fresh BSP/Donchian signal. Theory: noise stops in trends
+    # leave alpha on the table — the trend isn't broken, only intraday noise hit stop.
+    reentry_after_stop_enabled: bool = False
+    reentry_window_bars: int = 5
+    reentry_max_count: int = 1   # max re-entries per symbol within the window
+
+    # Portfolio-level vol target. Compute realized vol of equity curve over the
+    # last lookback days. If realized vol exceeds target, scale new-entry sizing
+    # down proportionally (target/actual, clipped to min/max). 0.0 = disabled.
+    portfolio_vol_target: float = 0.0   # annualized; 0.12 = 12%
+    portfolio_vol_lookback: int = 30    # trading days
+    portfolio_vol_scale_min: float = 0.5
+    portfolio_vol_scale_max: float = 1.0
 
     # Trailing stop overlay (off by default).
     # When profit reaches breakeven_at_r * initial_risk, raise stop to entry price.
@@ -145,6 +175,38 @@ class ChanDailyBacktestConfig:
     volume_confirm_lookback: int = 20
     volume_confirm_mult: float = 1.5
 
+    # Donchian breakout strength filter: require close > donchian_high × (1 + this).
+    # 0.0 = current behavior (any margin above breakout). 0.005 = require 0.5% above.
+    # Filters "marginal" breakouts that often reverse immediately.
+    donchian_breakout_min_pct: float = 0.0
+
+    # Pyramid scale-in: add to winners as MFE grows. Classic CTA technique.
+    # Adds at each R-multiple threshold; first add moves stop to breakeven.
+    pyramid_enabled: bool = False
+    pyramid_thresholds_r: tuple = (1.5, 3.0)
+    pyramid_add_fractions: tuple = (0.5, 0.33)
+    pyramid_breakeven_after_first_add: bool = True
+    # Conditional pyramid: only add when entry-time context matches (Test 1).
+    # All three default OFF — enable individually or combined.
+    pyramid_donchian_only: bool = False              # only pyramid Donchian-branch entries
+    pyramid_require_up_segseg_sure: bool = False     # only pyramid when entry segseg up + sure
+    pyramid_require_zs_broken: bool = False          # only pyramid when entry zs_broken == True
+
+    # Equity-curve gate: pause new entries when account equity is in DD vs
+    # high-water mark by more than `equity_dd_threshold_pct`. Resume when DD
+    # recovers to within `equity_dd_resume_pct`. 0 = off.
+    equity_dd_threshold_pct: float = 0.0
+    equity_dd_resume_pct: float = 0.0
+
+    # Sector cap: limit concurrent positions in "equity-correlated" group.
+    # When set > 0, at most N of the held positions can be in this group.
+    # Group symbols are passed via `equity_sector_symbols`.
+    equity_sector_max_positions: int = 0
+    equity_sector_symbols: tuple = (
+        "SPY", "QQQ", "IWM", "DIA",
+        "XLF", "XLE", "XLK", "XLV", "XLI", "XLY", "XLP", "XLU",
+    )
+
     # Same-level decomposition (同级别分解): only enter when most recent bi is
     # confirmed UP — i.e., a pullback has bottomed and reversed. Avoids "chasing"
     # entries mid-decline. This is the canonical Chan workflow: signal at level X
@@ -167,6 +229,31 @@ class ChanDailyBacktestConfig:
     vix_symbol: str = "^VIX"
     vix_block_threshold: float = 30.0  # block new entries if VIX > this
     vix_scale_mode: str = "off"        # "off" | "linear_above_20"
+
+    # Credit-spread regime gate: HYG/LQD ratio (or HYG/TLT) as risk-on/off proxy.
+    # When ratio is below its lookback SMA OR has fallen by > drop_pct over lookback,
+    # block new entries. Theory: credit spreads are a leading risk indicator,
+    # detect bear regimes (2014-16, 2018Q4) without killing V-recoveries (2020-22).
+    credit_spread_filter_enabled: bool = False
+    credit_spread_numerator: str = "HYG"   # high-yield ETF
+    credit_spread_denominator: str = "LQD" # investment-grade ETF (or "TLT" for flight-to-quality)
+    credit_spread_lookback: int = 60       # SMA / delta window
+    credit_spread_block_mode: str = "below_sma"  # "below_sma" | "negative_delta" | "z_below"
+    credit_spread_z_threshold: float = -0.5  # z-score threshold for "z_below" mode
+    credit_spread_drop_pct: float = 0.0    # additional buffer (block when below SMA × (1 - drop_pct))
+
+    # Calendar / seasonality gates.
+    # sell_in_may: block entries May-Oct (months 5-10), allow Nov-Apr.
+    # santa_only: only allow entries in Nov-Jan (extreme: trade only Q4 + Jan).
+    # block_months: explicit list of months to block (e.g., [9] = block September).
+    # block_pre_fomc_days: block entries within N trading days BEFORE FOMC meetings
+    #   (FOMC meeting dates are passed in fomc_dates).
+    # block_earnings_days: block entries within N trading days BEFORE/AFTER earnings;
+    #   earnings_dates is a dict[symbol, list[date]] (currently no auto-loader; null gate when empty).
+    calendar_filter_mode: str = "off"  # "off" | "sell_in_may" | "santa_only" | "block_months"
+    calendar_block_months: tuple[int, ...] = ()
+    fomc_block_days: int = 0
+    fomc_dates: tuple = ()  # tuple of pd.Timestamp or string dates
     # Realized-vol sizing scaler: scale risk_per_trade inversely to recent ATR%/price.
     # When enabled, position sizing reduces in high-vol regimes.
     vol_scale_enabled: bool = False
@@ -219,6 +306,15 @@ class _DailyPosition:
     initial_risk_per_share: float = 0.0   # entry_price - stop_price (long) or vice versa
     partial_taken: bool = False
     breakeven_set: bool = False
+    # Pyramid bookkeeping
+    initial_shares: int = 0          # shares at first entry (for pyramid sizing reference)
+    pyramid_level: int = 0           # which threshold we've crossed (0 = no add yet)
+    # Entry-time context (used by conditional pyramid logic)
+    entry_segseg_dir: Optional[str] = None
+    entry_segseg_is_sure: Optional[bool] = None
+    entry_zs_broken: Optional[bool] = None
+    # ATR at entry — used by vol-adaptive exit overlay
+    entry_atr: float = 0.0
 
 
 class PortfolioChanDailyBacktester:
@@ -716,15 +812,60 @@ class PortfolioChanDailyBacktester:
             except Exception as e:
                 log.warning("VIX load failed: %s", e)
 
+        # Load credit-spread proxy series (numerator / denominator ratio + rolling SMA)
+        credit_ratio: Optional[pd.Series] = None
+        credit_sma: Optional[pd.Series] = None
+        credit_delta: Optional[pd.Series] = None
+        credit_z: Optional[pd.Series] = None
+        if cfg.credit_spread_filter_enabled:
+            try:
+                conn = duckdb.connect(cfg.daily_db_path, read_only=True)
+                df_n = conn.execute(
+                    "SELECT trade_date, close FROM daily_bars WHERE symbol = ? ORDER BY trade_date",
+                    [cfg.credit_spread_numerator],
+                ).fetchdf()
+                df_d = conn.execute(
+                    "SELECT trade_date, close FROM daily_bars WHERE symbol = ? ORDER BY trade_date",
+                    [cfg.credit_spread_denominator],
+                ).fetchdf()
+                conn.close()
+                if df_n.empty or df_d.empty:
+                    log.warning("Credit-spread series missing (%s or %s not in DB); gate no-op",
+                                cfg.credit_spread_numerator, cfg.credit_spread_denominator)
+                else:
+                    df_n["trade_date"] = pd.to_datetime(df_n["trade_date"])
+                    df_d["trade_date"] = pd.to_datetime(df_d["trade_date"])
+                    sn = df_n.set_index("trade_date")["close"]
+                    sd = df_d.set_index("trade_date")["close"]
+                    common = sn.index.intersection(sd.index)
+                    credit_ratio = (sn.loc[common] / sd.loc[common]).sort_index()
+                    credit_sma = credit_ratio.rolling(cfg.credit_spread_lookback, min_periods=cfg.credit_spread_lookback).mean()
+                    credit_delta = credit_ratio - credit_ratio.shift(cfg.credit_spread_lookback)
+                    rstd = credit_ratio.rolling(cfg.credit_spread_lookback, min_periods=cfg.credit_spread_lookback).std()
+                    credit_z = (credit_ratio - credit_sma) / rstd.replace(0, pd.NA)
+                    log.info("Loaded credit-spread series %s/%s: %d obs, lookback=%d, mode=%s",
+                             cfg.credit_spread_numerator, cfg.credit_spread_denominator,
+                             len(credit_ratio), cfg.credit_spread_lookback, cfg.credit_spread_block_mode)
+            except Exception as e:
+                log.warning("Credit-spread load failed: %s", e)
+
         all_dates = sorted({d for s in symbols for d in bars[s].index})
         date_to_idx = {d: i for i, d in enumerate(all_dates)}
 
         cash = cfg.initial_cash
+        # Equity-curve high-water mark + DD-pause flag (for equity_dd gate)
+        equity_high_water = cfg.initial_cash
+        equity_dd_paused = False
+        equity_sector_set = set(cfg.equity_sector_symbols)
         positions: dict[str, _DailyPosition] = {}
         pending_entries: list[dict] = []
         pending_exits: list[dict] = []  # sell-signal exits decided yesterday
         trades: list[dict] = []
         equity_curve: list[dict] = []
+        # Re-entry tracking: per-symbol list of recent stops (for reentry_after_stop overlay).
+        # Each entry: {"stop_bar_idx": int, "entry_price": float, "bsp_types": str,
+        #              "ref_price": float, "count": int, "entry_ctx": dict}
+        recently_stopped: dict[str, dict] = {}
 
         slip_buy = 1.0 + cfg.slippage_bps / 10_000.0
         slip_sell = 1.0 - cfg.slippage_bps / 10_000.0
@@ -825,9 +966,16 @@ class PortfolioChanDailyBacktester:
 
                 atr_today = float(atr_per_sym[sym].loc[today]) if today in atr_per_sym[sym].index else 0.0
 
+                # Per-signal-type stop multiplier (Test 3): seg-bsp branch can use
+                # a different ATR multiplier (typically tighter — reversal signals
+                # should fail/work fast).
+                stop_mult_eff = cfg.stop_atr_mult
+                if cfg.stop_atr_mult_seg > 0 and str(entry.get("types_str", "")).startswith("seg:"):
+                    stop_mult_eff = cfg.stop_atr_mult_seg
+
                 if direction == "long":
                     fill = open_p * slip_buy
-                    atr_stop = fill - cfg.stop_atr_mult * atr_today
+                    atr_stop = fill - stop_mult_eff * atr_today
                     if cfg.structural_stop and entry["ref_price"] > 0:
                         stop_price = max(entry["ref_price"], atr_stop)  # tighter wins
                     else:
@@ -837,7 +985,7 @@ class PortfolioChanDailyBacktester:
                     risk_per_share = fill - stop_price
                 else:  # short
                     fill = open_p * slip_sell  # we sell short at the bid-side
-                    atr_stop = fill + cfg.stop_atr_mult * atr_today
+                    atr_stop = fill + stop_mult_eff * atr_today
                     if cfg.structural_stop and entry["ref_price"] > 0:
                         stop_price = min(entry["ref_price"], atr_stop)  # tighter (closer above) wins
                     else:
@@ -854,6 +1002,23 @@ class PortfolioChanDailyBacktester:
                     atr_pct = atr_today / fill
                     if atr_pct > 0:
                         size_scale = max(0.5, min(2.0, cfg.vol_scale_target_pct / atr_pct))
+
+                # Portfolio-level vol target: scale down when book vol > target
+                if cfg.portfolio_vol_target > 0 and len(equity_curve) >= cfg.portfolio_vol_lookback + 1:
+                    eq_vals = [r["equity"] for r in equity_curve[-(cfg.portfolio_vol_lookback + 1):]]
+                    rets = []
+                    for i in range(1, len(eq_vals)):
+                        if eq_vals[i - 1] > 0:
+                            rets.append(eq_vals[i] / eq_vals[i - 1] - 1.0)
+                    if len(rets) >= 5:
+                        import statistics
+                        daily_std = statistics.pstdev(rets)
+                        ann_vol = daily_std * (252 ** 0.5)
+                        if ann_vol > 0:
+                            scale = cfg.portfolio_vol_target / ann_vol
+                            scale = max(cfg.portfolio_vol_scale_min,
+                                        min(cfg.portfolio_vol_scale_max, scale))
+                            size_scale *= scale
 
                 mult = _mult(sym)
                 # Per-contract risk = risk-per-share × multiplier (futures point P&L)
@@ -903,6 +1068,7 @@ class PortfolioChanDailyBacktester:
                         continue
                     cash -= commission  # margin posted but tracked separately conceptually
 
+                ectx = entry.get("entry_ctx") or {}
                 positions[sym] = _DailyPosition(
                     symbol=sym, shares=shares, entry_price=fill,
                     entry_date=today, entry_bar_idx=d_idx,
@@ -911,6 +1077,11 @@ class PortfolioChanDailyBacktester:
                     direction=direction,
                     low_since_entry=float(today_bar["low"]),
                     initial_risk_per_share=risk_per_share,
+                    initial_shares=shares,
+                    entry_segseg_dir=ectx.get("segseg_dir"),
+                    entry_segseg_is_sure=ectx.get("segseg_is_sure"),
+                    entry_zs_broken=ectx.get("zs_broken"),
+                    entry_atr=atr_today,
                 )
             pending_entries = still_pending
 
@@ -963,11 +1134,84 @@ class PortfolioChanDailyBacktester:
                             new_stop = pos.high_since_entry - cfg.trail_atr_mult * atr_today
                             pos.stop_price = max(pos.stop_price, new_stop)
 
+                    # Vol-adaptive exit overlay (long only — short side ignored for now).
+                    # Detect ATR expansion vs entry; tighten stop or exit immediately.
+                    if (cfg.vol_adaptive_exit_mode != "off"
+                            and pos.direction == "long"
+                            and pos.entry_atr > 0
+                            and sym in atr_per_sym):
+                        atr_today = float(atr_per_sym[sym].loc[today]) if today in atr_per_sym[sym].index else 0.0
+                        if atr_today > 0 and atr_today / pos.entry_atr >= cfg.vol_expansion_ratio:
+                            if cfg.vol_adaptive_exit_mode == "tighten_stop":
+                                close_today = float(today_bar["close"])
+                                new_stop = close_today - cfg.vol_tightened_atr_mult * atr_today
+                                pos.stop_price = max(pos.stop_price, new_stop)
+                            elif cfg.vol_adaptive_exit_mode == "exit":
+                                # Schedule exit at next bar's open via sell-signal queue
+                                pending_exits.append({"symbol": sym, "kind": "sell"})
+
+                    # Pyramid scale-in: add to position when MFE crosses thresholds
+                    # Conditional gates (Test 1): skip pyramid if entry-time context
+                    # doesn't match enabled requirements.
+                    pyramid_ctx_ok = True
+                    if cfg.pyramid_enabled:
+                        if cfg.pyramid_donchian_only:
+                            # bsp_types is "donchian" for Donchian-branch entries; "seg:T2S" etc for seg-bsp
+                            if not str(pos.bsp_types).startswith("donchian"):
+                                pyramid_ctx_ok = False
+                        if pyramid_ctx_ok and cfg.pyramid_require_up_segseg_sure:
+                            if not (pos.entry_segseg_dir == "up" and bool(pos.entry_segseg_is_sure)):
+                                pyramid_ctx_ok = False
+                        if pyramid_ctx_ok and cfg.pyramid_require_zs_broken:
+                            if not bool(pos.entry_zs_broken):
+                                pyramid_ctx_ok = False
+
+                    if cfg.pyramid_enabled and pyramid_ctx_ok and pos.initial_shares > 0:
+                        # Check next pyramid threshold (if any remaining)
+                        while pos.pyramid_level < len(cfg.pyramid_thresholds_r):
+                            threshold_r = cfg.pyramid_thresholds_r[pos.pyramid_level]
+                            if r_multiple < threshold_r:
+                                break
+                            # Add!
+                            add_frac = cfg.pyramid_add_fractions[pos.pyramid_level]
+                            add_shares = int(pos.initial_shares * add_frac)
+                            if add_shares <= 0:
+                                pos.pyramid_level += 1
+                                continue
+                            add_price = float(today_bar["open"]) * slip_buy
+                            cost = add_shares * add_price * (1.0 + commission_rate)
+                            if cost > cash:
+                                # Not enough cash for the add — skip but advance level so we don't retry
+                                pos.pyramid_level += 1
+                                continue
+                            cash -= cost
+                            # Recompute weighted avg entry
+                            new_total = pos.shares + add_shares
+                            pos.entry_price = (pos.entry_price * pos.shares + add_price * add_shares) / new_total
+                            pos.shares = new_total
+                            pos.pyramid_level += 1
+                            # Move stop to breakeven on first add
+                            if pos.pyramid_level == 1 and cfg.pyramid_breakeven_after_first_add:
+                                pos.stop_price = max(pos.stop_price, pos.entry_price)
+                                pos.breakeven_set = True
+
                 if pos.direction == "long":
                     if float(today_bar["low"]) <= pos.stop_price:
                         open_p = float(today_bar["open"])
                         # Gap below stop fills at open; else at stop
                         fill_price = min(pos.stop_price, open_p)
+                        if cfg.reentry_after_stop_enabled:
+                            recently_stopped[sym] = {
+                                "stop_bar_idx": d_idx,
+                                "entry_price": pos.entry_price,
+                                "bsp_types": pos.bsp_types,
+                                "count": 0,
+                                "entry_ctx": {
+                                    "segseg_dir": pos.entry_segseg_dir,
+                                    "segseg_is_sure": pos.entry_segseg_is_sure,
+                                    "zs_broken": pos.entry_zs_broken,
+                                },
+                            }
                         _close_position(sym, pos, fill_price, today, "stop")
                         to_remove.append(sym)
                         continue
@@ -980,8 +1224,12 @@ class PortfolioChanDailyBacktester:
                         to_remove.append(sym)
                         continue
 
-                # Time stop — exit at today's close
-                if pos.bars_held >= cfg.time_stop_bars:
+                # Time stop — exit at today's close. Per-signal-type override (Test 3):
+                # seg-bsp branch may use a shorter time stop.
+                ts_bars_eff = cfg.time_stop_bars
+                if cfg.time_stop_bars_seg > 0 and str(pos.bsp_types).startswith("seg:"):
+                    ts_bars_eff = cfg.time_stop_bars_seg
+                if pos.bars_held >= ts_bars_eff:
                     _close_position(sym, pos, float(today_bar["close"]), today, "time_stop")
                     to_remove.append(sym)
             for sym in to_remove:
@@ -1055,6 +1303,18 @@ class PortfolioChanDailyBacktester:
                     lbs = sig.get("last_bi_sure")
                     bi_timing_ok = (lbd == "up") and bool(lbs)
 
+                # Equity-curve drawdown gate (block new entries while paused)
+                equity_curve_ok = True
+                if cfg.equity_dd_threshold_pct > 0 and equity_dd_paused:
+                    equity_curve_ok = False
+
+                # Sector cap: limit concurrent equity-correlated positions
+                sector_cap_ok = True
+                if cfg.equity_sector_max_positions > 0:
+                    held_equity = sum(1 for s in positions if s in equity_sector_set)
+                    if sym in equity_sector_set and held_equity >= cfg.equity_sector_max_positions:
+                        sector_cap_ok = False
+
                 # Trend-type gate (走势类型)
                 trend_type_long_ok = True
                 if cfg.trend_type_filter_mode != "off":
@@ -1085,6 +1345,54 @@ class PortfolioChanDailyBacktester:
                     if vix_today is not None and vix_today > cfg.vix_block_threshold:
                         vix_ok = False
 
+                # Calendar / seasonality gate
+                cal_ok = True
+                if cfg.calendar_filter_mode != "off":
+                    m = today.month
+                    if cfg.calendar_filter_mode == "sell_in_may":
+                        # Block May-Oct
+                        if m in (5, 6, 7, 8, 9, 10):
+                            cal_ok = False
+                    elif cfg.calendar_filter_mode == "santa_only":
+                        # Allow only Nov-Jan
+                        if m not in (11, 12, 1):
+                            cal_ok = False
+                    elif cfg.calendar_filter_mode == "block_months":
+                        if m in cfg.calendar_block_months:
+                            cal_ok = False
+                # FOMC pre-meeting blackout
+                if cal_ok and cfg.fomc_block_days > 0 and cfg.fomc_dates:
+                    fdates = pd.to_datetime(list(cfg.fomc_dates))
+                    today_ts = pd.Timestamp(today)
+                    diffs = (fdates - today_ts).days
+                    if any(0 <= d <= cfg.fomc_block_days for d in diffs):
+                        cal_ok = False
+
+                # Credit-spread regime gate. Use prior bar (today is decision day,
+                # but ratio uses close — we read from the most recent index <= today
+                # which on a trading day equals today's close. To stay strict no-look,
+                # use ratio asof (today - 1 trading day).
+                credit_ok = True
+                if cfg.credit_spread_filter_enabled and credit_ratio is not None:
+                    prior_idx = credit_ratio.index[credit_ratio.index < today]
+                    if len(prior_idx) > 0:
+                        ref_day = prior_idx[-1]
+                        r_now = float(credit_ratio.loc[ref_day])
+                        if cfg.credit_spread_block_mode == "below_sma":
+                            sma_v = credit_sma.loc[ref_day] if ref_day in credit_sma.index else None
+                            if sma_v is not None and not pd.isna(sma_v):
+                                threshold = float(sma_v) * (1.0 - cfg.credit_spread_drop_pct)
+                                if r_now < threshold:
+                                    credit_ok = False
+                        elif cfg.credit_spread_block_mode == "negative_delta":
+                            d_v = credit_delta.loc[ref_day] if ref_day in credit_delta.index else None
+                            if d_v is not None and not pd.isna(d_v) and float(d_v) < 0.0:
+                                credit_ok = False
+                        elif cfg.credit_spread_block_mode == "z_below":
+                            z_v = credit_z.loc[ref_day] if ref_day in credit_z.index else None
+                            if z_v is not None and not pd.isna(z_v) and float(z_v) < cfg.credit_spread_z_threshold:
+                                credit_ok = False
+
                 # Segseg direction gate (chan.py-internal 段套段, same data source as base)
                 segseg_long_ok = True
                 segseg_short_ok = True
@@ -1109,7 +1417,7 @@ class PortfolioChanDailyBacktester:
                         d_high = donchian_high_per_sym[sym].loc[today]
                         d_low = donchian_low_per_sym[sym].loc[today]
                         close_today = float(bars[sym].loc[today, "close"]) if today in bars[sym].index else None
-                        if close_today is not None and not pd.isna(d_high) and close_today > float(d_high):
+                        if close_today is not None and not pd.isna(d_high) and close_today > float(d_high) * (1 + cfg.donchian_breakout_min_pct):
                             # Volume-confirm gate (Donchian branch only)
                             volume_ok = True
                             if cfg.volume_confirm_enabled and sym in volume_avg_per_sym:
@@ -1158,7 +1466,7 @@ class PortfolioChanDailyBacktester:
                         d_high = donchian_high_per_sym[sym].loc[today]
                         d_low = donchian_low_per_sym[sym].loc[today]
                         close_today = float(bars[sym].loc[today, "close"]) if today in bars[sym].index else None
-                        if close_today is not None and not pd.isna(d_high) and close_today > float(d_high):
+                        if close_today is not None and not pd.isna(d_high) and close_today > float(d_high) * (1 + cfg.donchian_breakout_min_pct):
                             # Volume-confirm gate (Donchian branch only)
                             volume_ok = True
                             if cfg.volume_confirm_enabled and sym in volume_avg_per_sym:
@@ -1190,7 +1498,7 @@ class PortfolioChanDailyBacktester:
                         d_high = donchian_high_per_sym[sym].loc[today]
                         d_low = donchian_low_per_sym[sym].loc[today]
                         close_today = float(bars[sym].loc[today, "close"]) if today in bars[sym].index else None
-                        if close_today is not None and not pd.isna(d_high) and close_today > float(d_high):
+                        if close_today is not None and not pd.isna(d_high) and close_today > float(d_high) * (1 + cfg.donchian_breakout_min_pct):
                             # Volume-confirm gate (Donchian branch only)
                             volume_ok = True
                             if cfg.volume_confirm_enabled and sym in volume_avg_per_sym:
@@ -1230,7 +1538,13 @@ class PortfolioChanDailyBacktester:
                     if sig.get("sell"):
                         short_signal = {"types_str": sig["sell"]["types_str"], "ref_price": sig["sell"]["bi_high"]}
 
-                if cfg.enable_longs and long_signal and trend_long_ok and momentum_long_ok and weekly_long_ok and segseg_long_ok and zs_div_ok and vix_ok and trend_type_long_ok and bi_timing_ok:
+                # Capture entry-time signal context for conditional pyramid (Test 1)
+                entry_ctx = {
+                    "segseg_dir": sig.get("segseg_dir"),
+                    "segseg_is_sure": sig.get("segseg_is_sure"),
+                    "zs_broken": sig.get("zs_broken"),
+                }
+                if cfg.enable_longs and long_signal and trend_long_ok and momentum_long_ok and weekly_long_ok and segseg_long_ok and zs_div_ok and vix_ok and credit_ok and cal_ok and trend_type_long_ok and bi_timing_ok and equity_curve_ok and sector_cap_ok:
                     pending_entries.append({
                         "symbol": sym,
                         "direction": "long",
@@ -1238,8 +1552,42 @@ class PortfolioChanDailyBacktester:
                         "types_str": long_signal["types_str"],
                         "ready_after_idx": d_idx + cfg.entry_lag_extra_days,
                         "momentum_rank": sym_rank_val,
+                        "entry_ctx": entry_ctx,
                     })
-                if cfg.enable_shorts and short_signal and trend_short_ok and momentum_short_ok and weekly_short_ok and segseg_short_ok and vix_ok:
+                # Re-entry after stop overlay: if symbol was recently stopped and
+                # today's close has reclaimed the original entry price, inject a
+                # synthetic re-entry (without requiring a fresh BSP/Donchian signal).
+                if (cfg.reentry_after_stop_enabled
+                        and not long_signal  # only synthesize if no live signal already
+                        and sym in recently_stopped
+                        and cfg.enable_longs
+                        and trend_long_ok and momentum_long_ok and weekly_long_ok
+                        and segseg_long_ok and zs_div_ok and vix_ok and credit_ok and cal_ok
+                        and trend_type_long_ok and bi_timing_ok and equity_curve_ok and sector_cap_ok):
+                    rs = recently_stopped[sym]
+                    bars_since = d_idx - rs["stop_bar_idx"]
+                    if (bars_since <= cfg.reentry_window_bars
+                            and rs["count"] < cfg.reentry_max_count
+                            and today in bars[sym].index):
+                        close_today = float(bars[sym].loc[today, "close"])
+                        if close_today > rs["entry_price"]:
+                            pending_entries.append({
+                                "symbol": sym,
+                                "direction": "long",
+                                "ref_price": rs["entry_price"],
+                                "types_str": str(rs["bsp_types"]) + ":reentry",
+                                "ready_after_idx": d_idx + cfg.entry_lag_extra_days,
+                                "momentum_rank": sym_rank_val,
+                                "entry_ctx": rs["entry_ctx"],
+                            })
+                            rs["count"] += 1
+
+                # Drop expired re-entry windows
+                if cfg.reentry_after_stop_enabled and sym in recently_stopped:
+                    if d_idx - recently_stopped[sym]["stop_bar_idx"] > cfg.reentry_window_bars:
+                        del recently_stopped[sym]
+
+                if cfg.enable_shorts and short_signal and trend_short_ok and momentum_short_ok and weekly_short_ok and segseg_short_ok and vix_ok and credit_ok and cal_ok:
                     pending_entries.append({
                         "symbol": sym,
                         "direction": "short",
@@ -1247,6 +1595,7 @@ class PortfolioChanDailyBacktester:
                         "types_str": short_signal["types_str"],
                         "ready_after_idx": d_idx + cfg.entry_lag_extra_days,
                         "momentum_rank": sym_rank_val,
+                        "entry_ctx": entry_ctx,
                     })
 
             # ----- 5. Mark-to-market equity -----
@@ -1280,6 +1629,16 @@ class PortfolioChanDailyBacktester:
                 "date": today, "cash": cash, "positions_value": mtm,
                 "equity": cash + mtm, "n_positions": len(positions),
             })
+
+            # Update equity-curve gate state
+            if cfg.equity_dd_threshold_pct > 0:
+                eq_today = cash + mtm
+                equity_high_water = max(equity_high_water, eq_today)
+                dd_now = (equity_high_water - eq_today) / equity_high_water
+                if not equity_dd_paused and dd_now >= cfg.equity_dd_threshold_pct:
+                    equity_dd_paused = True
+                elif equity_dd_paused and dd_now <= cfg.equity_dd_resume_pct:
+                    equity_dd_paused = False
 
         # ----- 6. Force-close any remaining at last available close -----
         for sym, pos in list(positions.items()):

@@ -1,9 +1,16 @@
-"""Single-page dark-themed dashboard for the paper-trading variants."""
+"""Today — single-variant operational view.
+
+User picks a variant from the top-bar dropdown; the page shows that
+variant's live KPI, equity curve, open positions, and trade history.
+Cross-variant overview moved to the Reviews page.
+
+Live log lives on its own page — see pages/4_Live_Log.py.
+"""
 
 from __future__ import annotations
 
 import subprocess
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Dict, List
 
@@ -24,10 +31,6 @@ _DEFAULT_EXPERIMENT = "experiments/paper_launch_v2.yaml"
 
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
-
-
-def _log_path(repo_root: Path) -> Path:
-    return repo_root / "results" / "service_logs" / "automation_service.out.log"
 
 
 @st.cache_resource(show_spinner=False)
@@ -87,16 +90,6 @@ def _trades_for(variant: str, limit: int = 50) -> pd.DataFrame:
     return frame
 
 
-def _tail_lines(path: Path, n: int = 120) -> List[str]:
-    if not path.exists():
-        return ["(log file not found)"]
-    try:
-        with path.open("r", encoding="utf-8", errors="replace") as h:
-            return h.readlines()[-n:]
-    except Exception as exc:
-        return [f"(error reading log: {exc})"]
-
-
 def _service_pill() -> str:
     try:
         uid = subprocess.check_output(["id", "-u"], text=True).strip()
@@ -124,9 +117,26 @@ _CSS = """
 /* Sidebar kept visible so multi-page nav (Performance / Trade Journal /
    Reviews) is reachable. The built-in header stays visible too — without
    it, Streamlit's sidebar-toggle chevron is invisible. */
-.block-container { padding: 1rem 1.25rem; max-width: 1500px; }
+/* Top padding must clear Streamlit's fixed header (~3rem), otherwise the
+   variant dropdown at page top clips behind it. */
+.block-container { padding: 4rem 1.25rem 1rem; max-width: 1500px; }
 .stApp { background: #0a0e14; }
-html, body, [class*="st-"] { font-family: 'IBM Plex Mono', 'Menlo', 'Consolas', monospace; }
+/* Apply the monospace font to text-bearing elements only. The previous
+   `[class*="st-"]` selector swept up every Streamlit emotion class,
+   including the spans Streamlit uses for Material icons — Material
+   icons render via font ligatures, so forcing monospace produced
+   literal `keyboard_double_arrow_left` text where the sidebar collapse
+   chevron should be a glyph. */
+html, body, .stMarkdown, .stText, .stDataFrame, .stTable, .stCaption,
+.stCode, .stMetric, .stButton button, .stSelectbox, .stMultiSelect,
+.stRadio, .stCheckbox, .stTextInput, .stTextArea, .stNumberInput {
+  font-family: 'IBM Plex Mono', 'Menlo', 'Consolas', monospace;
+}
+[class*="material-icons"], [class*="material-symbols"],
+span[class*="EmotionIcon"], span[data-testid*="Icon"] {
+  font-family: 'Material Symbols Outlined', 'Material Symbols Rounded',
+               'Material Icons' !important;
+}
 
 .tb-outer {
   border: 1px solid #1f2937; border-radius: 10px; background: #0d1117;
@@ -181,14 +191,6 @@ table.tb tr:last-child td { border-bottom: none; }
 }
 .tag-buy   { background: rgba(16,185,129,0.12); color: #10b981; border: 1px solid #10b981; }
 .tag-sell  { background: rgba(239,68,68,0.12);  color: #ef4444; border: 1px solid #ef4444; }
-
-.live-log {
-  background: #05080d; border: 1px solid #1f2937; border-radius: 4px;
-  padding: 0.6rem 0.75rem; height: 310px; overflow-y: auto;
-  font-family: 'Menlo', monospace; font-size: 0.72rem; color: #9ca3af;
-  white-space: pre-wrap; line-height: 1.35;
-}
-.live-log .err { color: #ef4444; }
 
 .footer {
   color: #4b5563; font-size: 0.68rem; text-align: center; margin-top: 1rem;
@@ -303,26 +305,9 @@ def _trades_html(trades: pd.DataFrame, limit: int = 14) -> str:
     )
 
 
-def _log_html(lines: List[str]) -> str:
-    safe = "".join(lines).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    # Cheap error coloring: lines that contain "ERROR" or "Traceback"
-    colored = []
-    for raw in safe.splitlines():
-        if "ERROR" in raw or "Traceback" in raw or " error " in raw.lower():
-            colored.append(f'<span class="err">{raw}</span>')
-        else:
-            colored.append(raw)
-    body = "\n".join(colored)
-    return (
-        f'<div class="live-log" id="livelog">{body}</div>'
-        '<script>var el=document.getElementById("livelog"); '
-        'if(el) el.scrollTop=el.scrollHeight;</script>'
-    )
-
-
 def main():
     st.set_page_config(
-        page_title="Trading Bot Dashboard",
+        page_title="Today",
         layout="wide",
         initial_sidebar_state="expanded",
     )
@@ -342,7 +327,8 @@ def main():
         c1, c2, c3, c4 = st.columns([4, 2, 1.2, 0.8])
         with c1:
             st.markdown(
-                '<div class="tb-title">TRADING<em>/</em>BOT DASHBOARD<small>PAPER v2</small></div>',
+                '<div class="tb-title">TODAY<em>·</em>'
+                f'<small>{date.today().isoformat()}</small></div>',
                 unsafe_allow_html=True,
             )
         with c2:
@@ -438,27 +424,15 @@ def main():
             unsafe_allow_html=True,
         )
 
-    # ── Trade history + live log ─────────────────────────────────────
-    tcol, lcol = st.columns([1.0, 1.0])
-    with tcol:
-        trades = _trades_for(variant)
-        st.markdown(
-            f'<div class="panel"><div class="panel-head">'
-            f'<div class="panel-title">TRADE HISTORY</div>'
-            f'<div class="panel-meta">last 50</div>'
-            f'</div>{_trades_html(trades)}</div>',
-            unsafe_allow_html=True,
-        )
-
-    with lcol:
-        lines = _tail_lines(_log_path(_repo_root()), n=120)
-        st.markdown(
-            f'<div class="panel"><div class="panel-head">'
-            f'<div class="panel-title">LIVE LOG</div>'
-            f'<div class="panel-meta">last 120 lines · auto-scroll</div>'
-            f'</div>{_log_html(lines)}</div>',
-            unsafe_allow_html=True,
-        )
+    # ── Trade history ────────────────────────────────────────────────
+    trades = _trades_for(variant)
+    st.markdown(
+        f'<div class="panel"><div class="panel-head">'
+        f'<div class="panel-title">TRADE HISTORY</div>'
+        f'<div class="panel-meta">last 50</div>'
+        f'</div>{_trades_html(trades)}</div>',
+        unsafe_allow_html=True,
+    )
 
     # ── Footer ────────────────────────────────────────────────────────
     st.markdown(

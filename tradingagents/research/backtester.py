@@ -7,6 +7,7 @@ from typing import Dict, Optional
 
 import pandas as pd
 
+from .earnings_blackout import EarningsBlackout
 from .minervini import MinerviniScreener
 
 
@@ -149,6 +150,31 @@ class BacktestConfig:
     cross_asset_trend_ma_days: int = 200
     # Stop-loss on the cross_asset position itself (peak-to-close drop).
     cross_asset_stop_loss_pct: float = 0.10
+    # Upstream-inspired "don't chase" gate: block new entries when QQQ is
+    # stretched above its 21EMA or running too fast over the last 5 sessions.
+    # Set *_enabled=True and tune the two thresholds to taste. When the
+    # filter fires on a given day, NO new entries (breakout/continuation/
+    # leader_continuation) are opened; existing positions are unaffected.
+    market_extension_filter_enabled: bool = False
+    market_extension_max_qqq_above_ema21_pct: float = 0.05
+    market_extension_max_qqq_roc_5: float = 0.05
+    # Future-blanked probe for bias audit: when > 0, evaluate the filter
+    # against QQQ data from N bars ago instead of the current bar. If the
+    # filter's effect disappears with lag=1, it was reading same-day info
+    # that would not have been available at the open.
+    market_extension_lag_bars: int = 0
+    # Earnings-report blackout. When > 0, skip new entries if an ER is
+    # within N days of the candidate bar; flatten existing positions if
+    # an ER is within M days. Uses the earnings_events table populated by
+    # warehouse.fetch_and_store_earnings_events. BMO/AMC time_hint is
+    # respected; unknown-hint rows (AV fallback) are treated as whole-day
+    # blackout. 0 = disabled (default; preserves baseline reproducibility).
+    earnings_blackout_entry_days: int = 0
+    earnings_flatten_days_before: int = 0
+    # Just-in-time flatten: close positions ONLY at the last pre-print bar
+    # (AMC → close of ER day; BMO → close of day prior). When True,
+    # earnings_flatten_days_before is ignored for the flatten check.
+    earnings_flatten_last_bar_only: bool = False
 
 
 class MinerviniBacktester:
@@ -158,9 +184,51 @@ class MinerviniBacktester:
         self,
         screener: MinerviniScreener | None = None,
         config: BacktestConfig | None = None,
+        earnings_blackout: EarningsBlackout | None = None,
     ):
         self.screener = screener or MinerviniScreener()
         self.config = config or BacktestConfig()
+        # Only consulted when config.earnings_blackout_entry_days > 0 or
+        # config.earnings_flatten_days_before > 0. If the caller sets the
+        # config keys but does not provide a blackout, the filter is a
+        # no-op (fails safe, emits a one-shot warning).
+        self.earnings_blackout = earnings_blackout
+        self._earnings_blackout_warned = False
+
+    def _earnings_entry_blocked(self, symbol: str, ts) -> bool:
+        days = int(self.config.earnings_blackout_entry_days)
+        if days <= 0:
+            return False
+        if self.earnings_blackout is None:
+            if not self._earnings_blackout_warned:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "earnings_blackout_entry_days=%d but no EarningsBlackout "
+                    "instance wired — filter disabled",
+                    days,
+                )
+                self._earnings_blackout_warned = True
+            return False
+        blocked, _ = self.earnings_blackout.is_blackout(
+            symbol, pd.Timestamp(ts), days_before=days, days_after=0
+        )
+        return blocked
+
+    def _earnings_flatten_triggered(self, symbol: str, ts) -> bool:
+        if self.earnings_blackout is None:
+            return False
+        if self.config.earnings_flatten_last_bar_only:
+            blocked, _ = self.earnings_blackout.is_last_safe_bar_before_er(
+                symbol, pd.Timestamp(ts)
+            )
+            return blocked
+        days = int(self.config.earnings_flatten_days_before)
+        if days <= 0:
+            return False
+        blocked, _ = self.earnings_blackout.is_blackout(
+            symbol, pd.Timestamp(ts), days_before=days, days_after=0
+        )
+        return blocked
 
     def _trail_stop_from_row(
         self,
@@ -319,6 +387,8 @@ class MinerviniBacktester:
                     continue
                 if pd.notna(buy_limit_price) and price > float(buy_limit_price):
                     continue
+                if self._earnings_entry_blocked(symbol, trade_date):
+                    continue
 
                 if pd.notna(stop_candidate) and float(stop_candidate) < price:
                     risk_per_share = price - float(stop_candidate)
@@ -351,7 +421,9 @@ class MinerviniBacktester:
             hold_days = (trade_date - entry_date).days if entry_date is not None else 0
 
             exit_reason = None
-            if price <= stop_price:
+            if self._earnings_flatten_triggered(symbol, trade_date):
+                exit_reason = "earnings_flatten"
+            elif price <= stop_price:
                 exit_reason = "stop"
             elif self.config.exit_on_market_correction and not regime_ok:
                 exit_reason = "market_regime"
@@ -500,6 +572,8 @@ class MinerviniBacktester:
             if shares <= 0:
                 if not self._row_passes_entry(row, price, regime_ok):
                     continue
+                if self._earnings_entry_blocked(symbol, trade_date):
+                    continue
 
                 stop_candidate = row.get("initial_stop_price")
                 stop_reference = (
@@ -644,7 +718,9 @@ class MinerviniBacktester:
             exit_reason = None
             if shares <= 0:
                 continue
-            if price <= stop_price:
+            if self._earnings_flatten_triggered(symbol, trade_date):
+                exit_reason = "earnings_flatten"
+            elif price <= stop_price:
                 exit_reason = "stop"
             elif self.config.exit_on_market_correction and not regime_ok:
                 exit_reason = "market_regime"

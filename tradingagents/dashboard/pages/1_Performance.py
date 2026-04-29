@@ -47,42 +47,8 @@ if snapshots.empty:
     st.info("No snapshots for selected variants.")
     st.stop()
 
-# ── Metric cards ─────────────────────────────────────────────────
-cols = st.columns(len(selected))
-for i, variant in enumerate(selected):
-    vdf = snapshots[snapshots["variant"] == variant].sort_values("date")
-    if vdf.empty:
-        cols[i].metric(variant, "No data")
-        continue
-
-    equities = vdf["equity"].values
-    starting = equities[0]
-    current = equities[-1]
-    total_return = (current - starting) / starting if starting > 0 else 0
-
-    # Max drawdown
-    peak = 0.0
-    max_dd = 0.0
-    for eq in equities:
-        if eq > peak:
-            peak = eq
-        dd = (peak - eq) / peak if peak > 0 else 0
-        if dd > max_dd:
-            max_dd = dd
-
-    # Sharpe
-    daily_returns = []
-    for j in range(1, len(equities)):
-        if equities[j - 1] > 0:
-            daily_returns.append((equities[j] - equities[j - 1]) / equities[j - 1])
-    avg_r = sum(daily_returns) / len(daily_returns) if daily_returns else 0
-    std_r = (sum((r - avg_r) ** 2 for r in daily_returns) / len(daily_returns)) ** 0.5 if daily_returns else 0
-    sharpe = (avg_r / std_r * 252**0.5) if std_r > 0 else 0
-
-    cols[i].metric(f"{variant}", f"${current:,.0f}")
-    cols[i].caption(
-        f"Return: {total_return:+.2%} | DD: {max_dd:.2%} | Sharpe: {sharpe:.2f}"
-    )
+# Per-variant snapshot cards live on the Today page; Performance focuses on
+# historical analysis (curves, returns, drawdown, trade activity) only.
 
 # ── Equity curves ────────────────────────────────────────────────
 st.subheader("Equity Curves")

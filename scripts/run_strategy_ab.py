@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 from dataclasses import asdict
 from pathlib import Path
@@ -251,6 +252,30 @@ CHANGES = {
         "leader_cont_max_extension_pct": 0.07,
         "leader_cont_max_pullback_pct": 0.08,
     },
+    # Upstream-inspired "don't chase" gate: block new entries when QQQ is
+    # stretched > 5% above its 21EMA OR its 5-day ROC exceeds 5%. Entry-time
+    # only; existing positions unaffected. Pair with the future-blanked probe
+    # variant to bias-audit before accepting.
+    "market_extension_5_5": {
+        "market_extension_filter_enabled": True,
+        "market_extension_max_qqq_above_ema21_pct": 0.05,
+        "market_extension_max_qqq_roc_5": 0.05,
+    },
+    # Looser threshold: gate only when QQQ is meaningfully extended.
+    "market_extension_8_7": {
+        "market_extension_filter_enabled": True,
+        "market_extension_max_qqq_above_ema21_pct": 0.08,
+        "market_extension_max_qqq_roc_5": 0.07,
+    },
+    # Future-blanked probe: same 5/5 thresholds, evaluated against QQQ
+    # lagged by 1 bar. If this materially changes vs market_extension_5_5,
+    # the same-bar variant was reading same-day info (lookahead).
+    "market_extension_5_5_lag1": {
+        "market_extension_filter_enabled": True,
+        "market_extension_max_qqq_above_ema21_pct": 0.05,
+        "market_extension_max_qqq_roc_5": 0.05,
+        "market_extension_lag_bars": 1,
+    },
 }
 
 # Overrides applied to EVERY control + treatment to build the accumulated baseline.
@@ -344,10 +369,12 @@ def pick_db(period_name: str) -> str:
     # 2023_2025 requires main DB; earlier periods use historical DB.
     # When the live scheduler holds exclusive lock on market_data.duckdb, copy it
     # to /tmp/market_data_copy.duckdb and point the env var AB_MARKET_DB at it.
+    # AB_HISTORICAL_DB overrides the pre-2022 DB path (useful when the
+    # historical DB needs an augmented schema, e.g. earnings_events backfill).
     import os
     if period_name == "2023_2025":
         return os.environ.get("AB_MARKET_DB", "research_data/market_data.duckdb")
-    return "research_data/historical_2014_2021.duckdb"
+    return os.environ.get("AB_HISTORICAL_DB", "research_data/historical_2014_2021.duckdb")
 
 
 def run_change_for_flavor(
@@ -357,7 +384,9 @@ def run_change_for_flavor(
     period_filter: list | None,
     out_dir: Path,
 ) -> dict:
-    seed_symbols = load_seed_universe("research_data/seed_universe.json")
+    seed_symbols = load_seed_universe(
+        os.environ.get("AB_SEED_UNIVERSE", "research_data/seed_universe.json")
+    )
     raw_wf = build_wf_config(flavor)
     raw_base = build_research_config() if flavor == "research" else build_current_live_config()
 

@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 DEFAULT_LABEL = "com.tradingagents.scheduler"
+WATCHDOG_LABEL = "com.tradingagents.watchdog"
 
 
 def _launch_agent_path(label: str = DEFAULT_LABEL) -> Path:
@@ -94,3 +95,52 @@ def uninstall_launch_agent(label: str = DEFAULT_LABEL) -> Path:
         _run_launchctl(["bootout", f"gui/{os.getuid()}", str(plist_path)], check=False)
         plist_path.unlink()
     return plist_path
+
+
+def install_watchdog_agent(
+    repo_root: str,
+    python_bin: str,
+    label: str = WATCHDOG_LABEL,
+) -> Path:
+    """Install the watchdog as a separate launchd job."""
+    repo_path = Path(repo_root).resolve()
+    python_path = Path(python_bin)
+    plist_path = _launch_agent_path(label)
+
+    log_dir = repo_path / "results" / "service_logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    program_args = [
+        str(python_path),
+        str(repo_path / "run_watchdog.py"),
+    ]
+
+    plist = {
+        "Label": label,
+        "ProgramArguments": program_args,
+        "WorkingDirectory": str(repo_path),
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        "ProcessType": "Background",
+        "StandardOutPath": str(log_dir / "watchdog.out.log"),
+        "StandardErrorPath": str(log_dir / "watchdog.err.log"),
+        "EnvironmentVariables": {
+            "PATH": os.environ.get("PATH", ""),
+            "PYTHONUNBUFFERED": "1",
+        },
+    }
+
+    plist_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if plist_path.exists():
+        _run_launchctl(["bootout", f"gui/{os.getuid()}", str(plist_path)], check=False)
+
+    with plist_path.open("wb") as handle:
+        plistlib.dump(plist, handle)
+
+    _run_launchctl(["bootstrap", f"gui/{os.getuid()}", str(plist_path)])
+    return plist_path
+
+
+def uninstall_watchdog_agent(label: str = WATCHDOG_LABEL) -> Path:
+    return uninstall_launch_agent(label)

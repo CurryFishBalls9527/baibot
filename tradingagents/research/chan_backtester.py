@@ -13,7 +13,7 @@ import logging
 import random
 import sys
 import time
-from bisect import bisect_right
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -1064,16 +1064,22 @@ class PortfolioChanBacktester:
     ):
         """Look up daily data for a symbol on a given date.
 
+        Returns the daily Chan state for the most recent date STRICTLY
+        PRIOR to bar_date. The daily Chan signal for day D is computed
+        from day D's full bar (open/high/low/close), so using sym_dir[D]
+        to gate intraday entries during day D's session is same-day
+        lookahead. We always read D-1 or earlier instead.
+
         Returns either a string ("bullish"/"bearish"/"neutral") or a dict
         with rich daily structure, depending on the preload mode.
         """
         sym_dir = daily_directions.get(symbol)
         if not sym_dir:
             return "neutral"
-        if bar_date in sym_dir:
-            return sym_dir[bar_date]
         dates = sorted(sym_dir.keys())
-        idx = bisect_right(dates, bar_date) - 1
+        # bisect_left returns the leftmost index where bar_date could be
+        # inserted; idx-1 is the largest date STRICTLY LESS than bar_date.
+        idx = bisect_left(dates, bar_date) - 1
         if idx < 0:
             return "neutral"
         return sym_dir[dates[idx]]

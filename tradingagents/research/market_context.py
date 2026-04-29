@@ -19,6 +19,8 @@ def _trend_frame(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
     out[f"{prefix}_sma_50"] = close.rolling(50).mean()
     out[f"{prefix}_sma_200"] = close.rolling(200).mean()
     out[f"{prefix}_roc_20"] = close.pct_change(20)
+    out[f"{prefix}_ema_21"] = close.ewm(span=21, adjust=False).mean()
+    out[f"{prefix}_roc_5"] = close.pct_change(5)
     return out
 
 
@@ -66,10 +68,20 @@ def build_market_context(data_by_symbol: Dict[str, pd.DataFrame]) -> pd.DataFram
     context.loc[score >= 4, "market_regime"] = "uptrend_under_pressure"
     context.loc[score >= 6, "market_regime"] = "confirmed_uptrend"
 
-    return context[
-        [
-            "market_score",
-            "market_confirmed_uptrend",
-            "market_regime",
-        ]
+    output_columns = [
+        "market_score",
+        "market_confirmed_uptrend",
+        "market_regime",
     ]
+    # Expose QQQ extension metrics so consumers (e.g. the market-extension
+    # entry filter) can gate new entries. Computed by _trend_frame when QQQ
+    # is supplied; absent columns simply aren't emitted.
+    if {"qqq_close", "qqq_ema_21"}.issubset(context.columns):
+        context["qqq_above_ema21_pct"] = (
+            context["qqq_close"] / context["qqq_ema_21"] - 1.0
+        )
+        output_columns.append("qqq_above_ema21_pct")
+    if "qqq_roc_5" in context.columns:
+        output_columns.append("qqq_roc_5")
+
+    return context[output_columns]

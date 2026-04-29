@@ -8,6 +8,7 @@ from datetime import datetime
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 
+from .events import Categories, emit_event
 from .orchestrator import Orchestrator
 from .social_monitor import SocialFeedMonitor
 
@@ -423,6 +424,16 @@ class TradingScheduler:
             logger.info(f"JOB DONE: {label} — {result}")
         except Exception as e:
             logger.error(f"JOB FAILED: {label} — {e}", exc_info=True)
+            emit_event(
+                Categories.JOB_FAILED,
+                level="error",
+                message=label,
+                context={
+                    "label": label,
+                    "exc_type": type(e).__name__,
+                    "exc": str(e),
+                },
+            )
             notifier = (
                 self.orchestrator.notifier
                 if self.orchestrator

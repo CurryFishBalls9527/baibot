@@ -102,6 +102,24 @@ def build_config(overrides: dict = None) -> dict:
         "minervini_target_exposure_confirmed_uptrend": 0.72,
         "minervini_target_exposure_uptrend_under_pressure": 0.48,
         "minervini_target_exposure_market_correction": 0.0,
+        # Pyramid add-on: when a held Minervini position is up 2.5%/5% from
+        # entry, add 30%/20% of the original-sized notional on top, with a
+        # fresh protective stop. Kill-switch default OFF. Enabled per-variant
+        # in paper_launch_v2.yaml after 2026-04-23 audit (seed +9.8pp 23_25,
+        # broad -5.4pp 23_25 — universe-ambiguous, observational paper test).
+        "minervini_add_on_enabled": _env_flag("MINERVINI_ADD_ON_ENABLED", False),
+        "minervini_add_on_trigger_pct_1": float(
+            os.getenv("MINERVINI_ADD_ON_TRIGGER_PCT_1", "0.025")
+        ),
+        "minervini_add_on_trigger_pct_2": float(
+            os.getenv("MINERVINI_ADD_ON_TRIGGER_PCT_2", "0.05")
+        ),
+        "minervini_add_on_fraction_1": float(
+            os.getenv("MINERVINI_ADD_ON_FRACTION_1", "0.30")
+        ),
+        "minervini_add_on_fraction_2": float(
+            os.getenv("MINERVINI_ADD_ON_FRACTION_2", "0.20")
+        ),
         "leader_continuation_enabled": _env_flag("LEADER_CONTINUATION_ENABLED", True),
         "leader_continuation_min_rs_percentile": float(
             os.getenv("LEADER_CONTINUATION_MIN_RS_PERCENTILE", "75")

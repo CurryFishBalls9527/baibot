@@ -20,6 +20,7 @@ from tradingagents.portfolio.position_sizer import PositionSizer
 from tradingagents.portfolio.exit_manager import ExitManager
 from tradingagents.portfolio.exit_manager_v2 import ExitManagerV2
 from tradingagents.portfolio.portfolio_tracker import PortfolioTracker
+from tradingagents.automation.events import Categories, emit_event
 from tradingagents.automation.prescreener import MinerviniPreScreener
 from tradingagents.broker.models import OrderRequest
 from tradingagents.automation.notifier import build_notifier
@@ -541,7 +542,15 @@ class Orchestrator:
             row["symbol"]: row.to_dict()
             for _, row in preflight.screen_df.iterrows()
         }
-        candidate_symbols = set(getattr(preflight, "screened_symbols", []))
+        # Gate on screener's approval (rule_watch_candidate=True). Iterating
+        # `screened_symbols` here would let through every screener row,
+        # including symbols the screener actively rejected — the screener
+        # populates buy_point/buy_limit_price defaults even on `no_base`
+        # rows, and `_trade_rule_based_setup` will fire any setup whose
+        # current price is inside that zone. UNH (rs=2.1, candidate_status=
+        # no_base) filled on mechanical/mechanical_v2 on 2026-04-28 because
+        # of this leak; the rs_filter_bypassed watchdog caught it.
+        candidate_symbols = set(getattr(preflight, "approved_symbols", []) or [])
 
         account = self.broker.get_account()
         positions = self.broker.get_positions()
@@ -1485,6 +1494,39 @@ class Orchestrator:
             "timeframe": "swing",
             "source": "minervini_rule",
         }
+        # Defensive invariant: live entry must not bypass the RS gate the
+        # screener is supposed to enforce. If a symbol reaches here below
+        # threshold, something upstream (caller's candidate filter, screener
+        # config, or a manual entry path) has regressed. Emit an alert AND
+        # refuse the trade — second line of defence after the caller-side
+        # rule_watch gate. See project_live_entry_gate_gap memory.
+        rs_value = self._to_float(setup.get("rs_percentile"))
+        rs_threshold = float(self.config.get("minervini_min_rs_percentile", 70))
+        if rs_value is not None and rs_value < rs_threshold:
+            emit_event(
+                Categories.RS_FILTER_BYPASSED,
+                level="error",
+                variant=self.config.get("variant_name"),
+                symbol=symbol,
+                message=f"live entry below RS threshold ({rs_value:.1f} < {rs_threshold:.0f})",
+                context={
+                    "rs_percentile": rs_value,
+                    "threshold": rs_threshold,
+                    "rule_entry_candidate": setup.get("rule_entry_candidate"),
+                    "candidate_status": setup.get("candidate_status"),
+                },
+            )
+            return {
+                "symbol": symbol,
+                "action": "SKIP",
+                "traded": False,
+                "screen_rejected": (
+                    f"RS gate: rs_percentile={rs_value:.1f} below threshold "
+                    f"{rs_threshold:.0f} (defensive block)"
+                ),
+                "candidate_status": setup.get("candidate_status"),
+                "rs_percentile": rs_value,
+            }
         return self._execute_structured_signal(
             symbol=symbol,
             structured=structured,
@@ -2422,6 +2464,19 @@ class Orchestrator:
                 "%s: CRITICAL add-on %d bought but protective-stop resync failed: %s",
                 position.symbol, add_on_level, exc, exc_info=True,
             )
+            emit_event(
+                Categories.ADD_ON_SUPERSESSION,
+                level="critical",
+                variant=self.config.get("variant_name"),
+                symbol=position.symbol,
+                message=f"add-on {add_on_level} bought but protective-stop resync failed",
+                context={
+                    "add_on_level": add_on_level,
+                    "projected_qty": projected_qty,
+                    "stop_price": current_stop,
+                    "error": str(exc),
+                },
+            )
 
         return {
             "symbol": position.symbol,
@@ -2519,6 +2574,19 @@ class Orchestrator:
             logger.error(
                 "%s: add-on stop-resync submit failed (qty=%s price=%.2f): %s",
                 symbol, projected_qty, stop_price, exc,
+            )
+            emit_event(
+                Categories.ADD_ON_SUPERSESSION,
+                level="critical",
+                variant=self.config.get("variant_name"),
+                symbol=symbol,
+                code=("40310000" if "40310000" in str(exc) else None),
+                message="add-on stop-resync submit failed — position naked",
+                context={
+                    "projected_qty": projected_qty,
+                    "stop_price": stop_price,
+                    "error": str(exc),
+                },
             )
             return
         pos_state["stop_order_id"] = result.order_id

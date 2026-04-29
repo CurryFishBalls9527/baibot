@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import Dict, Iterable, Optional
 
 import duckdb
 import pandas as pd
+import requests
 import yfinance as yf
 
 logger = logging.getLogger(__name__)
@@ -108,6 +110,31 @@ class MarketDataWarehouse:
                 updated_at TIMESTAMP,
                 PRIMARY KEY (symbol, event_datetime)
             )
+            """
+        )
+        self._migrate_earnings_events_add_time_hint()
+
+    def _migrate_earnings_events_add_time_hint(self) -> None:
+        """Add time_hint column to earnings_events if missing, and backfill
+        null values from event_datetime.hour. Idempotent."""
+        cols = self.conn.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = 'earnings_events'"
+        ).fetchall()
+        col_names = {row[0] for row in cols}
+        if "time_hint" not in col_names:
+            self.conn.execute(
+                "ALTER TABLE earnings_events ADD COLUMN time_hint VARCHAR"
+            )
+        self.conn.execute(
+            """
+            UPDATE earnings_events
+            SET time_hint = CASE
+                WHEN EXTRACT(hour FROM event_datetime) <= 13 THEN 'bmo'
+                WHEN EXTRACT(hour FROM event_datetime) >= 20 THEN 'amc'
+                ELSE 'unknown'
+            END
+            WHERE time_hint IS NULL
             """
         )
 
@@ -352,50 +379,36 @@ class MarketDataWarehouse:
     def fetch_and_store_earnings_events(
         self,
         symbols: Iterable[str],
-        limit: int = 8,
+        limit: int = 40,
+        min_events: int = 20,
+        use_alpha_vantage_fallback: bool = True,
     ) -> Dict[str, int]:
+        """Fetch historical earnings events per symbol.
+
+        yfinance is the primary source (preserves BMO/AMC via event hour). If
+        the returned event count is below ``min_events`` and the Alpha Vantage
+        API key is configured, the AV EARNINGS endpoint fills the historical
+        gap (date-only, so those rows get time_hint='unknown').
+        """
         row_counts: Dict[str, int] = {}
 
         for symbol in symbols:
             logger.info("Downloading %s earnings events", symbol)
-            try:
-                ticker = yf.Ticker(symbol)
-                events = ticker.get_earnings_dates(limit=limit)
-                calendar = ticker.calendar if isinstance(ticker.calendar, dict) else {}
-            except Exception as exc:
-                logger.warning("Earnings events download failed for %s: %s", symbol, exc)
-                row_counts[symbol] = 0
-                continue
-            if events is None or events.empty:
+            yf_frame = self._fetch_yfinance_earnings(symbol, limit=limit)
+            frame = yf_frame
+
+            if (
+                use_alpha_vantage_fallback
+                and (frame is None or len(frame) < min_events)
+            ):
+                av_frame = self._fetch_alpha_vantage_earnings(symbol)
+                if av_frame is not None and not av_frame.empty:
+                    frame = self._merge_earnings_sources(yf_frame, av_frame)
+
+            if frame is None or frame.empty:
                 row_counts[symbol] = 0
                 continue
 
-            frame = events.reset_index().rename(columns={"Earnings Date": "event_datetime"})
-            frame["symbol"] = symbol
-            frame["event_datetime"] = pd.to_datetime(frame["event_datetime"], utc=True).dt.tz_localize(None)
-            frame["eps_estimate"] = pd.to_numeric(frame.get("EPS Estimate"), errors="coerce")
-            frame["reported_eps"] = pd.to_numeric(frame.get("Reported EPS"), errors="coerce")
-            frame["surprise_pct"] = pd.to_numeric(frame.get("Surprise(%)"), errors="coerce")
-            revenue_average = calendar.get("Revenue Average")
-            frame["revenue_average"] = self._safe_numeric(revenue_average)
-            now_ts = pd.Timestamp.utcnow()
-            frame["is_future"] = frame["event_datetime"] > now_ts.tz_localize(None)
-            frame["source"] = "yfinance"
-            frame["updated_at"] = now_ts
-            frame = frame[
-                [
-                    "symbol",
-                    "event_datetime",
-                    "eps_estimate",
-                    "reported_eps",
-                    "surprise_pct",
-                    "revenue_average",
-                    "is_future",
-                    "source",
-                    "updated_at",
-                ]
-            ]
-            frame = frame.dropna(subset=["event_datetime"])
             frame = frame.sort_values("event_datetime").drop_duplicates(
                 subset=["symbol", "event_datetime"],
                 keep="last",
@@ -408,6 +421,164 @@ class MarketDataWarehouse:
             row_counts[symbol] = len(frame)
 
         return row_counts
+
+    def _fetch_yfinance_earnings(
+        self,
+        symbol: str,
+        limit: int = 40,
+    ) -> Optional[pd.DataFrame]:
+        try:
+            ticker = yf.Ticker(symbol)
+            events = ticker.get_earnings_dates(limit=limit)
+            calendar = ticker.calendar if isinstance(ticker.calendar, dict) else {}
+        except Exception as exc:
+            logger.warning("yfinance earnings download failed for %s: %s", symbol, exc)
+            return None
+        if events is None or events.empty:
+            return None
+
+        frame = events.reset_index().rename(columns={"Earnings Date": "event_datetime"})
+        frame["symbol"] = symbol
+        frame["event_datetime"] = pd.to_datetime(
+            frame["event_datetime"], utc=True
+        ).dt.tz_localize(None)
+        frame["eps_estimate"] = pd.to_numeric(frame.get("EPS Estimate"), errors="coerce")
+        frame["reported_eps"] = pd.to_numeric(frame.get("Reported EPS"), errors="coerce")
+        frame["surprise_pct"] = pd.to_numeric(frame.get("Surprise(%)"), errors="coerce")
+        revenue_average = calendar.get("Revenue Average")
+        frame["revenue_average"] = self._safe_numeric(revenue_average)
+        now_ts = pd.Timestamp.utcnow()
+        frame["is_future"] = frame["event_datetime"] > now_ts.tz_localize(None)
+        frame["source"] = "yfinance"
+        frame["updated_at"] = now_ts
+        # BMO = before market open (hour <= 13 UTC ~ <= 09:00 ET)
+        # AMC = after market close (hour >= 20 UTC ~ >= 16:00 ET)
+        hours = frame["event_datetime"].dt.hour
+        frame["time_hint"] = hours.apply(
+            lambda h: "bmo" if h <= 13 else ("amc" if h >= 20 else "unknown")
+        )
+        frame = frame.dropna(subset=["event_datetime"])
+        return frame[
+            [
+                "symbol",
+                "event_datetime",
+                "eps_estimate",
+                "reported_eps",
+                "surprise_pct",
+                "revenue_average",
+                "is_future",
+                "source",
+                "updated_at",
+                "time_hint",
+            ]
+        ]
+
+    def _fetch_alpha_vantage_earnings(
+        self,
+        symbol: str,
+    ) -> Optional[pd.DataFrame]:
+        """Fetch historical earnings from Alpha Vantage EARNINGS endpoint.
+
+        AV provides reportedDate back to IPO but no BMO/AMC flag, so rows
+        get time_hint='unknown' and the blackout module treats them as
+        whole-day conservatively.
+        """
+        api_key = os.environ.get("ALPHAVANTAGE_API_KEY")
+        if not api_key:
+            logger.warning(
+                "ALPHAVANTAGE_API_KEY not set; skipping AV earnings fallback for %s",
+                symbol,
+            )
+            return None
+        url = "https://www.alphavantage.co/query"
+        params = {
+            "function": "EARNINGS",
+            "symbol": symbol,
+            "apikey": api_key,
+        }
+        try:
+            resp = requests.get(url, params=params, timeout=15)
+            resp.raise_for_status()
+            payload = resp.json()
+        except Exception as exc:
+            logger.warning("AV earnings download failed for %s: %s", symbol, exc)
+            return None
+
+        quarterly = payload.get("quarterlyEarnings") or []
+        if not quarterly:
+            return None
+
+        rows = []
+        now_ts = pd.Timestamp.utcnow().tz_localize(None)
+        for item in quarterly:
+            reported_date = item.get("reportedDate")
+            if not reported_date:
+                continue
+            try:
+                event_dt = pd.Timestamp(reported_date)
+            except Exception:
+                continue
+
+            def _num(key: str):
+                raw = item.get(key)
+                if raw in (None, "None", "", "NaN"):
+                    return None
+                try:
+                    return float(raw)
+                except (TypeError, ValueError):
+                    return None
+
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "event_datetime": event_dt,
+                    "eps_estimate": _num("estimatedEPS"),
+                    "reported_eps": _num("reportedEPS"),
+                    "surprise_pct": _num("surprisePercentage"),
+                    "revenue_average": None,
+                    "is_future": event_dt > now_ts,
+                    "source": "alphavantage",
+                    "updated_at": pd.Timestamp.utcnow(),
+                    "time_hint": "unknown",
+                }
+            )
+
+        if not rows:
+            return None
+        return pd.DataFrame(rows)
+
+    @staticmethod
+    def _merge_earnings_sources(
+        yf_frame: Optional[pd.DataFrame],
+        av_frame: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """Combine yfinance and AV frames; yfinance wins when dates match
+        within one day (yfinance has BMO/AMC precision)."""
+        if yf_frame is None or yf_frame.empty:
+            return av_frame
+        yf_dates = set(yf_frame["event_datetime"].dt.normalize())
+        av_mask = ~av_frame["event_datetime"].dt.normalize().apply(
+            lambda d: any(abs((d - yd).days) <= 1 for yd in yf_dates)
+        )
+        av_filtered = av_frame[av_mask]
+        if av_filtered.empty:
+            return yf_frame
+        return pd.concat([yf_frame, av_filtered], ignore_index=True)
+
+    def get_earnings_events(
+        self,
+        symbol: str,
+    ) -> pd.DataFrame:
+        """Return all earnings events for a symbol, sorted by date."""
+        query = """
+            SELECT symbol, event_datetime, eps_estimate, reported_eps,
+                   surprise_pct, revenue_average, is_future, source,
+                   updated_at, time_hint
+            FROM earnings_events
+            WHERE symbol = ?
+            ORDER BY event_datetime
+        """
+        return self.conn.execute(query, [symbol]).fetchdf()
 
     def get_daily_bars(
         self,

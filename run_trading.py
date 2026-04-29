@@ -21,17 +21,35 @@ Usage:
 import argparse
 import json
 import logging
+import os
 import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values
 
-load_dotenv()
+
+def _load_dotenv_skip_blanks() -> None:
+    # A `KEY=` line with no value causes dotenv to set the env var to empty
+    # string, which looks "set" to downstream consumers and silently produces
+    # 401s (e.g. OpenAI rejects blank Authorization). Treat blank as absent:
+    # read .env values, and only setdefault non-empty ones.
+    for key, value in dotenv_values().items():
+        if value:
+            os.environ.setdefault(key, value)
+
+
+_load_dotenv_skip_blanks()
 
 from tradingagents.automation.config import build_config
-from tradingagents.automation.launchd import install_launch_agent, uninstall_launch_agent
+from tradingagents.automation.launchd import (
+    WATCHDOG_LABEL,
+    install_launch_agent,
+    install_watchdog_agent,
+    uninstall_launch_agent,
+    uninstall_watchdog_agent,
+)
 from tradingagents.automation.notifier import build_notifier
 from tradingagents.automation.orchestrator import Orchestrator
 from tradingagents.automation.scheduler import TradingScheduler
@@ -191,6 +209,9 @@ def cmd_status(args):
     if strategy_type == "chan":
         from tradingagents.automation.chan_orchestrator import ChanOrchestrator
         orch = ChanOrchestrator(config)
+    elif strategy_type == "chan_daily":
+        from tradingagents.automation.chan_daily_orchestrator import ChanDailyOrchestrator
+        orch = ChanDailyOrchestrator(config)
     else:
         orch = Orchestrator(config)
     status = orch.get_status()
@@ -312,6 +333,9 @@ def cmd_report(args):
     if strategy_type == "chan":
         from tradingagents.automation.chan_orchestrator import ChanOrchestrator
         orch = ChanOrchestrator(config)
+    elif strategy_type == "chan_daily":
+        from tradingagents.automation.chan_daily_orchestrator import ChanDailyOrchestrator
+        orch = ChanDailyOrchestrator(config)
     else:
         orch = Orchestrator(config)
     report = orch.generate_daily_report(save=not args.no_save)
@@ -581,6 +605,41 @@ def cmd_remove_service(args):
     print()
 
 
+def cmd_install_watchdog(args):
+    """Install the watchdog as a separate macOS launch agent."""
+    repo_root = Path(__file__).resolve().parent
+    project_python = repo_root / ".venv" / "bin" / "python"
+    python_bin = project_python if project_python.exists() else Path(sys.executable)
+
+    plist_path = install_watchdog_agent(
+        repo_root=str(repo_root),
+        python_bin=str(python_bin),
+        label=args.label,
+    )
+
+    print("Watchdog launch agent installed.")
+    print(f"  Label: {args.label}")
+    print(f"  Plist: {plist_path}")
+    print(f"  Python: {python_bin}")
+    print(f"  Logs: {repo_root / 'results' / 'service_logs'}/watchdog.{{out,err}}.log")
+    print()
+    print("Required env vars (set in .env):")
+    print("  WATCHDOG_NTFY_TOPIC=<distinct from NTFY_TOPIC>")
+    print("  WATCHDOG_TELEGRAM_CHAT_ID=<distinct from TELEGRAM_CHAT_ID>")
+    print("  -- OR --")
+    print("  WATCHDOG_REUSE_TRADE_CHANNEL=1   # reuse trade ntfy/telegram for now")
+    print()
+
+
+def cmd_remove_watchdog(args):
+    """Remove the watchdog launch agent."""
+    plist_path = uninstall_watchdog_agent(label=args.label)
+    print("Watchdog launch agent removed.")
+    print(f"  Label: {args.label}")
+    print(f"  Plist: {plist_path}")
+    print()
+
+
 def cmd_dashboard(args):
     """Launch the local Streamlit dashboard."""
     repo_root = Path(__file__).resolve().parent
@@ -834,6 +893,30 @@ def main():
         help="launchd label to remove",
     )
 
+    # install-watchdog
+    p_install_wd = sub.add_parser(
+        "install-watchdog",
+        help="Install the external watchdog as a separate launch agent",
+    )
+    p_install_wd.add_argument(
+        "--label",
+        type=str,
+        default=WATCHDOG_LABEL,
+        help="launchd label for the watchdog",
+    )
+
+    # remove-watchdog
+    p_remove_wd = sub.add_parser(
+        "remove-watchdog",
+        help="Remove the watchdog launch agent",
+    )
+    p_remove_wd.add_argument(
+        "--label",
+        type=str,
+        default=WATCHDOG_LABEL,
+        help="launchd label to remove",
+    )
+
     # dashboard
     p_dashboard = sub.add_parser(
         "dashboard",
@@ -843,7 +926,7 @@ def main():
     p_dashboard.add_argument(
         "--address",
         type=str,
-        default="127.0.0.1",
+        default="0.0.0.0",
         help="Dashboard bind address",
     )
 
@@ -906,6 +989,8 @@ def main():
         "chart": cmd_chart,
         "install-service": cmd_install_service,
         "remove-service": cmd_remove_service,
+        "install-watchdog": cmd_install_watchdog,
+        "remove-watchdog": cmd_remove_watchdog,
         "dashboard": cmd_dashboard,
         "notify-test": cmd_notify_test,
         "experiment": cmd_experiment,

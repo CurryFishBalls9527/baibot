@@ -117,6 +117,35 @@ def _make_config(args: argparse.Namespace) -> ChanDailyBacktestConfig:
         volume_confirm_mult=args.volume_confirm_mult,
         trend_type_filter_mode=args.trend_type_filter,
         require_bi_up_at_entry=args.require_bi_up,
+        equity_dd_threshold_pct=args.equity_dd_threshold,
+        equity_dd_resume_pct=args.equity_dd_resume,
+        equity_sector_max_positions=args.equity_sector_cap,
+        donchian_breakout_min_pct=args.donchian_breakout_min_pct,
+        pyramid_enabled=args.pyramid,
+        pyramid_thresholds_r=tuple(float(x) for x in args.pyramid_thresholds.split(",")),
+        pyramid_add_fractions=tuple(float(x) for x in args.pyramid_fractions.split(",")),
+        pyramid_donchian_only=args.pyramid_donchian_only,
+        pyramid_require_up_segseg_sure=args.pyramid_require_up_segseg_sure,
+        pyramid_require_zs_broken=args.pyramid_require_zs_broken,
+        stop_atr_mult_seg=args.stop_atr_mult_seg,
+        time_stop_bars_seg=args.time_stop_bars_seg,
+        credit_spread_filter_enabled=args.credit_spread_filter,
+        credit_spread_numerator=args.credit_spread_numerator,
+        credit_spread_denominator=args.credit_spread_denominator,
+        credit_spread_lookback=args.credit_spread_lookback,
+        credit_spread_block_mode=args.credit_spread_block_mode,
+        credit_spread_z_threshold=args.credit_spread_z_threshold,
+        credit_spread_drop_pct=args.credit_spread_drop_pct,
+        calendar_filter_mode=args.calendar_filter,
+        calendar_block_months=tuple(int(m) for m in args.calendar_block_months.split(",") if m.strip()),
+        vol_adaptive_exit_mode=args.vol_adaptive_exit,
+        vol_expansion_ratio=args.vol_expansion_ratio,
+        vol_tightened_atr_mult=args.vol_tightened_atr_mult,
+        reentry_after_stop_enabled=args.reentry_after_stop,
+        reentry_window_bars=args.reentry_window_bars,
+        reentry_max_count=args.reentry_max_count,
+        portfolio_vol_target=args.portfolio_vol_target,
+        portfolio_vol_lookback=args.portfolio_vol_lookback,
     )
 
 
@@ -294,6 +323,34 @@ def parse_args() -> argparse.Namespace:
                    help="Block new entries when VIX > vix_threshold")
     p.add_argument("--vix-threshold", type=float, default=30.0,
                    help="VIX level above which entries are blocked (default 30)")
+    p.add_argument("--credit-spread-filter", action="store_true",
+                   help="Block new entries when credit-spread proxy ratio is risk-off")
+    p.add_argument("--credit-spread-numerator", default="HYG")
+    p.add_argument("--credit-spread-denominator", default="LQD")
+    p.add_argument("--credit-spread-lookback", type=int, default=60)
+    p.add_argument("--credit-spread-block-mode", default="below_sma",
+                   choices=["below_sma", "negative_delta", "z_below"])
+    p.add_argument("--credit-spread-z-threshold", type=float, default=-0.5)
+    p.add_argument("--credit-spread-drop-pct", type=float, default=0.0)
+    p.add_argument("--calendar-filter", default="off",
+                   choices=["off", "sell_in_may", "santa_only", "block_months"],
+                   help="Calendar gate. sell_in_may=block May-Oct, santa_only=Nov-Jan only.")
+    p.add_argument("--calendar-block-months", default="",
+                   help="Comma-separated month numbers to block (when --calendar-filter block_months)")
+    p.add_argument("--vol-adaptive-exit", default="off",
+                   choices=["off", "tighten_stop", "exit"],
+                   help="Vol-adaptive exit overlay. tighten_stop=raise stop on vol expansion, exit=close at next open.")
+    p.add_argument("--vol-expansion-ratio", type=float, default=1.5,
+                   help="ATR(today)/ATR(entry) ratio threshold for vol-adaptive exit")
+    p.add_argument("--vol-tightened-atr-mult", type=float, default=1.0,
+                   help="ATR multiplier for tightened stop in vol-adaptive tighten_stop mode")
+    p.add_argument("--reentry-after-stop", action="store_true",
+                   help="Allow re-entry after stop if price reclaims entry within reentry_window_bars")
+    p.add_argument("--reentry-window-bars", type=int, default=5)
+    p.add_argument("--reentry-max-count", type=int, default=1)
+    p.add_argument("--portfolio-vol-target", type=float, default=0.0,
+                   help="Annualized vol target (e.g., 0.12 = 12%%); 0=disabled")
+    p.add_argument("--portfolio-vol-lookback", type=int, default=30)
     p.add_argument("--vol-scale", action="store_true",
                    help="Scale per-trade risk inversely to recent ATR/price (target/actual, clipped 0.5-2x)")
     p.add_argument("--vol-scale-target", type=float, default=0.02,
@@ -312,6 +369,30 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--require-bi-up", action="store_true",
                    help="同级别分解: only enter when last bi is confirmed UP "
                         "(pullback bottomed). Avoids chasing mid-decline.")
+    p.add_argument("--equity-dd-threshold", type=float, default=0.0,
+                   help="Pause entries when account DD vs high-water > X (e.g. 0.05 for 5%). 0=off")
+    p.add_argument("--equity-dd-resume", type=float, default=0.0,
+                   help="Resume entries when DD recovers below X (e.g. 0.03 for 3%). 0=off")
+    p.add_argument("--equity-sector-cap", type=int, default=0,
+                   help="Max concurrent positions in equity-correlated group (SPY/QQQ/IWM/DIA/XL*). 0=off")
+    p.add_argument("--donchian-breakout-min-pct", type=float, default=0.0,
+                   help="Donchian breakout requires close > Donchian-high × (1+X). 0.005 = 0.5% margin")
+    p.add_argument("--pyramid", action="store_true",
+                   help="Pyramid scale-in: add to winners as MFE crosses thresholds")
+    p.add_argument("--pyramid-thresholds", default="1.5,3.0",
+                   help="R-multiple thresholds for adds, comma-sep")
+    p.add_argument("--pyramid-fractions", default="0.5,0.33",
+                   help="Fraction of initial shares to add at each threshold")
+    p.add_argument("--pyramid-donchian-only", action="store_true",
+                   help="Conditional pyramid: only add for Donchian-branch entries")
+    p.add_argument("--pyramid-require-up-segseg-sure", action="store_true",
+                   help="Conditional pyramid: only add when entry segseg dir=up + sure")
+    p.add_argument("--pyramid-require-zs-broken", action="store_true",
+                   help="Conditional pyramid: only add when entry zs_broken=True")
+    p.add_argument("--stop-atr-mult-seg", type=float, default=0.0,
+                   help="Per-signal stop: seg-bsp branch ATR multiplier (0=use main)")
+    p.add_argument("--time-stop-bars-seg", type=int, default=0,
+                   help="Per-signal time stop: seg-bsp branch bar count (0=use main)")
     p.add_argument("--out-dir", default="results/chan_daily_etf")
     return p.parse_args()
 
