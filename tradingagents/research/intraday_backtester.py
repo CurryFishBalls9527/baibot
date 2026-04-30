@@ -109,6 +109,27 @@ class IntradayBacktestConfig:
     nr4_min_volume_ratio: float = 1.3
     nr4_min_breakout_distance_pct: float = 0.0
     nr4_max_position_pct: Optional[float] = None
+    # NR4 breakdown short — symmetric mirror of nr4_breakout. Per
+    # `project_intraday_short_mvp` research: gross-positive across 2018,
+    # 2020, 2023_25 on broad250. With G4 regime gate (SPY 20-day ROC < 0
+    # prior-day) the strategy is net-positive on aggregate at Alpaca-paper
+    # realistic costs. Fair-weather signal in the OPPOSITE direction from
+    # nr4_breakout — combined long+short should smooth the regime profile.
+    allow_nr4_breakdown_short: bool = False
+    nr4_breakdown_lookback_days: int = 4
+    nr4_breakdown_earliest_entry_bar: int = 1
+    nr4_breakdown_latest_entry_bar: int = 12
+    nr4_breakdown_min_volume_ratio: float = 1.3
+    nr4_breakdown_min_distance_pct: float = 0.0
+    nr4_breakdown_max_position_pct: Optional[float] = None
+    nr4_breakdown_stop_pct: Optional[float] = None  # falls back to stop_loss_pct
+    nr4_breakdown_trail_stop_pct: Optional[float] = None  # falls back to trail_stop_pct
+    # G4 regime gate — only fire short signals when SPY's prior-day 20-day
+    # ROC is negative (proxy for "market currently under pressure"). Cuts
+    # ~75% of trades in bull regimes (e.g. 2023_25) without sacrificing the
+    # alpha in down regimes (2018, 2020). None disables the gate.
+    short_regime_gate: Optional[str] = None  # None | "spy_roc20_neg"
+    short_regime_spy_roc_lookback_days: int = 20
     allow_orb_breakout: bool = False
     orb_range_bars: int = 2
     orb_min_volume_ratio: float = 1.5
@@ -225,6 +246,7 @@ class IntradayBreakoutBacktester:
             "gap_reclaim_long": 4,
             "vwap_reversion_long": 4,
             "nr4_breakout": 3,
+            "nr4_breakdown_short": 3,
             "orb_breakout": 3,
             "opening_drive_overextended": 2,
             "opening_drive_continuation": 1,
@@ -388,10 +410,19 @@ class IntradayBreakoutBacktester:
         session_low_by_date = frame.groupby("session_date")["low"].min()
         daily_range_by_date = session_high_by_date - session_low_by_date
         prior_high_by_date = session_high_by_date.shift(1)
+        prior_low_by_date = session_low_by_date.shift(1)
         prior_range_by_date = daily_range_by_date.shift(1)
         frame["prior_session_high"] = frame["session_date"].map(prior_high_by_date)
-        if self.config.allow_nr4_breakout:
-            lookback = max(2, int(self.config.nr4_lookback_days))
+        frame["prior_session_low"] = frame["session_date"].map(prior_low_by_date)
+        # Compute NR4 status if EITHER long (breakout) or short (breakdown)
+        # variant is enabled — both consume prior_session_is_nr.
+        if self.config.allow_nr4_breakout or self.config.allow_nr4_breakdown_short:
+            nr4_lookback = (
+                self.config.nr4_lookback_days
+                if self.config.allow_nr4_breakout
+                else self.config.nr4_breakdown_lookback_days
+            )
+            lookback = max(2, int(nr4_lookback))
             prev_window_min = (
                 daily_range_by_date.shift(2)
                 .rolling(lookback - 1, min_periods=lookback - 1)
@@ -451,6 +482,11 @@ class IntradayBreakoutBacktester:
         if self.config.require_above_vwap:
             frame["entry_signal"] &= frame["close"] > frame["vwap"]
         frame["setup_family"] = pd.Series("none", index=frame.index, dtype="object")
+        # Default direction is "long" — preserved on every existing signal
+        # path. Short-side detectors (e.g. nr4_breakdown_short) flip this to
+        # "short" on their signal rows. Read in the simulation loop to invert
+        # stop / exit / P&L semantics.
+        frame["position_direction"] = pd.Series("long", index=frame.index, dtype="object")
         constructive_continuation_mask = (
             frame["entry_signal"]
             & frame["breakout_distance_pct"].notna()
@@ -499,6 +535,8 @@ class IntradayBreakoutBacktester:
             frame = self._apply_gap_reclaim_long(frame)
         if self.config.allow_nr4_breakout:
             frame = self._apply_nr4_breakout(frame)
+        if self.config.allow_nr4_breakdown_short:
+            frame = self._apply_nr4_breakdown_short(frame)
         if self.config.allow_orb_breakout:
             frame = self._apply_orb_breakout(frame)
         if self.config.allow_chan_seg_bsp_long:
@@ -765,6 +803,71 @@ class IntradayBreakoutBacktester:
 
         frame.loc[nr4_mask, "entry_signal"] = True
         frame.loc[nr4_mask, "setup_family"] = "nr4_breakout"
+        return frame
+
+    def _apply_nr4_breakdown_short(self, frame: pd.DataFrame) -> pd.DataFrame:
+        """Mirror of `_apply_nr4_breakout` — short on prior-NR4 + breakdown.
+
+        Same NR-4 setup detection, but the trigger is `close < prior_session_low`
+        (with min distance) and we go SHORT (sell to open). Sets
+        `position_direction = "short"` on the signal row so the simulation loop
+        knows to invert stop/exit/P&L semantics.
+        """
+        if "prior_session_low" not in frame.columns or "prior_session_is_nr" not in frame.columns:
+            return frame
+        min_vol = float(self.config.nr4_breakdown_min_volume_ratio)
+        earliest = int(self.config.nr4_breakdown_earliest_entry_bar)
+        latest = int(self.config.nr4_breakdown_latest_entry_bar)
+        min_breakdown = float(self.config.nr4_breakdown_min_distance_pct)
+
+        prior_low = frame["prior_session_low"]
+        prior_is_nr = frame["prior_session_is_nr"].fillna(False).astype(bool)
+        prior_valid = prior_low.notna() & (prior_low > 0)
+
+        breakdown_dist_pct = (prior_low - frame["close"]) / prior_low.where(prior_valid)
+        breakdown_ok = (
+            prior_valid
+            & prior_is_nr
+            & (frame["close"] < prior_low)
+            & (breakdown_dist_pct >= min_breakdown)
+        )
+
+        prior_bar_close = frame["close"].shift(1)
+        same_session_as_prior = frame["session_date"] == frame["session_date"].shift(1)
+        prior_above_break = (
+            prior_bar_close.notna()
+            & same_session_as_prior
+            & (prior_bar_close >= prior_low)
+        )
+
+        volume_ok = frame["volume_ratio"].fillna(0) >= min_vol
+        bar_ok = (frame["bar_in_session"] >= earliest) & (frame["bar_in_session"] <= latest)
+
+        already_assigned = frame["setup_family"].isin(
+            {
+                "opening_drive_continuation",
+                "opening_drive_expansion",
+                "opening_drive_overextended",
+                "pullback_vwap",
+                "gap_reclaim_long",
+                "nr4_breakout",
+                "vwap_reversion_long",
+                "chan_seg_bsp_long",
+            }
+        )
+
+        nr4_short_mask = (
+            breakdown_ok
+            & prior_above_break
+            & volume_ok
+            & bar_ok
+            & (~already_assigned)
+        ).fillna(False)
+
+        frame.loc[nr4_short_mask, "entry_signal"] = True
+        frame.loc[nr4_short_mask, "setup_family"] = "nr4_breakdown_short"
+        if "position_direction" in frame.columns:
+            frame.loc[nr4_short_mask, "position_direction"] = "short"
         return frame
 
     def _apply_orb_breakout(self, frame: pd.DataFrame) -> pd.DataFrame:
@@ -1113,6 +1216,39 @@ class IntradayBreakoutBacktester:
         score.index = pd.to_datetime(score.index).normalize()
         return score
 
+    def _load_short_regime_series(self, begin: str, end: str) -> pd.Series:
+        """Daily prior-day boolean: "is the market currently under pressure?"
+
+        Used to gate short-side signals. Currently supports
+        `short_regime_gate="spy_roc20_neg"`: True iff SPY's 20-day return at
+        prior session close is negative. Indexed by date (midnight) for `<`
+        comparison against intraday session date — same lookahead convention
+        as `_load_market_context_score`.
+        """
+        gate = self.config.short_regime_gate
+        if gate is None:
+            return pd.Series(dtype="bool")
+        if gate != "spy_roc20_neg":
+            logger.warning("Unknown short_regime_gate=%s — gate disabled", gate)
+            return pd.Series(dtype="bool")
+        lookback = max(1, int(self.config.short_regime_spy_roc_lookback_days))
+        # Pre-buffer for ROC warmup.
+        buffer_begin = (
+            pd.Timestamp(begin) - pd.Timedelta(days=lookback * 4 + 30)
+        ).strftime("%Y-%m-%d")
+        warehouse = MarketDataWarehouse(self.config.daily_db_path, read_only=True)
+        try:
+            spy = warehouse.get_daily_bars("SPY", buffer_begin, end)
+        finally:
+            warehouse.close()
+        if spy is None or spy.empty:
+            return pd.Series(dtype="bool")
+        spy = spy.copy().sort_index()
+        roc = spy["close"].pct_change(lookback)
+        gate_series = (roc < 0).astype(bool)
+        gate_series.index = pd.to_datetime(gate_series.index).normalize()
+        return gate_series
+
     @staticmethod
     def _symbol_summary(trades_df: pd.DataFrame) -> pd.DataFrame:
         if trades_df.empty:
@@ -1150,6 +1286,7 @@ class IntradayBreakoutBacktester:
         daily_trend = self._load_daily_trend_filter(symbols, begin, end)
         market_context_score = self._load_market_context_score(begin, end)
         minervini_regime_series = self._load_minervini_regime(begin, end)
+        short_regime_series = self._load_short_regime_series(begin, end)
         prepared = {
             symbol: self._prepare_symbol_features(df)
             for symbol, df in data_by_symbol.items()
@@ -1297,11 +1434,17 @@ class IntradayBreakoutBacktester:
                     )
                     continue
                 equity = cash + sum(
-                    pos["shares"] * float(prepared[sym].loc[ts, "close"])
+                    # signed_shares × close: positive market value for longs,
+                    # negative (liability) for shorts. Combined with the cash
+                    # delta on entry this gives correct unrealized P&L for
+                    # both directions.
+                    pos.get("signed_shares", pos["shares"])
+                    * float(prepared[sym].loc[ts, "close"])
                     for sym, pos in positions.items()
                     if ts in prepared[sym].index
                 )
                 family_for_sizing = entry.get("setup_family", "unknown")
+                direction = str(entry.get("position_direction", "long"))
                 position_pct = self.config.max_position_pct
                 if (
                     family_for_sizing == "pullback_vwap"
@@ -1318,6 +1461,11 @@ class IntradayBreakoutBacktester:
                     and self.config.nr4_max_position_pct is not None
                 ):
                     position_pct = self.config.nr4_max_position_pct
+                elif (
+                    family_for_sizing == "nr4_breakdown_short"
+                    and self.config.nr4_breakdown_max_position_pct is not None
+                ):
+                    position_pct = self.config.nr4_breakdown_max_position_pct
                 budget = min(cash, equity * position_pct)
                 shares = int(budget / price)
                 if shares <= 0:
@@ -1333,23 +1481,49 @@ class IntradayBreakoutBacktester:
                     )
                     continue
                 bar_volume = float(row["volume"]) if "volume" in row.index and pd.notna(row["volume"]) else None
-                fill_price = self._apply_execution_cost(price, "buy", None, shares, bar_volume)
-                cash -= shares * fill_price
+                # Long entry pays the ask (buy side); short entry receives the
+                # bid (sell side). _apply_execution_cost models both.
+                entry_side = "buy" if direction == "long" else "sell"
+                fill_price = self._apply_execution_cost(price, entry_side, None, shares, bar_volume)
+                # Signed-shares convention: positive for long, negative for
+                # short. Cash math `cash -= signed * fill` then works for
+                # both directions: long cash decreases (paid for shares),
+                # short cash increases (proceeds received as collateral).
+                signed_shares = shares if direction == "long" else -shares
+                cash -= signed_shares * fill_price
                 atr_at_entry: Optional[float] = None
                 if "atr" in row.index and pd.notna(row["atr"]) and float(row["atr"]) > 0:
                     atr_at_entry = float(row["atr"])
-                if (
-                    self.config.use_atr_stops
-                    and atr_at_entry is not None
-                ):
-                    initial_stop = fill_price - self.config.atr_stop_multiplier * atr_at_entry
+                if direction == "long":
+                    if (
+                        self.config.use_atr_stops
+                        and atr_at_entry is not None
+                    ):
+                        initial_stop = fill_price - self.config.atr_stop_multiplier * atr_at_entry
+                    else:
+                        initial_stop = fill_price * (1.0 - self.config.stop_loss_pct)
                 else:
-                    initial_stop = fill_price * (1.0 - self.config.stop_loss_pct)
+                    # Short: stop is ABOVE entry. Mirror of long stop math.
+                    short_stop_pct = (
+                        self.config.nr4_breakdown_stop_pct
+                        if (
+                            family_for_sizing == "nr4_breakdown_short"
+                            and self.config.nr4_breakdown_stop_pct is not None
+                        )
+                        else self.config.stop_loss_pct
+                    )
+                    if self.config.use_atr_stops and atr_at_entry is not None:
+                        initial_stop = fill_price + self.config.atr_stop_multiplier * atr_at_entry
+                    else:
+                        initial_stop = fill_price * (1.0 + short_stop_pct)
                 positions[symbol] = {
                     "entry_time": ts,
                     "entry_price": fill_price,
                     "shares": shares,
+                    "signed_shares": signed_shares,
+                    "direction": direction,
                     "high_since_entry": fill_price,
+                    "low_since_entry": fill_price,
                     "stop_price": initial_stop,
                     "atr_at_entry": atr_at_entry,
                     "setup_family": entry.get("setup_family", "unknown"),
@@ -1372,7 +1546,10 @@ class IntradayBreakoutBacktester:
 
                 if symbol in positions:
                     pos = positions[symbol]
+                    is_short = pos.get("direction", "long") == "short"
+                    # Track favorable extreme: high for longs, low for shorts.
                     pos["high_since_entry"] = max(pos["high_since_entry"], float(row["high"]))
+                    pos["low_since_entry"] = min(pos["low_since_entry"], float(row["low"]))
                     use_atr = (
                         self.config.use_atr_stops
                         and pos.get("atr_at_entry") is not None
@@ -1385,28 +1562,46 @@ class IntradayBreakoutBacktester:
                         best_return = (pos["high_since_entry"] / pos["entry_price"]) - 1.0
                         activate_trail = best_return >= self.config.gap_reclaim_trail_activation_return_pct
                     if activate_trail:
-                        if use_atr:
-                            trail_stop = (
-                                pos["high_since_entry"]
-                                - self.config.atr_trail_multiplier * pos["atr_at_entry"]
-                            )
+                        if not is_short:
+                            # LONG: trail stop = peak * (1 - trail_pct), ratchet UP.
+                            if use_atr:
+                                trail_stop = (
+                                    pos["high_since_entry"]
+                                    - self.config.atr_trail_multiplier * pos["atr_at_entry"]
+                                )
+                            else:
+                                trail_stop_pct = self.config.trail_stop_pct
+                                if (
+                                    pos["setup_family"] == "gap_reclaim_long"
+                                    and self.config.gap_reclaim_trail_stop_pct is not None
+                                ):
+                                    trail_stop_pct = self.config.gap_reclaim_trail_stop_pct
+                                trail_stop = pos["high_since_entry"] * (1.0 - trail_stop_pct)
+                            pos["stop_price"] = max(pos["stop_price"], trail_stop)
                         else:
-                            trail_stop_pct = self.config.trail_stop_pct
-                            if (
-                                pos["setup_family"] == "gap_reclaim_long"
-                                and self.config.gap_reclaim_trail_stop_pct is not None
-                            ):
-                                trail_stop_pct = self.config.gap_reclaim_trail_stop_pct
-                            trail_stop = pos["high_since_entry"] * (1.0 - trail_stop_pct)
-                        pos["stop_price"] = max(pos["stop_price"], trail_stop)
+                            # SHORT: trail stop = trough * (1 + trail_pct), ratchet DOWN.
+                            short_trail_pct = (
+                                self.config.nr4_breakdown_trail_stop_pct
+                                if (
+                                    pos["setup_family"] == "nr4_breakdown_short"
+                                    and self.config.nr4_breakdown_trail_stop_pct is not None
+                                )
+                                else self.config.trail_stop_pct
+                            )
+                            if use_atr:
+                                trail_stop = (
+                                    pos["low_since_entry"]
+                                    + self.config.atr_trail_multiplier * pos["atr_at_entry"]
+                                )
+                            else:
+                                trail_stop = pos["low_since_entry"] * (1.0 + short_trail_pct)
+                            pos["stop_price"] = min(pos["stop_price"], trail_stop)
 
-                    # ORB breakeven-lock: once the position has touched the
-                    # trigger gain (e.g. +1%), lift the stop to a fixed offset
-                    # from entry (e.g. +0.5%). Only ratchets UP — never below
-                    # the existing trail/initial stop. Targets ORB's "small
-                    # gap up then revert to -3% stop" failure mode.
+                    # ORB breakeven-lock (long-only by mechanism — ORB is a
+                    # long-direction signal, no short equivalent here).
                     if (
-                        pos["setup_family"] == "orb_breakout"
+                        not is_short
+                        and pos["setup_family"] == "orb_breakout"
                         and self.config.orb_breakeven_trigger_pct > 0.0
                     ):
                         gain_so_far = (
@@ -1420,9 +1615,15 @@ class IntradayBreakoutBacktester:
 
                     exit_price = None
                     exit_reason = None
-                    if float(row["low"]) <= pos["stop_price"]:
-                        exit_price = min(float(row["open"]), pos["stop_price"])
-                        exit_reason = "stop"
+                    # Stop hit: longs get hurt by LOW, shorts get hurt by HIGH.
+                    if not is_short:
+                        if float(row["low"]) <= pos["stop_price"]:
+                            exit_price = min(float(row["open"]), pos["stop_price"])
+                            exit_reason = "stop"
+                    else:
+                        if float(row["high"]) >= pos["stop_price"]:
+                            exit_price = max(float(row["open"]), pos["stop_price"])
+                            exit_reason = "stop"
                     if (
                         exit_price is None
                         and (
@@ -1447,13 +1648,28 @@ class IntradayBreakoutBacktester:
 
                     if exit_price is not None:
                         shares = pos["shares"]
+                        signed_shares = pos.get("signed_shares", shares)
                         bar_volume_exit = float(row["volume"]) if "volume" in row.index and pd.notna(row["volume"]) else None
+                        # Long exits via SELL (receive bid). Short covers via
+                        # BUY (pay ask). _apply_execution_cost respects side.
+                        exit_side = "sell" if not is_short else "buy"
                         exit_price = self._apply_execution_cost(
-                            exit_price, "sell", exit_reason, shares, bar_volume_exit
+                            exit_price, exit_side, exit_reason, shares, bar_volume_exit
                         )
-                        proceeds = shares * exit_price
-                        cost = shares * pos["entry_price"]
-                        cash += proceeds
+                        # Cash flow on close. With signed_shares convention:
+                        # long  (+): cash += signed_shares * exit  (receive proceeds)
+                        # short (-): cash += signed_shares * exit  (pay to cover, signed_shares is negative)
+                        cash += signed_shares * exit_price
+                        # P&L = signed_shares × (exit − entry). Long: positive
+                        # when exit > entry. Short: positive when exit < entry
+                        # (signed_shares is negative).
+                        pnl = signed_shares * (exit_price - pos["entry_price"])
+                        # `return_pct` is reported as the position's return,
+                        # direction-aware: long = (exit/entry-1), short = (entry/exit-1).
+                        if not is_short:
+                            ret_pct = (exit_price / pos["entry_price"]) - 1.0
+                        else:
+                            ret_pct = (pos["entry_price"] / exit_price) - 1.0
                         trades.append(
                             {
                                 "symbol": symbol,
@@ -1463,8 +1679,9 @@ class IntradayBreakoutBacktester:
                                 "entry_price": round(pos["entry_price"], 4),
                                 "exit_price": round(exit_price, 4),
                                 "shares": shares,
-                                "pnl": round(proceeds - cost, 2),
-                                "return_pct": round((exit_price / pos["entry_price"]) - 1.0, 4),
+                                "direction": pos.get("direction", "long"),
+                                "pnl": round(pnl, 2),
+                                "return_pct": round(ret_pct, 4),
                                 "bars_held": int(
                                     frame.loc[(frame.index >= pos["entry_time"]) & (frame.index <= ts)].shape[0]
                                 ),
@@ -1503,6 +1720,7 @@ class IntradayBreakoutBacktester:
                         if pd.notna(row["volume_ratio"])
                         else None,
                         "setup_family": row.get("setup_family", "unknown"),
+                        "position_direction": str(row.get("position_direction", "long")),
                         "candidate_score": round(float(row["candidate_score"]), 4)
                         if pd.notna(row.get("candidate_score"))
                         else None,
@@ -1571,6 +1789,22 @@ class IntradayBreakoutBacktester:
                             allowed = True  # unknown filter value → permissive
                         if not allowed:
                             candidate["filter_reason"] = "minervini_regime_filter"
+                            candidate_log.append(candidate)
+                            continue
+                    # Short-side regime gate (G4 = SPY 20-day ROC < 0). Only
+                    # applied to short signals; long signals are unaffected.
+                    if (
+                        self.config.short_regime_gate is not None
+                        and str(candidate.get("position_direction", "long")) == "short"
+                    ):
+                        if short_regime_series.empty:
+                            candidate["filter_reason"] = "missing_short_regime"
+                            candidate_log.append(candidate)
+                            continue
+                        sreg_day = pd.Timestamp(ts.date())
+                        sreg_valid = short_regime_series.loc[short_regime_series.index < sreg_day]
+                        if sreg_valid.empty or not bool(sreg_valid.iloc[-1]):
+                            candidate["filter_reason"] = "short_regime_gate"
                             candidate_log.append(candidate)
                             continue
                     if self.config.allow_relative_volume_filter:
@@ -1707,6 +1941,9 @@ class IntradayBreakoutBacktester:
                             {
                                 "symbol": symbol,
                                 "setup_family": candidate["setup_family"],
+                                "position_direction": candidate.get(
+                                    "position_direction", "long"
+                                ),
                                 "signal_time": candidate["ts"],
                                 "candidate_score": candidate["candidate_score"],
                                 "selection_score": candidate["selection_score"],
@@ -1721,7 +1958,13 @@ class IntradayBreakoutBacktester:
             for symbol, pos in positions.items():
                 frame = prepared[symbol]
                 if ts in frame.index:
-                    market_value += pos["shares"] * float(frame.loc[ts, "close"])
+                    # signed_shares × close: positive MV for longs, negative
+                    # (liability) for shorts. Combined with cash (which already
+                    # carries entry-side proceeds for shorts) gives correct
+                    # equity for mixed long+short books.
+                    market_value += pos.get("signed_shares", pos["shares"]) * float(
+                        frame.loc[ts, "close"]
+                    )
             equity = cash + market_value
             running_peak = max(running_peak, equity)
             if running_peak > 0:
