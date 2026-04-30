@@ -96,6 +96,10 @@ def parse_args() -> argparse.Namespace:
                    help="DANGER — actually submit orders. Default is dry-run.")
     p.add_argument("--max-rebalances", type=int, default=None,
                    help="Stop after N rebalance steps (smoke-test bound)")
+    p.add_argument("--account-prefix", default="XSECTION",
+                   help="Env var prefix: ALPACA_<PREFIX>_API_KEY/SECRET_KEY. "
+                        "Default XSECTION; use CAF for closing-auction-fade sleeve "
+                        "on a separate paper account.")
     return p.parse_args()
 
 
@@ -128,6 +132,13 @@ def build_strategy(args: argparse.Namespace) -> XSectionReversionConfig:
 
 
 def build_live(args: argparse.Namespace) -> XSectionPaperTraderConfig:
+    # Per-account feed override: ALPACA_<PREFIX>_FEED takes precedence,
+    # falling back to ALPACA_XSECTION_FEED, then "iex" default.
+    feed = (
+        os.getenv(f"ALPACA_{args.account_prefix}_FEED")
+        or os.getenv("ALPACA_XSECTION_FEED")
+        or "iex"
+    )
     return XSectionPaperTraderConfig(
         log_dir=Path(args.log_dir),
         dry_run=not args.live_submit,
@@ -135,18 +146,24 @@ def build_live(args: argparse.Namespace) -> XSectionPaperTraderConfig:
         bar_grace_seconds=args.bar_grace_seconds,
         universe_path=args.universe,
         daily_db_path=args.daily_db,
-        alpaca_data_feed=os.getenv("ALPACA_XSECTION_FEED", "iex"),
+        alpaca_data_feed=feed,
     )
 
 
-def build_broker() -> AlpacaBroker:
-    api_key = os.environ.get("ALPACA_XSECTION_API_KEY")
-    secret = os.environ.get("ALPACA_XSECTION_SECRET_KEY")
+def build_broker(prefix: str = "XSECTION") -> AlpacaBroker:
+    """Construct AlpacaBroker from ALPACA_<prefix>_API_KEY env vars.
+
+    Default prefix XSECTION matches the original morning-xsection account.
+    Use prefix=CAF (or another) to run a parallel sleeve (e.g.,
+    closing-auction fade) on a separate paper account.
+    """
+    api_key = os.environ.get(f"ALPACA_{prefix}_API_KEY")
+    secret = os.environ.get(f"ALPACA_{prefix}_SECRET_KEY")
     if not api_key or not secret:
         raise SystemExit(
-            "ALPACA_XSECTION_API_KEY and ALPACA_XSECTION_SECRET_KEY must be set. "
-            "This must be a NEW Alpaca paper account, separate from the existing "
-            "mechanical / llm / chan accounts."
+            f"ALPACA_{prefix}_API_KEY and ALPACA_{prefix}_SECRET_KEY must be set. "
+            f"This must be a paper account dedicated to this sleeve, separate "
+            f"from any other strategy's account."
         )
     return AlpacaBroker(api_key=api_key, secret_key=secret, paper=True)
 
@@ -174,7 +191,7 @@ def main() -> int:
     )
     args = parse_args()
 
-    broker = build_broker()
+    broker = build_broker(args.account_prefix)
     strategy = build_strategy(args)
     live = build_live(args)
     symbols = load_symbols(args.universe)
