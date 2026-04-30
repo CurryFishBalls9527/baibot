@@ -699,3 +699,172 @@ def test_xsection_tilt_refresh_resizes_same_basket_midday(monkeypatch):
     assert bbb_trades[1].qty == 765
     assert aaa_trades[1].qty > aaa_trades[0].qty
     assert bbb_trades[1].qty < bbb_trades[0].qty
+
+
+def _make_eod_skip_frames():
+    """Bar 09:00 in the rebalance window with bar 09:30 already past EOD flatten."""
+    index = pd.to_datetime(
+        [
+            "2026-04-01 08:30:00",
+            "2026-04-01 09:00:00",
+            "2026-04-01 09:30:00",
+        ]
+    )
+    return {
+        "AAA": pd.DataFrame(
+            {
+                "open": [100.0, 90.0, 95.0],
+                "high": [101.0, 91.0, 96.0],
+                "low": [99.0, 89.0, 94.0],
+                "close": [100.0, 90.0, 95.0],
+                "volume": [1_000_000] * 3,
+            },
+            index=index,
+        ),
+        "BBB": pd.DataFrame(
+            {
+                "open": [100.0, 110.0, 105.0],
+                "high": [101.0, 111.0, 106.0],
+                "low": [99.0, 109.0, 104.0],
+                "close": [100.0, 110.0, 105.0],
+                "volume": [1_000_000] * 3,
+            },
+            index=index,
+        ),
+    }
+
+
+def test_xsection_skips_rebalance_when_execution_bar_is_eod(monkeypatch):
+    frames = _make_eod_skip_frames()
+    monkeypatch.setattr(
+        "tradingagents.research.intraday_xsection_backtester._load_symbol_frames",
+        lambda *args, **kwargs: frames,
+    )
+    monkeypatch.setattr(
+        "tradingagents.research.intraday_xsection_backtester._load_sector_map",
+        lambda *args, **kwargs: {},
+    )
+    monkeypatch.setattr(
+        "tradingagents.research.intraday_xsection_backtester._compute_dollar_volume",
+        lambda frame, lookback_bars: pd.Series(10_000_000.0, index=frame.index),
+    )
+
+    cfg = XSectionReversionConfig(
+        initial_cash=100_000.0,
+        min_dollar_volume_avg=0.0,
+        interval_minutes=30,
+        formation_minutes=30,
+        hold_minutes=60,
+        n_long=1,
+        n_short=1,
+        dollar_neutral=True,
+        target_gross_exposure=1.0,
+        earliest_rebalance_time=dtime(9, 0),
+        latest_rebalance_time=dtime(9, 0),
+        flatten_at_close_time=dtime(9, 30),
+        half_spread_bps=0.0,
+        slippage_bps=0.0,
+        short_borrow_bps_per_day=0.0,
+    )
+
+    result = XSectionReversionBacktester(cfg).backtest(
+        symbols=["AAA", "BBB"],
+        begin="2026-04-01",
+        end="2026-04-01",
+        intraday_db_path="dummy.duckdb",
+    )
+
+    # The 09:00 bar would normally schedule a rebalance for 09:30, but 09:30 is
+    # past flatten time so opening + immediately closing is wasteful churn.
+    assert result.summary["rebalance_count"] == 0
+    assert result.summary["total_trades"] == 0
+
+
+def _make_nan_exit_frames():
+    """BBB has NaN at the execution bar (09:30) so the exit must use ffill."""
+    index = pd.to_datetime(
+        [
+            "2026-04-01 08:30:00",
+            "2026-04-01 09:00:00",
+            "2026-04-01 09:30:00",
+            "2026-04-01 10:00:00",
+            "2026-04-01 11:00:00",
+        ]
+    )
+    aaa = pd.DataFrame(
+        {
+            "open": [100.0, 90.0, 92.0, 95.0, 101.0],
+            "high": [101.0, 91.0, 93.0, 96.0, 102.0],
+            "low": [99.0, 89.0, 91.0, 94.0, 100.0],
+            "close": [100.0, 90.0, 92.0, 95.0, 101.0],
+            "volume": [1_000_000] * 5,
+        },
+        index=index,
+    )
+    bbb = pd.DataFrame(
+        {
+            "open": [100.0, 110.0, 108.0, 105.0, 99.0],
+            "high": [101.0, 111.0, 109.0, 106.0, 100.0],
+            "low": [99.0, 109.0, 107.0, 104.0, 98.0],
+            "close": [100.0, 110.0, 108.0, 105.0, 99.0],
+            "volume": [1_000_000] * 5,
+        },
+        index=index,
+    )
+    # Drop bar 10:00 from BBB so master_index keeps 10:00 (from AAA) but
+    # open_df.at[10:00, BBB] is NaN — emulating a missing bar at execution time.
+    bbb = bbb.drop(index=pd.Timestamp("2026-04-01 10:00:00"))
+    return {"AAA": aaa, "BBB": bbb}
+
+
+def test_xsection_nan_execution_bar_uses_ffill_to_exit(monkeypatch):
+    frames = _make_nan_exit_frames()
+    monkeypatch.setattr(
+        "tradingagents.research.intraday_xsection_backtester._load_symbol_frames",
+        lambda *args, **kwargs: frames,
+    )
+    monkeypatch.setattr(
+        "tradingagents.research.intraday_xsection_backtester._load_sector_map",
+        lambda *args, **kwargs: {},
+    )
+    monkeypatch.setattr(
+        "tradingagents.research.intraday_xsection_backtester._compute_dollar_volume",
+        lambda frame, lookback_bars: pd.Series(10_000_000.0, index=frame.index),
+    )
+
+    cfg = XSectionReversionConfig(
+        initial_cash=100_000.0,
+        min_dollar_volume_avg=0.0,
+        interval_minutes=30,
+        formation_minutes=30,
+        hold_minutes=30,
+        n_long=1,
+        n_short=1,
+        dollar_neutral=True,
+        target_gross_exposure=1.0,
+        earliest_rebalance_time=dtime(9, 0),
+        latest_rebalance_time=dtime(9, 30),
+        flatten_at_close_time=dtime(11, 0),
+        half_spread_bps=0.0,
+        slippage_bps=0.0,
+        short_borrow_bps_per_day=0.0,
+    )
+
+    result = XSectionReversionBacktester(cfg).backtest(
+        symbols=["AAA", "BBB"],
+        begin="2026-04-01",
+        end="2026-04-01",
+        intraday_db_path="dummy.duckdb",
+    )
+
+    # First rebalance fires at 09:00 for execution at 09:30. The second fires at
+    # 09:30 but BBB has no bar at 10:00, so without the ffill fallback the BBB
+    # short would stay stuck. With the fix it exits at the prior known close.
+    bbb_trades = [trade for trade in result.trades if trade.symbol == "BBB"]
+    assert len(bbb_trades) >= 1
+    # The exit at 10:00 should fall back to BBB's last known close (108 at 09:30).
+    assert any(
+        trade.exit_time == pd.Timestamp("2026-04-01 10:00:00")
+        and trade.exit_price == 108.0
+        for trade in bbb_trades
+    )

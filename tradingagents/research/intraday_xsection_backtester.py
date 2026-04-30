@@ -507,6 +507,11 @@ class XSectionReversionBacktester:
         close_df = pd.DataFrame(
             {sym: df["close"] for sym, df in frames.items()}, index=master_index
         )
+        # Forward-filled fallback for symbols missing a bar at execution time.
+        # Used only when the primary price (open at execution / close at EOD) is
+        # NaN, so that a stale-quoted bar still flushes the position instead of
+        # leaving it stuck in open_positions.
+        close_ffill_df = close_df.ffill()
         session_open_df = open_df.groupby(master_index.normalize(), sort=False).transform("first")
         dv_df = pd.DataFrame(
             {sym: _compute_dollar_volume(df, liquidity_lookback_bars) for sym, df in frames.items()},
@@ -537,12 +542,22 @@ class XSectionReversionBacktester:
             is_last_bar_of_session = (
                 next_ts is None or next_ts.normalize() != t.normalize()
             )
+            # Execution bar (T+1) sits past the EOD flatten time => any rebalance
+            # we schedule at T would be opened and immediately flushed by the EOD
+            # block on the same bar. Skip scheduling in that window.
+            next_is_eod = (
+                next_ts is None
+                or next_ts.normalize() != t.normalize()
+                or next_ts.time() >= cfg.flatten_at_close_time
+            )
 
             # Execute the prior bar's rebalance decision on the next bar open.
             if pending_rebalance is not None:
                 for sym in list(open_positions.keys()):
                     pos = open_positions[sym]
                     px = open_df.at[t, sym] if sym in open_df.columns else None
+                    if px is None or pd.isna(px):
+                        px = close_ffill_df.at[t, sym] if sym in close_ffill_df.columns else None
                     if px is None or pd.isna(px):
                         continue
                     exit_px = float(px)
@@ -637,9 +652,8 @@ class XSectionReversionBacktester:
                 and pending_rebalance is None
                 and since_last_tilt_refresh is not None
                 and since_last_tilt_refresh >= bars_per_tilt_refresh
-                and next_ts is not None
-                and next_ts.normalize() == t.normalize()
                 and not is_eod
+                and not next_is_eod
             )
 
             # 1. Force-close at EOD using the bar close.
@@ -647,6 +661,8 @@ class XSectionReversionBacktester:
                 for sym in list(open_positions.keys()):
                     pos = open_positions[sym]
                     px = close_df.at[t, sym] if sym in close_df.columns else None
+                    if px is None or pd.isna(px):
+                        px = close_ffill_df.at[t, sym] if sym in close_ffill_df.columns else None
                     if px is None or pd.isna(px):
                         continue
                     exit_px = float(px)
@@ -786,9 +802,8 @@ class XSectionReversionBacktester:
             if (
                 should_rebalance
                 and not is_eod
+                and not next_is_eod
                 and i >= bars_per_form
-                and next_ts is not None
-                and next_ts.normalize() == t.normalize()
             ):
                 rebalance_count += 1
                 session_date = pd.Timestamp(t.normalize())
