@@ -116,6 +116,13 @@ class IntradayBacktestConfig:
     orb_earliest_entry_bar: int = 2
     orb_latest_entry_bar: int = 10
     orb_require_above_vwap: bool = True
+    # ORB breakeven-lock (2026-04-29): when high_since_entry / entry - 1
+    # >= trigger, ratchet stop UP to entry * (1 + lock_offset). Targets
+    # ORB's known failure mode — false breakouts that touch a small high
+    # then mean-revert all day to -3% stop. Both 0.0 = disabled (default).
+    # Tested only when allow_orb_breakout=True.
+    orb_breakeven_trigger_pct: float = 0.0
+    orb_breakeven_lock_offset_pct: float = 0.0
     # Chan-structural 15m signal — segment-level type-1 BSP as a 4th OR
     # entry path. Different mechanism (structural reversal) vs. the post-
     # open breakout signals above. Adapter computes per-symbol via
@@ -1392,6 +1399,24 @@ class IntradayBreakoutBacktester:
                                 trail_stop_pct = self.config.gap_reclaim_trail_stop_pct
                             trail_stop = pos["high_since_entry"] * (1.0 - trail_stop_pct)
                         pos["stop_price"] = max(pos["stop_price"], trail_stop)
+
+                    # ORB breakeven-lock: once the position has touched the
+                    # trigger gain (e.g. +1%), lift the stop to a fixed offset
+                    # from entry (e.g. +0.5%). Only ratchets UP — never below
+                    # the existing trail/initial stop. Targets ORB's "small
+                    # gap up then revert to -3% stop" failure mode.
+                    if (
+                        pos["setup_family"] == "orb_breakout"
+                        and self.config.orb_breakeven_trigger_pct > 0.0
+                    ):
+                        gain_so_far = (
+                            pos["high_since_entry"] / pos["entry_price"]
+                        ) - 1.0
+                        if gain_so_far >= self.config.orb_breakeven_trigger_pct:
+                            lock_stop = pos["entry_price"] * (
+                                1.0 + self.config.orb_breakeven_lock_offset_pct
+                            )
+                            pos["stop_price"] = max(pos["stop_price"], lock_stop)
 
                     exit_price = None
                     exit_reason = None
