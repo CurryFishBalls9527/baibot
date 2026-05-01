@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  PEAD daily one-shot.
+  Fires every weekday at 08:35 CDT (= 09:35 ET, 5 min after market open).
+  No-ops on weekends/holidays via the script's Alpaca-calendar check.
+
+  Install (after editing in your env vars):
+    cp scripts/launchd/com.baibot.pead.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.baibot.pead.plist
+
+  To force a manual run:
+    launchctl kickstart gui/$UID/com.baibot.pead
+
+  To remove:
+    launchctl unload ~/Library/LaunchAgents/com.baibot.pead.plist
+    rm ~/Library/LaunchAgents/com.baibot.pead.plist
+
+  IMPORTANT: launchd does NOT inherit shell env. The script reads
+  ALPACA_PEAD_API_KEY/SECRET_KEY via os.environ — set them inline below
+  OR in EnvironmentVariables. Storing keys in this XML file is acceptable
+  for a paper account on a single-user macOS workstation; do NOT commit
+  edited copies with real keys to git.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.baibot.pead</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/myu/code/baibot/.venv/bin/python</string>
+    <string>/Users/myu/code/baibot/scripts/run_pead_paper.py</string>
+    <string>--account-prefix</string><string>PEAD</string>
+    <string>--universe</string><string>research_data/intraday_top250_universe.json</string>
+    <string>--min-surprise-pct</string><string>5.0</string>
+    <string>--hold-days</string><string>20</string>
+    <string>--position-pct</string><string>0.05</string>
+    <string>--max-concurrent</string><string>10</string>
+    <string>--max-gross-exposure</string><string>0.5</string>
+    <string>--log-dir</string><string>/Users/myu/code/baibot/results/pead/paper</string>
+    <!-- IMPORTANT: add --live-submit ONLY after dry-run validation -->
+    <!-- <string>- -live-submit</string> -->
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/myu/code/baibot</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+    <!-- Replace these with actual values OR source .env elsewhere -->
+    <!-- <key>ALPACA_PEAD_API_KEY</key><string>your_key_here</string> -->
+    <!-- <key>ALPACA_PEAD_SECRET_KEY</key><string>your_secret_here</string> -->
+  </dict>
+
+  <key>StartCalendarInterval</key>
+  <array>
+    <!-- Mon-Fri at 08:35 local (CDT). Use 13:35 if you want 8:35 ET / 7:35 CDT. -->
+    <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>35</integer></dict>
+    <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>35</integer></dict>
+    <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>35</integer></dict>
+    <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>35</integer></dict>
+    <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>35</integer></dict>
+  </array>
+
+  <key>RunAtLoad</key>
+  <false/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/myu/code/baibot/results/pead/paper/launchd.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/myu/code/baibot/results/pead/paper/launchd.err.log</string>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>

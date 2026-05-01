@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  C1 cross-asset rotation — daily one-shot.
+  Fires every weekday at 09:00 CDT. Auto-no-ops on non-rebalance days
+  (only acts on the first trading day of each new month).
+
+  Install:
+    cp scripts/launchd/com.baibot.xasset.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.baibot.xasset.plist
+
+  IMPORTANT: launchd does NOT inherit shell env. Set
+  ALPACA_XASSET_API_KEY/SECRET_KEY in EnvironmentVariables below.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.baibot.xasset</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/myu/code/baibot/.venv/bin/python</string>
+    <string>/Users/myu/code/baibot/scripts/run_xasset_rotation_paper.py</string>
+    <string>--account-prefix</string><string>XASSET</string>
+    <string>--lookback-days</string><string>20</string>
+    <string>--top-n</string><string>2</string>
+    <string>--max-gross-exposure</string><string>0.5</string>
+    <string>--log-dir</string><string>/Users/myu/code/baibot/results/xasset_rotation/paper</string>
+    <!-- IMPORTANT: add --live-submit ONLY after dry-run validation -->
+    <!-- <string>- -live-submit</string> -->
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/myu/code/baibot</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+    <!-- <key>ALPACA_XASSET_API_KEY</key><string>your_key_here</string> -->
+    <!-- <key>ALPACA_XASSET_SECRET_KEY</key><string>your_secret_here</string> -->
+  </dict>
+
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>9</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>9</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>9</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>9</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>9</integer><key>Minute</key><integer>0</integer></dict>
+  </array>
+
+  <key>RunAtLoad</key>
+  <false/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/myu/code/baibot/results/xasset_rotation/paper/launchd.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/myu/code/baibot/results/xasset_rotation/paper/launchd.err.log</string>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>

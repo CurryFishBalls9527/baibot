@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  CAF (closing-auction fade) — long-running intraday process.
+  Sits idle most of the day, fires once at ~14:45 CDT (after 14:30 bar
+  close) for the closing-auction trade, EOD-flattens at 14:55.
+
+  KeepAlive=true → launchd auto-restarts on crash.
+
+  Install:
+    cp scripts/launchd/com.baibot.caf.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.baibot.caf.plist
+
+  To stop:
+    launchctl unload ~/Library/LaunchAgents/com.baibot.caf.plist
+
+  To restart (e.g. after code change):
+    launchctl kickstart -k gui/$UID/com.baibot.caf
+
+  IMPORTANT: launchd does NOT inherit shell env. Set
+  ALPACA_CAF_API_KEY/SECRET_KEY in EnvironmentVariables below OR via a
+  wrapper that sources .env before exec.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.baibot.caf</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/myu/code/baibot/.venv/bin/python</string>
+    <string>/Users/myu/code/baibot/scripts/run_intraday_xsection_paper.py</string>
+    <string>--account-prefix</string><string>CAF</string>
+    <string>--earliest-rebalance</string><string>14:30</string>
+    <string>--latest-rebalance</string><string>14:30</string>
+    <string>--hold-minutes</string><string>15</string>
+    <string>--formation-minutes</string><string>60</string>
+    <string>--n-long</string><string>10</string>
+    <string>--n-short</string><string>10</string>
+    <string>--max-gross-exposure</string><string>0.5</string>
+    <string>--min-dollar-volume-avg</string><string>0</string>
+    <string>--log-dir</string><string>/Users/myu/code/baibot/results/intraday_xsection/caf</string>
+    <!-- IMPORTANT: add --live-submit ONLY after dry-run validation -->
+    <!-- <string>- -live-submit</string> -->
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/myu/code/baibot</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+    <!-- <key>ALPACA_CAF_API_KEY</key><string>your_key_here</string> -->
+    <!-- <key>ALPACA_CAF_SECRET_KEY</key><string>your_secret_here</string> -->
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/myu/code/baibot/results/intraday_xsection/caf/launchd.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/myu/code/baibot/results/intraday_xsection/caf/launchd.err.log</string>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>
