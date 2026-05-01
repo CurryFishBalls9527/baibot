@@ -63,20 +63,63 @@ def parse_args():
     return p.parse_args()
 
 
-def _load_priority_symbols(universe_path: str, db_path: str) -> list[str]:
-    """Default priority: broad250 names not yet in earnings_events."""
+# ETFs and other instruments without earnings reports. Hardcoded so we
+# don't waste AV's 25/day on AGG / SPY / etc., which would otherwise sit
+# at the top of the alphabetical backfill list forever (always "missing
+# from earnings_events" because there's nothing to insert).
+NO_EARNINGS_TICKERS: set[str] = {
+    "AGG", "IEF", "IWM", "QQQ", "SMH", "SPY", "TLT",
+    "DIA", "GLD", "SLV", "VTI", "VOO", "VEA", "VWO",
+    "HYG", "LQD", "XLK", "XLF", "XLE", "XLV", "XLI",
+    "XLY", "XLP", "XLU", "XLB", "XLRE", "XLC", "XBI",
+    "ARKK", "TQQQ", "SQQQ", "UVXY",
+}
+
+
+def _load_priority_symbols(
+    universe_path: str, db_path: str, refresh_after_days: int = 60,
+) -> list[str]:
+    """Returns symbols in priority order for nightly ingest:
+
+    1. BACKFILL — symbols in universe with NO earnings_events row at all
+    2. REFRESH — symbols whose latest event is older than `refresh_after_days`
+       (oldest-first, so stale-est data refreshes first)
+
+    Quarterly EPS reports happen every ~90 days, so refresh_after_days=60
+    means we re-fetch any symbol that hasn't been touched in 60+ days —
+    this picks up new quarters within ~30 days of release at worst.
+
+    Once backfill is exhausted (after ~10 days at AV free tier 25/day),
+    the rotation naturally becomes refresh-only on a ~10-day cycle for
+    a 250-symbol universe.
+    """
     payload = json.loads(Path(universe_path).read_text())
     universe = payload["symbols"] if isinstance(payload, dict) else payload
+    # Skip ETFs / non-earnings instruments to avoid wasting AV quota.
+    universe = [s for s in universe if s not in NO_EARNINGS_TICKERS]
     con = duckdb.connect(db_path, read_only=True)
     try:
-        existing = set(
-            r[0] for r in con.execute(
-                "SELECT DISTINCT symbol FROM earnings_events"
-            ).fetchall()
-        )
+        # latest event per symbol
+        rows = con.execute(
+            "SELECT symbol, MAX(event_datetime) FROM earnings_events GROUP BY symbol"
+        ).fetchall()
     finally:
         con.close()
-    return sorted(set(universe) - existing)
+    latest_by_sym = {sym: ts for sym, ts in rows}
+
+    from datetime import datetime as _dt, timedelta as _td
+    cutoff = _dt.now() - _td(days=refresh_after_days)
+
+    backfill: list[str] = []
+    refresh: list[tuple[str, object]] = []
+    for sym in universe:
+        if sym not in latest_by_sym:
+            backfill.append(sym)
+        elif latest_by_sym[sym] is not None and latest_by_sym[sym] < cutoff:
+            refresh.append((sym, latest_by_sym[sym]))
+    backfill.sort()
+    refresh.sort(key=lambda x: x[1])  # oldest first
+    return backfill + [s for s, _ in refresh]
 
 
 def _av_fetch_earnings(symbol: str, key: str, timeout: int = 20) -> dict:
@@ -141,8 +184,10 @@ def _normalize_av_quarter(symbol: str, q: dict) -> dict | None:
 
 
 def _upsert(con: duckdb.DuckDBPyConnection, row: dict) -> str:
-    """Returns 'inserted' / 'updated' / 'skipped' / 'identical'."""
-    # Check for existing yfinance event within 1 day of this one for same symbol
+    """Returns 'inserted' / 'updated' / 'skipped' / 'identical' /
+    'replaced_yfinance' / 'kept_yfinance_av_no_surprise'.
+    """
+    # Check for existing event within 1 day of this one for same symbol
     existing = con.execute(
         """
         SELECT event_datetime, source, surprise_pct
@@ -157,8 +202,11 @@ def _upsert(con: duckdb.DuckDBPyConnection, row: dict) -> str:
     if existing is not None:
         existing_dt, existing_source, existing_surp = existing
         if existing_source == "alphavantage":
-            # Already from AV — update in place if surprise differs
-            if abs((existing_surp or 0) - (row["surprise_pct"] or 0)) < 0.001:
+            # Already from AV. Only update if AV's new value carries data we
+            # didn't have. Don't overwrite a populated surprise with NULL.
+            if row["surprise_pct"] is None and existing_surp is not None:
+                return "kept_existing_av"
+            if existing_surp is not None and abs(existing_surp - (row["surprise_pct"] or 0)) < 0.001:
                 return "identical"
             con.execute(
                 """
@@ -173,7 +221,11 @@ def _upsert(con: duckdb.DuckDBPyConnection, row: dict) -> str:
             )
             return "updated"
         else:
-            # Existing yfinance — replace with AV (cleaner data)
+            # Existing yfinance row. Only replace with AV when AV is strictly
+            # better — i.e. AV has a populated surprise_pct. Otherwise keep
+            # yfinance (which may already have the surprise % we need).
+            if row["surprise_pct"] is None and existing_surp is not None:
+                return "kept_yfinance_av_no_surprise"
             con.execute(
                 """
                 DELETE FROM earnings_events

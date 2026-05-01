@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Alpha Vantage earnings ingest. Runs every weekday at 08:00 CDT
+  (35 min before PEAD fires at 08:35). Catches:
+    * Yesterday's AMC reports (published ~15:00 CDT prior day,
+      AV typically populated by morning)
+    * Today's BMO reports (published 06:00-08:00 CDT, AV usually
+      lags by 30-60 min after release)
+
+  Pulls 25 symbols per night (AV free-tier daily limit), 13s delay
+  between calls (under AV's 5/min cap). Priority queue:
+    (1) backfill — broad250 symbols not yet in earnings_events
+    (2) refresh — symbols whose latest event is > 60 days old
+                  (catches new quarters)
+
+  At 25/night, the 159 backfill symbols complete in ~7 nights, then
+  rotation switches to pure refresh — every symbol re-fetched within
+  ~10 days of any new quarterly report.
+
+  Install:
+    cp scripts/launchd/com.baibot.av_ingest.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.baibot.av_ingest.plist
+
+  Force a manual run:
+    launchctl kickstart gui/$UID/com.baibot.av_ingest
+
+  Watch:
+    tail -f /Users/myu/code/baibot/results/pead/paper/av_ingest.out.log
+
+  IMPORTANT: AV ingest must complete BEFORE PEAD fires (08:35).
+  At 25 symbols × 13s = 5.5 min, finishing by ~08:06. Plenty of buffer.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.baibot.av_ingest</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/myu/code/baibot/scripts/launchd_wrappers/av_ingest_run.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/myu/code/baibot</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+  </dict>
+
+  <key>StartCalendarInterval</key>
+  <array>
+    <!-- Mon-Fri at 08:00 CDT — 35 min before PEAD's 08:35 trigger. -->
+    <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>0</integer></dict>
+  </array>
+
+  <key>RunAtLoad</key>
+  <false/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/myu/code/baibot/results/pead/paper/av_ingest.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/myu/code/baibot/results/pead/paper/av_ingest.err.log</string>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>
