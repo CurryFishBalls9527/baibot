@@ -76,57 +76,57 @@ NO_EARNINGS_TICKERS: set[str] = {
 }
 
 
-def _load_calendar_symbols(api_key: str, horizon: str = "3month",
-                           expected_window_days: int = 3) -> set[str]:
-    """Use AV's EARNINGS_CALENDAR endpoint to identify symbols expected to
-    report in the next `expected_window_days` days. Returns empty set on
-    failure (rate limit, network) — caller should fall back to other
-    priorities. Costs 1 API quota.
+def _load_recent_reporters_yfinance(
+    universe: list[str], lookback_days: int = 4, max_check: int = 50,
+) -> set[str]:
+    """Identify symbols that ACTUALLY REPORTED EARNINGS in the past
+    `lookback_days` days, using yfinance's per-symbol calendar.
+
+    Why not AV's EARNINGS_CALENDAR? It only returns FUTURE events. To
+    learn who reported yesterday, we need a different source. yfinance
+    is free and reliable here.
+
+    Costs zero AV quota but is slow (~1s per symbol). Capped at
+    `max_check` symbols per run to bound runtime — pick the most-likely
+    recent-reporters by alphabetical rotation across days. Returns
+    empty set on any failure (yfinance rate limit / network).
+
+    Note: a "recent reporter" returned here doesn't mean we MUST fetch
+    them — caller decides priority. But it tells us "this symbol just
+    moved on actual fresh data, prioritize over generic backfill."
     """
     try:
-        r = requests.get(
-            AV_BASE,
-            params={"function": "EARNINGS_CALENDAR", "horizon": horizon, "apikey": api_key},
-            timeout=20,
-        )
-        if r.status_code != 200:
-            return set()
-        # AV returns CSV (not JSON) for EARNINGS_CALENDAR
-        text = r.text.strip()
-        if text.startswith("{"):
-            # Likely an error message in JSON — bail
-            return set()
-        lines = text.splitlines()
-        if len(lines) < 2:
-            return set()
-        header = [h.strip() for h in lines[0].split(",")]
-        try:
-            sym_idx = header.index("symbol")
-            date_idx = header.index("reportDate")
-        except ValueError:
-            return set()
+        import yfinance as yf
         from datetime import datetime as _dt, timedelta as _td
-        today = _dt.now().date()
-        # Catch reports from yesterday (in case calendar lags) through the window.
-        # Using yesterday → today + window_days inclusive.
-        start = today - _td(days=1)
-        end = today + _td(days=expected_window_days)
-        out: set[str] = set()
-        for line in lines[1:]:
-            cols = line.split(",")
-            if len(cols) <= max(sym_idx, date_idx):
-                continue
-            sym = cols[sym_idx].strip()
-            date_str = cols[date_idx].strip()
-            try:
-                d = _dt.strptime(date_str, "%Y-%m-%d").date()
-            except ValueError:
-                continue
-            if start <= d <= end:
-                out.add(sym)
-        return out
     except Exception:
         return set()
+    cutoff_start = _dt.now().date() - _td(days=lookback_days)
+    cutoff_end = _dt.now().date() + _td(days=1)
+    found: set[str] = set()
+    # Rotate the check window across days so we don't always hit the same
+    # leading-alphabetical names. Pick max_check symbols starting at a
+    # rotation offset based on day-of-year.
+    if not universe:
+        return found
+    rotation_offset = _dt.now().timetuple().tm_yday % max(1, len(universe))
+    rotated = universe[rotation_offset:] + universe[:rotation_offset]
+    for sym in rotated[:max_check]:
+        try:
+            ed = yf.Ticker(sym).earnings_dates
+            if ed is None or ed.empty:
+                continue
+            # earnings_dates index is the report datetime (timezone-aware).
+            for idx, row in ed.iterrows():
+                d = idx.date() if hasattr(idx, "date") else None
+                if d is None:
+                    continue
+                if cutoff_start <= d <= cutoff_end:
+                    # Reported recently — flag it
+                    found.add(sym)
+                    break
+        except Exception:
+            continue
+    return found
 
 
 def _load_priority_symbols(
@@ -134,14 +134,13 @@ def _load_priority_symbols(
     db_path: str,
     refresh_after_days: int = 60,
     fresh_nan_days: int = 30,
-    calendar_symbols: set[str] | None = None,
+    recent_reporter_symbols: set[str] | None = None,
 ) -> list[str]:
     """Returns symbols in priority order for nightly ingest:
 
-    1. CALENDAR  — broad250 symbols expected to report in next ~3 days
-                   (per AV's EARNINGS_CALENDAR), regardless of DB state.
-                   Highest priority — we want fresh data BEFORE the report
-                   so the next-morning ingest catches the surprise.
+    1. RECENT_REPORTER — symbols that ACTUALLY REPORTED in the past few
+                         days (per yfinance check). HIGHEST priority —
+                         fresh signal data exists upstream.
     2. NAN_REFRESH — symbols whose most recent non-future event has
                      `surprise_pct = NULL` AND is < `fresh_nan_days` old.
                      The report exists in our DB but data lag means we
@@ -151,9 +150,8 @@ def _load_priority_symbols(
                        to fetch.
     4. BACKFILL — symbols in universe with no earnings_events row at all.
 
-    Background context: AV free tier = 25 calls/day. Need to spend that
-    budget on the symbols MOST LIKELY to have a fresh signal for PEAD.
-    Calendar lookup costs 1 call but tells us exactly who reports soon.
+    Background: AV free tier = 25 calls/day. Need to spend that budget
+    on the symbols MOST LIKELY to have a fresh signal for PEAD.
     """
     payload = json.loads(Path(universe_path).read_text())
     universe = payload["symbols"] if isinstance(payload, dict) else payload
@@ -184,25 +182,26 @@ def _load_priority_symbols(
     cutoff_stale = now - _td(days=refresh_after_days)
     cutoff_recent = now - _td(days=fresh_nan_days)
 
-    # Tier 1: Calendar (expected to report in next few days)
-    calendar_priority: list[str] = []
-    if calendar_symbols:
-        calendar_in_universe = calendar_symbols & universe_set
+    # Tier 1: Recent reporters (actually reported in past few days, per yfinance)
+    recent_priority: list[str] = []
+    if recent_reporter_symbols:
+        recent_in_universe = recent_reporter_symbols & universe_set
         # Sort by whether we already have data — symbols missing from DB first
-        # (we DEFINITELY need their history); then those we have.
-        calendar_priority = sorted(
-            calendar_in_universe,
+        # (we DEFINITELY need their history including the fresh report); then
+        # those we have (need to refresh to get the new quarter).
+        recent_priority = sorted(
+            recent_in_universe,
             key=lambda s: (s in latest_by_sym, s),
         )
 
-    # Build remaining priorities, EXCLUDING anything already on calendar list.
-    on_calendar = set(calendar_priority)
+    # Build remaining priorities, EXCLUDING anything already on recent list.
+    on_recent = set(recent_priority)
 
     nan_refresh: list[tuple[str, object]] = []
     stale_refresh: list[tuple[str, object]] = []
     backfill: list[str] = []
     for sym in universe:
-        if sym in on_calendar:
+        if sym in on_recent:
             continue
         if sym not in latest_by_sym:
             backfill.append(sym)
@@ -223,7 +222,7 @@ def _load_priority_symbols(
     backfill.sort()
 
     return (
-        calendar_priority
+        recent_priority
         + [s for s, _ in nan_refresh]
         + [s for s, _ in stale_refresh]
         + backfill
@@ -388,23 +387,32 @@ def main():
     if args.symbols:
         symbols = args.symbols
     else:
-        # Calendar lookup costs 1 quota but gives us symbols expected to
-        # report in the next few days — these are the ones whose data we
-        # want freshest before PEAD fires. Fall back to refresh+backfill
-        # priorities if calendar fetch fails (rate limit / network).
-        calendar_syms = _load_calendar_symbols(api_key, expected_window_days=3)
-        if calendar_syms:
-            logging.info("Calendar: %d symbols expected to report in next 3 days",
-                         len(calendar_syms))
-        else:
-            logging.warning("Calendar lookup returned empty — using refresh+backfill priorities only")
+        # Use yfinance to identify symbols that ACTUALLY REPORTED in the
+        # past 4 days — these are the highest-priority signal sources.
+        # AV's EARNINGS_CALENDAR is forward-only and doesn't help here.
+        # Costs zero AV quota; bounded runtime by checking only top
+        # max_check symbols (rotated daily so coverage cycles).
+        try:
+            payload = json.loads(Path(args.universe).read_text())
+            uni = payload["symbols"] if isinstance(payload, dict) else payload
+            uni = [s for s in uni if s not in NO_EARNINGS_TICKERS]
+            recent_syms = _load_recent_reporters_yfinance(uni, lookback_days=4, max_check=80)
+            if recent_syms:
+                logging.info("yfinance recent reporters (past 4 days): %d — %s",
+                             len(recent_syms), sorted(recent_syms))
+            else:
+                logging.info("No recent reporters found via yfinance — using refresh+backfill")
+        except Exception as exc:
+            logging.warning("yfinance recent-reporter check failed: %s", exc)
+            recent_syms = set()
+
         symbols = _load_priority_symbols(
             args.universe, args.db,
             refresh_after_days=60,
             fresh_nan_days=30,
-            calendar_symbols=calendar_syms,
+            recent_reporter_symbols=recent_syms,
         )
-        logging.info("Total priority queue: %d symbols (calendar+nan+stale+backfill)", len(symbols))
+        logging.info("Total priority queue: %d (recent+nan+stale+backfill)", len(symbols))
 
     if args.max_symbols:
         symbols = symbols[: args.max_symbols]
