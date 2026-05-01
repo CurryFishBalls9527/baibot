@@ -78,16 +78,18 @@ NO_EARNINGS_TICKERS: set[str] = {
 
 def _load_recent_reporters_from_calendar(
     db_path: str, lookback_days: int = 4,
-) -> set[str]:
-    """Read from the local earnings_calendar table — symbols whose
-    expected_report_date is in [today - lookback_days, today + 1] AND
-    we don't yet have a confirmed actual event for that date.
+) -> dict:
+    """Read from the local earnings_calendar table.
+
+    Returns dict {symbol: most_recent_expected_report_date} for symbols
+    whose expected_report_date is in [today - lookback_days, today + 1]
+    AND we don't yet have a confirmed actual event for that date.
 
     Decoupled from data fetching: maintenance of earnings_calendar is
     handled by scripts/update_earnings_calendar.py (separate cron).
     This function is a pure DB read — no network, no rate limits.
 
-    Returns empty set if the table doesn't exist or no matching rows.
+    Returns empty dict if the table doesn't exist or no matching rows.
     """
     from datetime import datetime as _dt, timedelta as _td
 
@@ -97,25 +99,25 @@ def _load_recent_reporters_from_calendar(
     try:
         con = duckdb.connect(db_path, read_only=True)
         try:
-            # Table may not exist yet on a fresh setup
             con.execute("SELECT 1 FROM earnings_calendar LIMIT 1")
         except Exception:
             con.close()
-            return set()
+            return {}
         rows = con.execute(
             """
-            SELECT DISTINCT symbol
+            SELECT symbol, MAX(expected_report_date) AS latest_expected
             FROM earnings_calendar
             WHERE expected_report_date >= ?
               AND expected_report_date <= ?
               AND confirmed_reported_at IS NULL
+            GROUP BY symbol
             """,
             [start, end],
         ).fetchall()
         con.close()
     except Exception:
-        return set()
-    return {r[0] for r in rows}
+        return {}
+    return {r[0]: r[1] for r in rows}
 
 
 def _load_priority_symbols(
@@ -123,7 +125,7 @@ def _load_priority_symbols(
     db_path: str,
     refresh_after_days: int = 60,
     fresh_nan_days: int = 30,
-    recent_reporter_symbols: set[str] | None = None,
+    recent_reporter_dates: dict | None = None,
 ) -> list[str]:
     """Returns symbols in priority order for nightly ingest:
 
@@ -171,19 +173,35 @@ def _load_priority_symbols(
     cutoff_stale = now - _td(days=refresh_after_days)
     cutoff_recent = now - _td(days=fresh_nan_days)
 
-    # Tier 1: Recent reporters (actually reported in past few days, per yfinance)
+    # Tier 1: Recent reporters (per local calendar table). Sort by URGENCY:
+    #   Tier 1a: latest non-future event in DB is OLDER than the calendar's
+    #            expected_report_date — we're missing the recent quarter
+    #   Tier 1b: latest non-future event >= expected_report_date — we have
+    #            the recent quarter (just may need surprise via NaN-refresh)
+    # Within each tier: most-recent expected date first, then alphabetical.
     recent_priority: list[str] = []
-    if recent_reporter_symbols:
-        recent_in_universe = recent_reporter_symbols & universe_set
-        # Sort by whether we already have data — symbols missing from DB first
-        # (we DEFINITELY need their history including the fresh report); then
-        # those we have (need to refresh to get the new quarter).
-        recent_priority = sorted(
-            recent_in_universe,
-            key=lambda s: (s in latest_by_sym, s),
-        )
+    if recent_reporter_dates:
+        scored: list[tuple] = []
+        for sym, expected_date in recent_reporter_dates.items():
+            if sym not in universe_set:
+                continue
+            latest_entry = latest_by_sym.get(sym)
+            if latest_entry is None:
+                # Not in DB at all — most urgent
+                urgency = 0
+            else:
+                ts, _surp = latest_entry
+                ts_date = ts.date() if hasattr(ts, "date") else ts
+                if ts_date < expected_date:
+                    urgency = 0   # missing the recent quarter
+                else:
+                    urgency = 1   # have the recent quarter (NaN-refresh tier handles missing surprise)
+            # Sort key: urgency, then most-recent date first (negative ordinal),
+            # then alphabetical. Smaller key = higher priority.
+            scored.append((urgency, -expected_date.toordinal(), sym))
+        scored.sort()
+        recent_priority = [s for _, _, s in scored]
 
-    # Build remaining priorities, EXCLUDING anything already on recent list.
     on_recent = set(recent_priority)
 
     nan_refresh: list[tuple[str, object]] = []
@@ -378,10 +396,12 @@ def main():
     else:
         # Read from local earnings_calendar table — pure DB query, no network.
         # Calendar maintenance is a separate concern: see
-        # scripts/update_earnings_calendar.py (runs weekly via launchd).
+        # scripts/update_earnings_calendar.py (runs daily via launchd).
+        # Returns dict {symbol: most_recent_expected_report_date} so the
+        # priority logic can compare against latest non-future event in DB.
         recent_syms = _load_recent_reporters_from_calendar(args.db, lookback_days=4)
         if recent_syms:
-            logging.info("Calendar table: %d symbols expected to have reported in past 4 days",
+            logging.info("Calendar table: %d symbols with unconfirmed expected reports in past 4d",
                          len(recent_syms))
         else:
             logging.warning(
@@ -393,7 +413,7 @@ def main():
             args.universe, args.db,
             refresh_after_days=60,
             fresh_nan_days=30,
-            recent_reporter_symbols=recent_syms,
+            recent_reporter_dates=recent_syms,
         )
         logging.info("Total priority queue: %d (recent+nan+stale+backfill)", len(symbols))
 
