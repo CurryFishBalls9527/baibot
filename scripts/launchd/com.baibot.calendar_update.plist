@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Earnings calendar maintenance. Reads yfinance.Ticker.earnings_dates
+  per symbol and upserts into the `earnings_calendar` DuckDB table.
+
+  Decoupled from the AV ingest job:
+    * This script: KNOWS WHO REPORTS WHEN (free, yfinance, ~4 min runtime)
+    * AV ingest: FETCHES THEIR ACTUAL EARNINGS DATA (paid quota, fast)
+
+  Cadence: daily at 02:00 CDT. yfinance calendar entries don't change
+  often but cron is free, so daily is fine. Lookback 90d catches recent
+  reschedules, lookahead 180d covers next 2 quarters.
+
+  Install:
+    cp scripts/launchd/com.baibot.calendar_update.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.baibot.calendar_update.plist
+
+  Force run:
+    launchctl kickstart gui/$UID/com.baibot.calendar_update
+
+  Watch:
+    tail -f /Users/myu/code/baibot/results/pead/paper/calendar_update.{out,err}.log
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.baibot.calendar_update</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/myu/code/baibot/scripts/launchd_wrappers/calendar_update_run.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/myu/code/baibot</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+  </dict>
+
+  <key>StartCalendarInterval</key>
+  <array>
+    <!-- Every day at 02:00 CDT — well before AV ingest (08:00) and PEAD (08:35). -->
+    <dict><key>Hour</key><integer>2</integer><key>Minute</key><integer>0</integer></dict>
+  </array>
+
+  <key>RunAtLoad</key>
+  <false/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/myu/code/baibot/results/pead/paper/calendar_update.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/myu/code/baibot/results/pead/paper/calendar_update.err.log</string>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>

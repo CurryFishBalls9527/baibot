@@ -76,57 +76,46 @@ NO_EARNINGS_TICKERS: set[str] = {
 }
 
 
-def _load_recent_reporters_yfinance(
-    universe: list[str], lookback_days: int = 4, max_check: int = 50,
+def _load_recent_reporters_from_calendar(
+    db_path: str, lookback_days: int = 4,
 ) -> set[str]:
-    """Identify symbols that ACTUALLY REPORTED EARNINGS in the past
-    `lookback_days` days, using yfinance's per-symbol calendar.
+    """Read from the local earnings_calendar table — symbols whose
+    expected_report_date is in [today - lookback_days, today + 1] AND
+    we don't yet have a confirmed actual event for that date.
 
-    Why not AV's EARNINGS_CALENDAR? It only returns FUTURE events. To
-    learn who reported yesterday, we need a different source. yfinance
-    is free and reliable here.
+    Decoupled from data fetching: maintenance of earnings_calendar is
+    handled by scripts/update_earnings_calendar.py (separate cron).
+    This function is a pure DB read — no network, no rate limits.
 
-    Costs zero AV quota but is slow (~1s per symbol). Capped at
-    `max_check` symbols per run to bound runtime — pick the most-likely
-    recent-reporters by alphabetical rotation across days. Returns
-    empty set on any failure (yfinance rate limit / network).
-
-    Note: a "recent reporter" returned here doesn't mean we MUST fetch
-    them — caller decides priority. But it tells us "this symbol just
-    moved on actual fresh data, prioritize over generic backfill."
+    Returns empty set if the table doesn't exist or no matching rows.
     """
+    from datetime import datetime as _dt, timedelta as _td
+
+    today = _dt.now().date()
+    start = today - _td(days=lookback_days)
+    end = today + _td(days=1)
     try:
-        import yfinance as yf
-        from datetime import datetime as _dt, timedelta as _td
+        con = duckdb.connect(db_path, read_only=True)
+        try:
+            # Table may not exist yet on a fresh setup
+            con.execute("SELECT 1 FROM earnings_calendar LIMIT 1")
+        except Exception:
+            con.close()
+            return set()
+        rows = con.execute(
+            """
+            SELECT DISTINCT symbol
+            FROM earnings_calendar
+            WHERE expected_report_date >= ?
+              AND expected_report_date <= ?
+              AND confirmed_reported_at IS NULL
+            """,
+            [start, end],
+        ).fetchall()
+        con.close()
     except Exception:
         return set()
-    cutoff_start = _dt.now().date() - _td(days=lookback_days)
-    cutoff_end = _dt.now().date() + _td(days=1)
-    found: set[str] = set()
-    # Rotate the check window across days so we don't always hit the same
-    # leading-alphabetical names. Pick max_check symbols starting at a
-    # rotation offset based on day-of-year.
-    if not universe:
-        return found
-    rotation_offset = _dt.now().timetuple().tm_yday % max(1, len(universe))
-    rotated = universe[rotation_offset:] + universe[:rotation_offset]
-    for sym in rotated[:max_check]:
-        try:
-            ed = yf.Ticker(sym).earnings_dates
-            if ed is None or ed.empty:
-                continue
-            # earnings_dates index is the report datetime (timezone-aware).
-            for idx, row in ed.iterrows():
-                d = idx.date() if hasattr(idx, "date") else None
-                if d is None:
-                    continue
-                if cutoff_start <= d <= cutoff_end:
-                    # Reported recently — flag it
-                    found.add(sym)
-                    break
-        except Exception:
-            continue
-    return found
+    return {r[0] for r in rows}
 
 
 def _load_priority_symbols(
@@ -387,24 +376,18 @@ def main():
     if args.symbols:
         symbols = args.symbols
     else:
-        # Use yfinance to identify symbols that ACTUALLY REPORTED in the
-        # past 4 days — these are the highest-priority signal sources.
-        # AV's EARNINGS_CALENDAR is forward-only and doesn't help here.
-        # Costs zero AV quota; bounded runtime by checking only top
-        # max_check symbols (rotated daily so coverage cycles).
-        try:
-            payload = json.loads(Path(args.universe).read_text())
-            uni = payload["symbols"] if isinstance(payload, dict) else payload
-            uni = [s for s in uni if s not in NO_EARNINGS_TICKERS]
-            recent_syms = _load_recent_reporters_yfinance(uni, lookback_days=4, max_check=80)
-            if recent_syms:
-                logging.info("yfinance recent reporters (past 4 days): %d — %s",
-                             len(recent_syms), sorted(recent_syms))
-            else:
-                logging.info("No recent reporters found via yfinance — using refresh+backfill")
-        except Exception as exc:
-            logging.warning("yfinance recent-reporter check failed: %s", exc)
-            recent_syms = set()
+        # Read from local earnings_calendar table — pure DB query, no network.
+        # Calendar maintenance is a separate concern: see
+        # scripts/update_earnings_calendar.py (runs weekly via launchd).
+        recent_syms = _load_recent_reporters_from_calendar(args.db, lookback_days=4)
+        if recent_syms:
+            logging.info("Calendar table: %d symbols expected to have reported in past 4 days",
+                         len(recent_syms))
+        else:
+            logging.warning(
+                "earnings_calendar empty/missing — run update_earnings_calendar.py first. "
+                "Falling back to refresh+backfill priorities only."
+            )
 
         symbols = _load_priority_symbols(
             args.universe, args.db,
