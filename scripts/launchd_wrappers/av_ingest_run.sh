@@ -19,12 +19,17 @@ if [ -z "${ALPHA_VANTAGE_API_KEY:-}" ] && [ -z "${ALPHAVANTAGE_API_KEY:-}" ]; th
   exit 1
 fi
 
-# 25 symbols/night = AV free-tier daily limit (5/min × 5 min ≈ comfortably under cap).
-# 13s delay = ~4.6 req/min, under the 5/min hard limit.
-# Hits backfill first (159 broad250 names without data), then rotates refresh
-# (symbols whose latest event is > 60 days old).
+# Max 24 fetches/night so the EARNINGS_CALENDAR call (1 quota) at the
+# start fits within AV's 25/day free-tier limit. 13s delay = ~4.6 req/min,
+# under the 5/min hard limit.
+#
+# Priority queue (rebuilt each night):
+#   1. Calendar — symbols expected to report in next 3 days (per AV)
+#   2. NaN-refresh — events in DB w/ NULL surprise_pct, < 30d old
+#   3. Stale-refresh — latest non-future event > 60 days old
+#   4. Backfill — broad250 names not yet in earnings_events
 exec "$REPO/.venv/bin/python" "$REPO/scripts/ingest_earnings_alphavantage.py" \
-  --max-symbols 25 \
+  --max-symbols 24 \
   --delay-seconds 13 \
   --universe "$REPO/research_data/intraday_top250_universe.json" \
   --db "$REPO/research_data/market_data.duckdb"

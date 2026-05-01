@@ -76,50 +76,158 @@ NO_EARNINGS_TICKERS: set[str] = {
 }
 
 
+def _load_calendar_symbols(api_key: str, horizon: str = "3month",
+                           expected_window_days: int = 3) -> set[str]:
+    """Use AV's EARNINGS_CALENDAR endpoint to identify symbols expected to
+    report in the next `expected_window_days` days. Returns empty set on
+    failure (rate limit, network) — caller should fall back to other
+    priorities. Costs 1 API quota.
+    """
+    try:
+        r = requests.get(
+            AV_BASE,
+            params={"function": "EARNINGS_CALENDAR", "horizon": horizon, "apikey": api_key},
+            timeout=20,
+        )
+        if r.status_code != 200:
+            return set()
+        # AV returns CSV (not JSON) for EARNINGS_CALENDAR
+        text = r.text.strip()
+        if text.startswith("{"):
+            # Likely an error message in JSON — bail
+            return set()
+        lines = text.splitlines()
+        if len(lines) < 2:
+            return set()
+        header = [h.strip() for h in lines[0].split(",")]
+        try:
+            sym_idx = header.index("symbol")
+            date_idx = header.index("reportDate")
+        except ValueError:
+            return set()
+        from datetime import datetime as _dt, timedelta as _td
+        today = _dt.now().date()
+        # Catch reports from yesterday (in case calendar lags) through the window.
+        # Using yesterday → today + window_days inclusive.
+        start = today - _td(days=1)
+        end = today + _td(days=expected_window_days)
+        out: set[str] = set()
+        for line in lines[1:]:
+            cols = line.split(",")
+            if len(cols) <= max(sym_idx, date_idx):
+                continue
+            sym = cols[sym_idx].strip()
+            date_str = cols[date_idx].strip()
+            try:
+                d = _dt.strptime(date_str, "%Y-%m-%d").date()
+            except ValueError:
+                continue
+            if start <= d <= end:
+                out.add(sym)
+        return out
+    except Exception:
+        return set()
+
+
 def _load_priority_symbols(
-    universe_path: str, db_path: str, refresh_after_days: int = 60,
+    universe_path: str,
+    db_path: str,
+    refresh_after_days: int = 60,
+    fresh_nan_days: int = 30,
+    calendar_symbols: set[str] | None = None,
 ) -> list[str]:
     """Returns symbols in priority order for nightly ingest:
 
-    1. BACKFILL — symbols in universe with NO earnings_events row at all
-    2. REFRESH — symbols whose latest event is older than `refresh_after_days`
-       (oldest-first, so stale-est data refreshes first)
+    1. CALENDAR  — broad250 symbols expected to report in next ~3 days
+                   (per AV's EARNINGS_CALENDAR), regardless of DB state.
+                   Highest priority — we want fresh data BEFORE the report
+                   so the next-morning ingest catches the surprise.
+    2. NAN_REFRESH — symbols whose most recent non-future event has
+                     `surprise_pct = NULL` AND is < `fresh_nan_days` old.
+                     The report exists in our DB but data lag means we
+                     don't yet have the surprise %.
+    3. STALE_REFRESH — symbols whose latest non-future event is >
+                       `refresh_after_days` old. Likely a new quarter
+                       to fetch.
+    4. BACKFILL — symbols in universe with no earnings_events row at all.
 
-    Quarterly EPS reports happen every ~90 days, so refresh_after_days=60
-    means we re-fetch any symbol that hasn't been touched in 60+ days —
-    this picks up new quarters within ~30 days of release at worst.
-
-    Once backfill is exhausted (after ~10 days at AV free tier 25/day),
-    the rotation naturally becomes refresh-only on a ~10-day cycle for
-    a 250-symbol universe.
+    Background context: AV free tier = 25 calls/day. Need to spend that
+    budget on the symbols MOST LIKELY to have a fresh signal for PEAD.
+    Calendar lookup costs 1 call but tells us exactly who reports soon.
     """
     payload = json.loads(Path(universe_path).read_text())
     universe = payload["symbols"] if isinstance(payload, dict) else payload
-    # Skip ETFs / non-earnings instruments to avoid wasting AV quota.
     universe = [s for s in universe if s not in NO_EARNINGS_TICKERS]
+    universe_set = set(universe)
     con = duckdb.connect(db_path, read_only=True)
     try:
-        # latest event per symbol
+        # Latest NON-FUTURE event per symbol with its surprise status.
+        # (Future events from yfinance — like BP's expected Aug report — should
+        # not be treated as "latest" for refresh purposes.)
         rows = con.execute(
-            "SELECT symbol, MAX(event_datetime) FROM earnings_events GROUP BY symbol"
+            """
+            WITH latest AS (
+                SELECT symbol, event_datetime, surprise_pct,
+                       ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY event_datetime DESC) AS rn
+                FROM earnings_events
+                WHERE is_future = false
+            )
+            SELECT symbol, event_datetime, surprise_pct FROM latest WHERE rn = 1
+            """
         ).fetchall()
     finally:
         con.close()
-    latest_by_sym = {sym: ts for sym, ts in rows}
+    latest_by_sym = {sym: (ts, surp) for sym, ts, surp in rows}
 
     from datetime import datetime as _dt, timedelta as _td
-    cutoff = _dt.now() - _td(days=refresh_after_days)
+    now = _dt.now()
+    cutoff_stale = now - _td(days=refresh_after_days)
+    cutoff_recent = now - _td(days=fresh_nan_days)
 
+    # Tier 1: Calendar (expected to report in next few days)
+    calendar_priority: list[str] = []
+    if calendar_symbols:
+        calendar_in_universe = calendar_symbols & universe_set
+        # Sort by whether we already have data — symbols missing from DB first
+        # (we DEFINITELY need their history); then those we have.
+        calendar_priority = sorted(
+            calendar_in_universe,
+            key=lambda s: (s in latest_by_sym, s),
+        )
+
+    # Build remaining priorities, EXCLUDING anything already on calendar list.
+    on_calendar = set(calendar_priority)
+
+    nan_refresh: list[tuple[str, object]] = []
+    stale_refresh: list[tuple[str, object]] = []
     backfill: list[str] = []
-    refresh: list[tuple[str, object]] = []
     for sym in universe:
+        if sym in on_calendar:
+            continue
         if sym not in latest_by_sym:
             backfill.append(sym)
-        elif latest_by_sym[sym] is not None and latest_by_sym[sym] < cutoff:
-            refresh.append((sym, latest_by_sym[sym]))
+            continue
+        ts, surp = latest_by_sym[sym]
+        if ts is None:
+            backfill.append(sym)
+            continue
+        if surp is None and ts >= cutoff_recent:
+            # Have the event row but missing the surprise % — refresh ASAP
+            nan_refresh.append((sym, ts))
+        elif ts < cutoff_stale:
+            # Latest event is old, likely a new quarter exists upstream
+            stale_refresh.append((sym, ts))
+
+    nan_refresh.sort(key=lambda x: x[1], reverse=True)  # most recent first
+    stale_refresh.sort(key=lambda x: x[1])              # oldest first
     backfill.sort()
-    refresh.sort(key=lambda x: x[1])  # oldest first
-    return backfill + [s for s, _ in refresh]
+
+    return (
+        calendar_priority
+        + [s for s, _ in nan_refresh]
+        + [s for s, _ in stale_refresh]
+        + backfill
+    )
 
 
 def _av_fetch_earnings(symbol: str, key: str, timeout: int = 20) -> dict:
@@ -280,8 +388,23 @@ def main():
     if args.symbols:
         symbols = args.symbols
     else:
-        symbols = _load_priority_symbols(args.universe, args.db)
-        logging.info("Default priority symbols (broad250 not yet in events): %d", len(symbols))
+        # Calendar lookup costs 1 quota but gives us symbols expected to
+        # report in the next few days — these are the ones whose data we
+        # want freshest before PEAD fires. Fall back to refresh+backfill
+        # priorities if calendar fetch fails (rate limit / network).
+        calendar_syms = _load_calendar_symbols(api_key, expected_window_days=3)
+        if calendar_syms:
+            logging.info("Calendar: %d symbols expected to report in next 3 days",
+                         len(calendar_syms))
+        else:
+            logging.warning("Calendar lookup returned empty — using refresh+backfill priorities only")
+        symbols = _load_priority_symbols(
+            args.universe, args.db,
+            refresh_after_days=60,
+            fresh_nan_days=30,
+            calendar_symbols=calendar_syms,
+        )
+        logging.info("Total priority queue: %d symbols (calendar+nan+stale+backfill)", len(symbols))
 
     if args.max_symbols:
         symbols = symbols[: args.max_symbols]
