@@ -75,8 +75,16 @@ class PEADConfig:
     max_gross_exposure: float = 0.5  # safety cap
     # Universe gate (None = all symbols in earnings_events)
     universe_path: Optional[str] = None  # e.g. "research_data/intraday_top250_universe.json"
-    # Data
-    daily_db_path: str = "research_data/market_data.duckdb"
+    # Data — earnings_events lives in earnings_data.duckdb (split off
+    # market_data.duckdb 2026-05-01 to eliminate scheduler lock collisions).
+    # See plan ethereal-strolling-rocket.md.
+    daily_db_path: str = "research_data/earnings_data.duckdb"
+    # LLM gate (Phase 2 — see plan §A and pead_llm_analyzer.py). When True,
+    # find_new_signals INNER JOINs against earnings_llm_decisions and only
+    # surfaces symbols where the multi-agent pipeline returned BUY. Missing
+    # decision (batch crashed, parse failed, etc.) → symbol skipped, NO
+    # silent fallback to raw threshold (per failure-mode policy).
+    require_llm_buy: bool = False
     # Operational
     log_dir: Path = field(default_factory=lambda: Path("results/pead/paper"))
     dry_run: bool = True
@@ -225,22 +233,57 @@ class PEADTrader:
         # Pull events from past 3 calendar days to be safe (covers weekend + holiday gaps).
         end_dt = today
         start_dt = today - timedelta(days=4)
-        try:
+
+        def _read_events() -> pd.DataFrame:
             con = duckdb.connect(cfg.daily_db_path, read_only=True)
-            df = con.execute(
-                """
-                SELECT symbol, event_datetime, surprise_pct, time_hint
-                FROM earnings_events
-                WHERE is_future = false
-                  AND surprise_pct IS NOT NULL
-                  AND event_datetime >= ?
-                  AND event_datetime <= ?
-                ORDER BY event_datetime
-                """,
-                [start_dt.strftime("%Y-%m-%d %H:%M:%S"),
-                 end_dt.strftime("%Y-%m-%d %H:%M:%S")],
-            ).fetchdf()
-            con.close()
+            try:
+                if cfg.require_llm_buy:
+                    # INNER JOIN against earnings_llm_decisions — only
+                    # surface symbols where the multi-agent pipeline
+                    # returned BUY for that (symbol, event_date). Missing
+                    # row (batch failed, parse failed, etc.) ⇒ symbol
+                    # naturally drops. NO fallback to raw threshold.
+                    return con.execute(
+                        """
+                        SELECT ee.symbol, ee.event_datetime,
+                               ee.surprise_pct, ee.time_hint
+                        FROM earnings_events ee
+                        INNER JOIN earnings_llm_decisions eld
+                          ON eld.symbol = ee.symbol
+                         AND eld.event_date = CAST(ee.event_datetime AS DATE)
+                         AND eld.llm_decision = 'BUY'
+                        WHERE ee.is_future = false
+                          AND ee.surprise_pct IS NOT NULL
+                          AND ee.event_datetime >= ?
+                          AND ee.event_datetime <= ?
+                        ORDER BY ee.event_datetime
+                        """,
+                        [start_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                         end_dt.strftime("%Y-%m-%d %H:%M:%S")],
+                    ).fetchdf()
+                return con.execute(
+                    """
+                    SELECT symbol, event_datetime, surprise_pct, time_hint
+                    FROM earnings_events
+                    WHERE is_future = false
+                      AND surprise_pct IS NOT NULL
+                      AND event_datetime >= ?
+                      AND event_datetime <= ?
+                    ORDER BY event_datetime
+                    """,
+                    [start_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                     end_dt.strftime("%Y-%m-%d %H:%M:%S")],
+                ).fetchdf()
+            finally:
+                con.close()
+
+        try:
+            # _with_lock_retry handles transient `Could not set lock`
+            # collisions with concurrent writers (e.g., AV ingest cron
+            # running alongside PEAD's morning fire). Imported lazily to
+            # avoid a hard dependency on warehouse module.
+            from tradingagents.research.warehouse import _with_lock_retry
+            df = _with_lock_retry(_read_events)
         except Exception as exc:
             logger.error("earnings_events query failed: %s", exc)
             return []

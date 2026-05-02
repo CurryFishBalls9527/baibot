@@ -107,6 +107,43 @@ class BacktestConfig:
     leader_cont_max_below_52w_high: float = 0.30
     leader_cont_max_extension_pct: float = 0.07
     leader_cont_max_pullback_pct: float = 0.08
+    # Volume gate for the leader_continuation path. The rule-entry path
+    # already enforces volume_surge_multiple>=1.5 via the screener
+    # (breakout_signal_today). The continuation path has no volume check
+    # by design (an already-running leader doesn't need a fresh-base
+    # confirmation surge). W18 daily reviews flagged 5+ live continuation
+    # entries with breakout_volume_ratio in the 0.7-1.0x range; this knob
+    # tests whether requiring a minimum on continuations improves outcome.
+    # Default 0.0 = disabled = current behavior.
+    leader_cont_min_breakout_volume_ratio: float = 0.0
+    # Time-of-day-aware volume gate (W18 build B). Source: precomputed
+    # `morning_volume_features` table — ratio of today's 09:30-13:30 ET
+    # accumulated volume vs same-window 20-day average. Captures volume
+    # context AT the moment a pyramid add-on or 15:30 swing-entry decision
+    # fires, vs the daily-bar `breakout_volume_ratio` which only knows
+    # full-day numbers and was directionally null in earlier sweep
+    # (see `project_volume_gate_null.md`). 0.0 = disabled (default).
+    min_morning_volume_ratio: float = 0.0
+    leader_cont_min_morning_volume_ratio: float = 0.0
+    # Bar-level "fake breakout" gates for the pyramid add-on path. Two
+    # complementary metrics from `max_bar_volume_features` (built by
+    # scripts/compute_max_bar_volume_features.py):
+    #   * `min_add_on_max_bar_rvol_20d`     — gate on max_bar_rvol_20d
+    #     (today's strongest 30m bar / 20-day same-slot baseline)
+    #   * `min_add_on_max_bar_rvol_intraday` — gate on max_bar_rvol_intraday
+    #     (max(today_bar_vol) / mean(today_bar_vol) — within-day concentration)
+    # Hypothesis: pyramid add-ons that fire WITHOUT either signal are
+    # "fake breakouts" — drift through trigger price without volume
+    # conviction. 0.0 = disabled (default). See plan + memory.
+    min_add_on_max_bar_rvol_20d: float = 0.0
+    min_add_on_max_bar_rvol_intraday: float = 0.0
+    # W18 verification: require yesterday's daily close to also exceed
+    # today's buy_point. Together with the existing `price >= buy_point`
+    # entry gate, this means we wait for the SECOND consecutive day above
+    # the pivot — i.e. confirming the breakout held overnight. Tests
+    # "hold above the pivot for 2 bars" from the W18 daily reviewer.
+    # Default False = disabled (current behavior: enter on first cross).
+    require_prior_close_above_buy_point: bool = False
     # Change #16 (Wave 2): composite entry scoring. Replaces the raw-feature
     # ranking tuple with a composite score built from template, RS,
     # base depth, volume contraction, stage, RVOL, and 60d momentum. Intent:
@@ -960,6 +997,14 @@ class MinerviniBacktester:
             return False
         if pd.notna(buy_limit_price) and price > float(buy_limit_price):
             return False
+        if self.config.require_prior_close_above_buy_point:
+            held = row.get("prior_close_above_buy_point")
+            if pd.isna(held) or not bool(held):
+                return False
+        if self.config.min_morning_volume_ratio > 0:
+            mvr = row.get("morning_volume_ratio")
+            if pd.isna(mvr) or float(mvr) < self.config.min_morning_volume_ratio:
+                return False
         return True
 
     def _row_passes_continuation_entry(self, row: pd.Series, price: float) -> bool:
@@ -1070,6 +1115,21 @@ class MinerviniBacktester:
         ):
             return False
 
+        if self.config.leader_cont_min_breakout_volume_ratio > 0:
+            rvol = row.get("breakout_volume_ratio")
+            if pd.isna(rvol) or float(rvol) < self.config.leader_cont_min_breakout_volume_ratio:
+                return False
+
+        if self.config.require_prior_close_above_buy_point:
+            held = row.get("prior_close_above_buy_point")
+            if pd.isna(held) or not bool(held):
+                return False
+
+        if self.config.leader_cont_min_morning_volume_ratio > 0:
+            mvr = row.get("morning_volume_ratio")
+            if pd.isna(mvr) or float(mvr) < self.config.leader_cont_min_morning_volume_ratio:
+                return False
+
         return True
 
     def _row_supports_pyramiding(self, row: pd.Series, price: float) -> bool:
@@ -1077,6 +1137,18 @@ class MinerviniBacktester:
             return False
         if self.config.use_close_range_filter and pd.notna(row.get("close_range_pct")):
             if float(row["close_range_pct"]) < self.config.min_close_range_pct:
+                return False
+        # Fake-breakout gates (see config). Either gate, when enabled,
+        # requires a concentrated bar today; missing/NaN feature → reject
+        # (conservative — same failure-mode policy as other intraday
+        # features when data is unavailable).
+        if self.config.min_add_on_max_bar_rvol_20d > 0:
+            r = row.get("max_bar_rvol_20d")
+            if pd.isna(r) or float(r) < self.config.min_add_on_max_bar_rvol_20d:
+                return False
+        if self.config.min_add_on_max_bar_rvol_intraday > 0:
+            r = row.get("max_bar_rvol_intraday")
+            if pd.isna(r) or float(r) < self.config.min_add_on_max_bar_rvol_intraday:
                 return False
         return bool(row.get("breakout_ready")) or bool(row.get("breakout_signal"))
 

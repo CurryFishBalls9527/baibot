@@ -91,6 +91,123 @@ CHANGES = {
     "rvol_1_5x": {"min_breakout_volume_ratio": 1.5},
     "rvol_1_25x": {"min_breakout_volume_ratio": 1.25},
     "rvol_2_0x": {"min_breakout_volume_ratio": 2.0},
+    # W18 daily-review investigation: leader_continuation entry path has
+    # no volume gate (backtester.py:1007). Multiple live W18 entries via
+    # this path had breakout_volume_ratio in the 0.7-1.0x range. Tests
+    # whether requiring a minimum on continuations filters weak ones
+    # without losing the strong leader-following trades.
+    "leader_cont_vol_1_4x": {"leader_cont_min_breakout_volume_ratio": 1.4},
+    "leader_cont_vol_1_5x": {"leader_cont_min_breakout_volume_ratio": 1.5},
+    # B build-out: time-of-day-aware volume gate. `morning_volume_ratio` is
+    # today's 09:30-13:30 ET volume / 20-day avg of same window — measured
+    # at the moment a pyramid add-on or 15:30 swing-entry decision fires.
+    # Tests whether THIS metric (vs the previously-tested daily-bar full-day
+    # ratio) catches the weak entries the W18 reviewer flagged.
+    # On leader_continuation path (where the prior null memory pointed):
+    "morning_vol_lc_1_0x": {"leader_cont_min_morning_volume_ratio": 1.0},
+    "morning_vol_lc_1_2x": {"leader_cont_min_morning_volume_ratio": 1.2},
+    "morning_vol_lc_1_5x": {"leader_cont_min_morning_volume_ratio": 1.5},
+    # On rule-entry path (parallel test for completeness):
+    "morning_vol_re_1_0x": {"min_morning_volume_ratio": 1.0},
+    "morning_vol_re_1_2x": {"min_morning_volume_ratio": 1.2},
+    # On both paths simultaneously:
+    "morning_vol_all_1_2x": {
+        "min_morning_volume_ratio": 1.2,
+        "leader_cont_min_morning_volume_ratio": 1.2,
+    },
+    # 2026-05-02 fake-breakout test on PYRAMID ADD-ON path. Two
+    # complementary metrics (see compute_max_bar_volume_features.py):
+    #   _20d      — today's biggest 30m bar / 20-day same-slot baseline
+    #               (catches "this bar is exceptional vs typical days")
+    #   _intraday — max(today_bar_vol) / mean(today_bar_vol)
+    #               (catches "today had a concentrated moment")
+    # Backtester pyramid is always-on by default (add_on_fraction_*=0.3/0.2);
+    # the gates apply via _row_supports_pyramiding (backtester.py:1123).
+    # Threshold picks aim for ~30-50% selectivity (distribution: 20d p50=1.65,
+    # intraday p50=3.20). User's theory: drift-through-pivot WITHOUT bar-level
+    # confirmation = fake breakout, skip the add-on.
+    "add_on_max_bar_20d_1_5x":      {"min_add_on_max_bar_rvol_20d": 1.5},
+    "add_on_max_bar_20d_2_0x":      {"min_add_on_max_bar_rvol_20d": 2.0},
+    "add_on_max_bar_intraday_3_5x": {"min_add_on_max_bar_rvol_intraday": 3.5},
+    "add_on_max_bar_intraday_4_0x": {"min_add_on_max_bar_rvol_intraday": 4.0},
+    # W18 daily-review verification batch — testing literal proposals that
+    # were previously rejected on direction-level priors only.
+    # A.1: tighter universal trail (5% / 7% flat). The baseline has
+    # regime_aware_trail=True which makes trail_stop_pct a dead knob —
+    # we explicitly disable that flag here so the override actually fires.
+    "tight_trail_5pct": {"regime_aware_trail": False, "trail_stop_pct": 0.05},
+    "tight_trail_7pct": {"regime_aware_trail": False, "trail_stop_pct": 0.07},
+    # A.2: lock stop to entry+5% once MFE crosses +5%
+    "lock_at_mfe_5pct": {
+        "breakeven_trigger_pct": 0.05,
+        "breakeven_lock_offset_pct": 0.05,
+    },
+    # C: ADX>=20 entry filter on both rule and continuation paths
+    "adx_ge_20": {
+        "min_adx_14": 20.0,
+        "leader_cont_min_adx_14": 20.0,
+    },
+    # D: require yesterday's close to also be above today's buy_point.
+    # Combined with the existing price>=buy_point gate, this means today
+    # is the 2nd consecutive bar above the pivot — confirming the breakout
+    # held overnight. The most-implementable flavor of the W18 reviewer's
+    # "post-entry confirmation" votes.
+    "hold_above_pivot_2d": {"require_prior_close_above_buy_point": True},
+    # ── A build-out: regime-aware trail sweep below the shipped 10/10/7 ─
+    # Going tighter than 10/10/7 (the current B4L config). regime_trail_*
+    # entries above test variants strictly above; these go strictly below
+    # and explore asymmetric tighten patterns.
+    "regime_trail_10_8_5": {
+        "regime_aware_trail": True,
+        "trail_stop_pct_uptrend": 0.10,
+        "trail_stop_pct_pressure": 0.08,
+        "trail_stop_pct_correction": 0.05,
+    },
+    "regime_trail_8_8_6": {
+        "regime_aware_trail": True,
+        "trail_stop_pct_uptrend": 0.08,
+        "trail_stop_pct_pressure": 0.08,
+        "trail_stop_pct_correction": 0.06,
+    },
+    "regime_trail_8_7_5": {
+        "regime_aware_trail": True,
+        "trail_stop_pct_uptrend": 0.08,
+        "trail_stop_pct_pressure": 0.07,
+        "trail_stop_pct_correction": 0.05,
+    },
+    "regime_trail_10_10_5": {
+        "regime_aware_trail": True,
+        "trail_stop_pct_uptrend": 0.10,
+        "trail_stop_pct_pressure": 0.10,
+        "trail_stop_pct_correction": 0.05,
+    },
+    # ── A build-out: MFE-lock variants (less-aggressive than 5/5) ────────
+    # The 5/5 variant we tested failed (-12.2pp 2023_25 live). These give
+    # the trade more room before locking. Lock-at-+5% is the W18 reviewer's
+    # specific suggestion; trigger thresholds 8/10/15 give the trade more
+    # runway before the lock kicks in.
+    "mfe_lock_8_5": {
+        "breakeven_trigger_pct": 0.08,
+        "breakeven_lock_offset_pct": 0.05,
+    },
+    "mfe_lock_10_5": {
+        "breakeven_trigger_pct": 0.10,
+        "breakeven_lock_offset_pct": 0.05,
+    },
+    "mfe_lock_15_5": {
+        "breakeven_trigger_pct": 0.15,
+        "breakeven_lock_offset_pct": 0.05,
+    },
+    # Combined: best regime-trail (8/7/5) + best MFE-lock (10/+5).
+    # Stacks the two mechanisms to test for interference vs additive effect.
+    "regime875_mfe_lock_10_5": {
+        "regime_aware_trail": True,
+        "trail_stop_pct_uptrend": 0.08,
+        "trail_stop_pct_pressure": 0.07,
+        "trail_stop_pct_correction": 0.05,
+        "breakeven_trigger_pct": 0.10,
+        "breakeven_lock_offset_pct": 0.05,
+    },
     # Change #7: partial profit params
     "partial_25_at_20": {"partial_profit_trigger_pct": 0.20, "partial_profit_fraction": 0.25},
     "partial_off": {"partial_profit_fraction": 0.0},

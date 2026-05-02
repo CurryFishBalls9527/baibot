@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  PEAD end-of-day dashboard sync. Fires every weekday at 15:30 CDT
+  (= 16:30 ET, 30 min after market close). Mirrors PEAD's authoritative
+  state (positions.json, fills.jsonl) + the live PEAD Alpaca account
+  into trading_pead.db so the unified dashboard sees correct EOD
+  equity / cash / position values for the PEAD strategy.
+
+  Why a separate cron from com.baibot.pead?
+    - PEAD itself fires at 08:35 CDT to take entries shortly after open.
+    - The morning run captures intraday positions but the daily_snapshot
+      taken at that moment reflects pre-fill state. EOD sync at 15:30
+      CDT captures settled equity for the day.
+    - Decoupling means PEAD entry logic + dashboard sync can be edited
+      and run independently.
+
+  Reads .env via the wrapper so API keys never appear in this plist.
+
+  Install:
+    cp scripts/launchd/com.baibot.pead_eod_sync.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.baibot.pead_eod_sync.plist
+
+  Force run NOW:
+    launchctl kickstart gui/$UID/com.baibot.pead_eod_sync
+
+  Watch:
+    tail -f /Users/myu/code/baibot/results/pead/paper/eod_sync.{out,err}.log
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.baibot.pead_eod_sync</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/myu/code/baibot/scripts/launchd_wrappers/pead_eod_sync_run.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/myu/code/baibot</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+  </dict>
+
+  <key>StartCalendarInterval</key>
+  <array>
+    <!-- Mon-Fri at 15:30 local CDT (= 16:30 ET, after market close). -->
+    <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>15</integer><key>Minute</key><integer>30</integer></dict>
+    <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>15</integer><key>Minute</key><integer>30</integer></dict>
+    <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>15</integer><key>Minute</key><integer>30</integer></dict>
+    <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>15</integer><key>Minute</key><integer>30</integer></dict>
+    <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>15</integer><key>Minute</key><integer>30</integer></dict>
+  </array>
+
+  <key>RunAtLoad</key>
+  <false/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/myu/code/baibot/results/pead/paper/eod_sync.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/myu/code/baibot/results/pead/paper/eod_sync.err.log</string>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>

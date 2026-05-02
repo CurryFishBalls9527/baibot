@@ -274,7 +274,7 @@ def run_period(
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--daily-db", default="research_data/market_data.duckdb")
+    parser.add_argument("--daily-db", default="research_data/earnings_data.duckdb")
     parser.add_argument("--include-shorts", action="store_true",
                         help="Enable L/S based on surprise sign (vs long-only)")
     args = parser.parse_args()

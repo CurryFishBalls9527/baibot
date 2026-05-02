@@ -108,9 +108,16 @@ variants:
       dead_money_max_days: 10
       # B2: disable partial profits, let winners run
       partial_profit_fraction: 0.0
-      # B3L: breakeven at +8%, lock entry+1%
-      breakeven_trigger_pct: 0.08
-      breakeven_lock_offset_pct: 0.01
+      # B3L: lock at entry+5% once price has run up +10% (was: 8% trigger
+      # / +1% lock; updated 2026-05-01 after A build-out backtests). The
+      # previous 8/+1 protected against round-trip-to-flat; the new 10/+5
+      # waits for the trend to confirm (+10%) then preserves half the
+      # gain (+5%). Backtest delta vs previous: +9.2pp research 2023_25,
+      # +0.2pp live 2023_25, +6.0pp live 2015. See memory file
+      # `project_a_buildout_mfe_lock_candidate.md`. To revert: restore
+      # 0.08 / 0.01.
+      breakeven_trigger_pct: 0.10
+      breakeven_lock_offset_pct: 0.05
       # B4L: regime-dependent trail (tighten only in correction)
       regime_aware_trail: true
       trail_stop_pct_uptrend: 0.10
@@ -263,3 +270,11 @@ variants:
       max_positions: 6
       default_stop_loss_pct: 0.03
       default_take_profit_pct: 1.0
+
+  # PEAD intentionally NOT a variant here. It's a standalone launchd job
+  # (com.baibot.pead) — adding it here causes the scheduler's ABRunner to
+  # build a default Minervini Orchestrator against PEAD's Alpaca account
+  # and trade against it (proven harmful 2026-05-01: scheduler opened
+  # INTC/LITE/STX on PEAD account, ExitManager fabricated stops on PEAD
+  # positions). Dashboard discovery for PEAD happens via hardcoded entry
+  # in tradingagents/dashboard/multi_variant.py — not via this YAML.

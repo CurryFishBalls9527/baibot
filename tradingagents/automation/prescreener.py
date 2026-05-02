@@ -309,7 +309,16 @@ class MinerviniPreScreener:
             if self._should_refresh_fundamentals(warehouse, symbols, end_date):
                 warehouse.fetch_and_store_fundamentals(symbols, snapshot_date=end_date)
                 warehouse.fetch_and_store_quarterly_fundamentals(symbols)
-                warehouse.fetch_and_store_earnings_events(symbols)
+                # Earnings refresh is now handled by the dedicated nightly
+                # crons (com.baibot.av_ingest + the chained yfinance-recent
+                # fallback) writing to research_data/earnings_data.duckdb.
+                # The live preflight only READS via the attached earnings
+                # DB. We do NOT call fetch_and_store_earnings_events here:
+                # it would open a write connection to earnings_data.duckdb,
+                # which conflicts with this process's existing READ_ONLY
+                # ATTACH (DuckDB's process-level file-handle uniqueness —
+                # broke 2026-05-01 post-restart, see plan
+                # ethereal-strolling-rocket.md).
 
             data_by_symbol = {
                 symbol: warehouse.get_daily_bars(symbol, start_date, end_date)
@@ -495,12 +504,18 @@ class MinerviniPreScreener:
             return True
         latest_dates = set(str(value) for value in latest["snapshot_date"].dropna().tolist())
         quarterly = warehouse.get_quarterly_fundamentals(symbols)
-        earnings_count = warehouse.conn.execute(
-            "SELECT COUNT(DISTINCT symbol) FROM earnings_events WHERE symbol IN ({})".format(
-                ", ".join(["?"] * len(symbols))
-            ),
-            symbols,
-        ).fetchone()[0]
+        # earnings_events lives in the attached read-only earnings DB
+        # (ed) since the 2026-05-01 DB split. If attach failed, treat
+        # earnings as missing → forces refresh path.
+        if warehouse._earnings_attached:
+            earnings_count = warehouse.conn.execute(
+                "SELECT COUNT(DISTINCT symbol) FROM ed.earnings_events WHERE symbol IN ({})".format(
+                    ", ".join(["?"] * len(symbols))
+                ),
+                symbols,
+            ).fetchone()[0]
+        else:
+            earnings_count = 0
         return (
             target_date not in latest_dates
             or quarterly.empty

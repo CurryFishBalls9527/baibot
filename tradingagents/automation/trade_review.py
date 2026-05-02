@@ -821,7 +821,11 @@ def run_held_position_review(
     from tradingagents.llm_clients.factory import create_llm_client
     llm_client = create_llm_client(
         provider=config.get("llm_provider", "openai"),
-        model=config.get("quick_think_llm", "gpt-4o-mini"),
+        # Same upgrade as TradeAnalyzer (closed-trade path): held-position
+        # health-checks now use the daily_review_model knob (gpt-5.2 by
+        # default) instead of the cheap quick_think_llm shared with the
+        # 13-agent LLM trader.
+        model=config.get("daily_review_model", "gpt-5.2"),
     )
     llm = llm_client.get_llm()
 

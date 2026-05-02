@@ -878,3 +878,229 @@ def _fingerprint_log(line: str) -> str:
     line = _UUID_RE.sub("<id>", line)
     line = _NUMERIC_RE.sub("<n>", line)
     return line.strip()[:120]
+
+
+# ── Checks: PEAD + earnings ingest freshness ─────────────────────────
+# Added 2026-05-01 alongside the DB split + PEAD dashboard bridge. PEAD
+# and the three earnings ingest crons are intentionally separate launchd
+# jobs, so the swing scheduler's heartbeat does not catch their failures.
+# These checks alert if a job hasn't produced fresh output for too long.
+
+REPO_ROOT = Path("/Users/myu/code/baibot")
+PEAD_STATE_DIR = REPO_ROOT / "results" / "pead" / "paper"
+PEAD_DASHBOARD_DB = REPO_ROOT / "trading_pead.db"
+EARNINGS_DB = REPO_ROOT / "research_data" / "earnings_data.duckdb"
+
+
+def _file_age_hours(path: Path) -> Optional[float]:
+    if not path.exists():
+        return None
+    try:
+        mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=ET)
+    except OSError:
+        return None
+    return (now_et() - mtime).total_seconds() / 3600.0
+
+
+def check_pead_freshness(state: WatchdogState) -> List[Alert]:
+    """PEAD cron should write positions.json on every weekday fire (08:35 CDT).
+    Alert if the file is missing or > 36h old on a trading day. 36h covers
+    weekend gaps (Fri 08:35 → Mon 08:35 = 72h would not be caught; we
+    accept that and only alert on intra-week stalls)."""
+    today = now_et().date()
+    if not is_nyse_trading_day(today):
+        return []
+    positions_json = PEAD_STATE_DIR / "positions.json"
+    age_h = _file_age_hours(positions_json)
+    if age_h is None:
+        return [Alert(
+            category="pead_freshness",
+            title="PEAD positions.json missing",
+            body=f"{positions_json} does not exist. com.baibot.pead may not be running.",
+            dedupe_key=f"pead_freshness:missing:{today.isoformat()}",
+            priority="urgent",
+            tags=["warning"],
+            ttl_hours=12,
+        )]
+    if age_h <= 36:
+        return []
+    return [Alert(
+        category="pead_freshness",
+        title=f"PEAD positions.json stale ({age_h:.0f}h)",
+        body=(
+            f"{positions_json} mtime is {age_h:.0f}h old. PEAD cron "
+            "(com.baibot.pead, 08:35 CDT Mon-Fri) likely failed before write. "
+            "Check results/pead/paper/launchd.err.log."
+        ),
+        dedupe_key=f"pead_freshness:stale:{today.isoformat()}",
+        priority="high",
+        tags=["warning"],
+        ttl_hours=12,
+    )]
+
+
+def check_pead_dashboard_sync(state: WatchdogState) -> List[Alert]:
+    """The pead_ingest bridge writes trading_pead.db on every PEAD fire +
+    EOD sync (16:30 ET). Alert if it's > 36h stale on a trading day —
+    means the bridge is broken even though PEAD itself may be fine."""
+    today = now_et().date()
+    if not is_nyse_trading_day(today):
+        return []
+    age_h = _file_age_hours(PEAD_DASHBOARD_DB)
+    if age_h is None:
+        return [Alert(
+            category="pead_dashboard_sync",
+            title="trading_pead.db missing",
+            body=(
+                f"{PEAD_DASHBOARD_DB} does not exist. The PEAD → dashboard "
+                "bridge (scripts/sync_pead_to_dashboard.py) hasn't run. "
+                "PEAD will not show in the dashboard until it does."
+            ),
+            dedupe_key=f"pead_dashboard_sync:missing:{today.isoformat()}",
+            priority="high",
+            tags=["warning"],
+            ttl_hours=12,
+        )]
+    if age_h <= 36:
+        return []
+    return [Alert(
+        category="pead_dashboard_sync",
+        title=f"trading_pead.db stale ({age_h:.0f}h)",
+        body=(
+            f"{PEAD_DASHBOARD_DB} mtime is {age_h:.0f}h old. Either the "
+            "PEAD cron isn't writing fresh state, or the post-PEAD sync "
+            "step failed. Check results/pead/paper/launchd.err.log "
+            "and results/pead/paper/eod_sync.err.log."
+        ),
+        dedupe_key=f"pead_dashboard_sync:stale:{today.isoformat()}",
+        priority="medium",
+        tags=["warning"],
+        ttl_hours=12,
+    )]
+
+
+def _earnings_db_age_hours(query: str) -> Optional[float]:
+    """Run a MAX(timestamp_col) query on earnings_data.duckdb and return
+    age in hours. Returns None on failure (DB missing, lock contention,
+    empty table) so the caller can decide how loud to be."""
+    if not EARNINGS_DB.exists():
+        return None
+    try:
+        import duckdb
+        con = duckdb.connect(str(EARNINGS_DB), read_only=True)
+        try:
+            row = con.execute(query).fetchone()
+        finally:
+            con.close()
+        if not row or row[0] is None:
+            return None
+        ts = row[0]
+        # DuckDB returns datetime objects; localize as UTC if naive.
+        if isinstance(ts, datetime):
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            return (now_et() - ts.astimezone(ET)).total_seconds() / 3600.0
+    except Exception as exc:
+        logger.warning("earnings DB freshness query failed: %s", exc)
+    return None
+
+
+def check_calendar_freshness(state: WatchdogState) -> List[Alert]:
+    """earnings_calendar should be refreshed nightly by com.baibot.calendar_update
+    (02:00 CDT). Alert if MAX(fetched_at) is > 36h old."""
+    age_h = _earnings_db_age_hours("SELECT MAX(fetched_at) FROM earnings_calendar")
+    if age_h is None or age_h <= 36:
+        return []
+    today = now_et().date()
+    return [Alert(
+        category="calendar_freshness",
+        title=f"earnings_calendar stale ({age_h:.0f}h)",
+        body=(
+            f"MAX(fetched_at) in earnings_calendar is {age_h:.0f}h old. "
+            "com.baibot.calendar_update (02:00 CDT daily) likely failed. "
+            "Check results/pead/paper/calendar_update.err.log."
+        ),
+        dedupe_key=f"calendar_freshness:{today.isoformat()}",
+        priority="medium",
+        tags=["warning"],
+        ttl_hours=12,
+    )]
+
+
+def check_av_or_yfinance_freshness(state: WatchdogState) -> List[Alert]:
+    """earnings_events should get a fresh row from EITHER av_ingest or
+    yfinance_recent on every weekday morning (08:00 CDT). Alert only if
+    NEITHER source has produced a row in 48h on a trading day. The OR
+    logic means we don't false-alert when AV is rate-limited but
+    yfinance fallback is working."""
+    today = now_et().date()
+    if not is_nyse_trading_day(today):
+        return []
+    age_h = _earnings_db_age_hours(
+        "SELECT MAX(updated_at) FROM earnings_events"
+    )
+    if age_h is None or age_h <= 48:
+        return []
+    return [Alert(
+        category="earnings_ingest_freshness",
+        title=f"earnings_events stale ({age_h:.0f}h)",
+        body=(
+            f"MAX(updated_at) in earnings_events is {age_h:.0f}h old. "
+            "Both AV ingest and yfinance fallback (08:00 CDT) appear "
+            "broken. PEAD will have no fresh signals. Check "
+            "results/pead/paper/av_ingest.err.log."
+        ),
+        dedupe_key=f"earnings_ingest_freshness:{today.isoformat()}",
+        priority="urgent",
+        tags=["warning"],
+        ttl_hours=12,
+    )]
+
+
+def check_pead_llm_decisions_fresh(state: WatchdogState) -> List[Alert]:
+    """LLM-gated PEAD treatment arm depends on the AMC + BMO batch jobs
+    (com.baibot.pead_llm_amc/bmo) populating earnings_llm_decisions before
+    PEAD's 08:35 fire. Alert if no decision row was written in the past
+    18h on a trading day — means the batch crashed or never installed.
+
+    Treatment arm fails closed (skips entries when no decision), so this
+    check exists to surface silent failures to the operator. Control arm
+    (com.baibot.pead with --no-llm-gate) is unaffected — it doesn't read
+    this table at all."""
+    today = now_et().date()
+    if not is_nyse_trading_day(today):
+        return []
+    age_h = _earnings_db_age_hours(
+        "SELECT MAX(analyzed_at) FROM earnings_llm_decisions"
+    )
+    if age_h is None:
+        return [Alert(
+            category="pead_llm_decisions_fresh",
+            title="earnings_llm_decisions empty / missing",
+            body=(
+                "earnings_llm_decisions has no rows or table doesn't exist. "
+                "com.baibot.pead_llm_amc (17:30 CDT) likely never ran. "
+                "PEAD LLM-gated treatment arm will skip every entry today. "
+                "Check results/pead/llm/amc.err.log."
+            ),
+            dedupe_key=f"pead_llm_decisions_fresh:missing:{today.isoformat()}",
+            priority="high",
+            tags=["warning"],
+            ttl_hours=12,
+        )]
+    if age_h <= 18:
+        return []
+    return [Alert(
+        category="pead_llm_decisions_fresh",
+        title=f"earnings_llm_decisions stale ({age_h:.0f}h)",
+        body=(
+            f"MAX(analyzed_at) in earnings_llm_decisions is {age_h:.0f}h old. "
+            "AMC batch (17:30 CDT) or BMO batch (08:10 CDT) failed before "
+            "writing today's rows. PEAD LLM-gated treatment arm will skip "
+            "every entry. Check results/pead/llm/{amc,bmo}.err.log."
+        ),
+        dedupe_key=f"pead_llm_decisions_fresh:stale:{today.isoformat()}",
+        priority="high",
+        tags=["warning"],
+        ttl_hours=12,
+    )]

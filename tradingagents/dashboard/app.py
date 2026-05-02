@@ -319,7 +319,14 @@ def main():
         st.stop()
 
     variant_names = list(orchestrators.keys())
-    if "variant" not in st.session_state:
+    # Reset session_state if a stale variant is selected (e.g. user's session
+    # held "chan" before chan v1 was retired 2026-04-27). Without this, the
+    # selectbox(index=...) call below raises ValueError on a missing variant
+    # and the page errors out before the dropdown can let them pick again.
+    if (
+        "variant" not in st.session_state
+        or st.session_state["variant"] not in variant_names
+    ):
         st.session_state["variant"] = variant_names[0]
 
     # ── Top bar ────────────────────────────────────────────────────────

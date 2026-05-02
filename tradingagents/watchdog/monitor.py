@@ -135,6 +135,25 @@ class Watchdog:
             misfire_grace_time=600,
         )
 
+        # 10-14. PEAD + earnings ingest freshness checks (added 2026-05-01,
+        # extended 2026-05-02 with pead_llm_decisions_fresh for the LLM-
+        # gated A/B treatment arm). All fire once daily at 09:00 ET —
+        # after overnight crons should have finished, before the user
+        # starts looking at the dashboard. See checks.py for rationale.
+        for check_id, check_fn in (
+            ("pead_freshness",            checks.check_pead_freshness),
+            ("pead_dashboard_sync",       checks.check_pead_dashboard_sync),
+            ("calendar_freshness",        checks.check_calendar_freshness),
+            ("earnings_ingest_freshness", checks.check_av_or_yfinance_freshness),
+            ("pead_llm_decisions_fresh",  checks.check_pead_llm_decisions_fresh),
+        ):
+            self.scheduler.add_job(
+                wrap(check_fn, check_id),
+                trigger=CronTrigger(day_of_week="mon-fri", hour=9, minute=0),
+                id=check_id,
+                misfire_grace_time=1800,
+            )
+
     # ── Check execution ──────────────────────────────────────────────
 
     def _run_check(self, check_fn, name: str) -> None:

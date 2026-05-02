@@ -50,7 +50,7 @@ def parse_args():
     p.add_argument("symbols", nargs="*",
                    help="Specific symbols to fetch. Default: broad250 names "
                         "not yet in earnings_events.")
-    p.add_argument("--db", default="research_data/market_data.duckdb")
+    p.add_argument("--db", default="research_data/earnings_data.duckdb")
     p.add_argument("--universe", default="research_data/intraday_top250_universe.json",
                    help="Universe JSON for default symbol list")
     p.add_argument("--max-symbols", type=int, default=25,
@@ -384,12 +384,15 @@ def main():
         format="%(asctime)s %(levelname)s %(message)s",
     )
     args = parse_args()
-    api_key = (
-        os.environ.get("ALPHA_VANTAGE_API_KEY")
-        or os.environ.get("ALPHAVANTAGE_API_KEY")
-    )
+    # Dedicated key for the nightly earnings ingest cron — kept separate
+    # from the shared ALPHA_VANTAGE_API_KEY so other callers (fundamentals
+    # tools, ad-hoc scripts) can't burn this 25/day budget.
+    api_key = os.environ.get("ALPHA_VANTAGE_INGEST_API_KEY")
     if not api_key:
-        raise SystemExit("Set ALPHA_VANTAGE_API_KEY in environment.")
+        raise SystemExit(
+            "Set ALPHA_VANTAGE_INGEST_API_KEY in environment "
+            "(dedicated key for earnings ingest; do not reuse the shared key)."
+        )
 
     if args.symbols:
         symbols = args.symbols

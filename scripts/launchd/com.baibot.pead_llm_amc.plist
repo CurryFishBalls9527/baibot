@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  PEAD-LLM AMC batch. Fires Mon-Fri 17:30 CDT (= 18:30 ET, ~2.5h post-close).
+  Analyzes yesterday-AMC + overnight earnings reporters via the existing
+  13-agent TradingAgentsGraph pipeline; writes BUY/HOLD/SELL decisions to
+  earnings_data.duckdb earnings_llm_decisions table.
+
+  PEAD's morning 08:35 CDT cron INNER JOINs against this cache and only
+  enters positions where llm_decision='BUY'. See plan
+  /Users/myu/.claude/plans/ethereal-strolling-rocket.md.
+
+  Reads OPENAI_API_KEY from .env. No Alpaca creds needed (analysis-only,
+  no broker). Cost ~$0.10-0.20/candidate × typical 3-10 AMC names = ~$1-3/night.
+
+  Install:
+    cp scripts/launchd/com.baibot.pead_llm_amc.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.baibot.pead_llm_amc.plist
+
+  Force run NOW (won't trade, just writes cache rows for current AMC window):
+    launchctl kickstart gui/$UID/com.baibot.pead_llm_amc
+
+  Watch:
+    tail -f /Users/myu/code/baibot/results/pead/llm/amc.{out,err}.log
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.baibot.pead_llm_amc</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/myu/code/baibot/scripts/launchd_wrappers/pead_llm_amc.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/myu/code/baibot</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+  </dict>
+
+  <key>StartCalendarInterval</key>
+  <array>
+    <!-- Mon-Fri at 17:30 local CDT (= 18:30 ET, after-close + ~2.5h to settle). -->
+    <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>17</integer><key>Minute</key><integer>30</integer></dict>
+    <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>17</integer><key>Minute</key><integer>30</integer></dict>
+    <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>17</integer><key>Minute</key><integer>30</integer></dict>
+    <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>17</integer><key>Minute</key><integer>30</integer></dict>
+    <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>17</integer><key>Minute</key><integer>30</integer></dict>
+  </array>
+
+  <key>RunAtLoad</key>
+  <false/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/myu/code/baibot/results/pead/llm/amc.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/myu/code/baibot/results/pead/llm/amc.err.log</string>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>

@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from pathlib import Path
-from typing import Dict, Iterable, Optional
+from typing import Callable, Dict, Iterable, Optional, TypeVar
 
 import duckdb
 import pandas as pd
@@ -14,21 +15,125 @@ import yfinance as yf
 
 logger = logging.getLogger(__name__)
 
+# Earnings data lives in a separate DuckDB file so the standalone earnings
+# ingest crons (AV / yfinance / calendar) and the live PEAD reader never
+# contend with the scheduler's market_data.duckdb writer lock. Cross-DB
+# queries use ATTACH ... (READ_ONLY) which does not take a writer lock.
+# See plan: /Users/myu/.claude/plans/ethereal-strolling-rocket.md.
+EARNINGS_DB_PATH = "research_data/earnings_data.duckdb"
+
+T = TypeVar("T")
+
+
+def _with_lock_retry(
+    fn: Callable[[], T],
+    max_tries: int = 3,
+    backoff: tuple[float, ...] = (0.5, 2.0, 8.0),
+) -> T:
+    """Run ``fn`` and retry on DuckDB ``Could not set lock`` errors.
+
+    Used by live readers (e.g., pead_trader) that may collide with brief
+    writer windows held by the scheduler. Returns ``fn()`` on success;
+    re-raises the final exception after exhausting retries.
+    """
+    last_exc: Optional[Exception] = None
+    for attempt in range(max_tries):
+        try:
+            return fn()
+        except duckdb.IOException as exc:
+            if "Could not set lock" not in str(exc):
+                raise
+            last_exc = exc
+            if attempt + 1 >= max_tries:
+                break
+            sleep_s = backoff[min(attempt, len(backoff) - 1)]
+            logger.warning(
+                "DuckDB lock contention (attempt %d/%d), retrying in %.1fs",
+                attempt + 1, max_tries, sleep_s,
+            )
+            time.sleep(sleep_s)
+    assert last_exc is not None
+    raise last_exc
+
 
 class MarketDataWarehouse:
-    """Persist daily market data locally so research is reproducible."""
+    """Persist daily market data locally so research is reproducible.
+
+    Earnings tables (``earnings_events``, ``earnings_calendar``) live in a
+    separate DuckDB file at :data:`EARNINGS_DB_PATH`. This warehouse
+    attaches that file READ_ONLY for cross-DB JOINs (see
+    :meth:`get_latest_fundamentals`) and opens dedicated write connections
+    inside :meth:`fetch_and_store_earnings_events`.
+    """
 
     def __init__(
         self,
         db_path: str = "research_data/market_data.duckdb",
         read_only: bool = False,
+        earnings_db_path: str = EARNINGS_DB_PATH,
     ):
         self.db_path = Path(db_path)
         self.read_only = read_only
+        self.earnings_db_path = Path(earnings_db_path)
         if not self.read_only:
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = duckdb.connect(str(self.db_path), read_only=self.read_only)
+        self._earnings_attached = False
+        self._attach_earnings_readonly()
         self._create_tables()
+
+    # Context-manager support for `with MarketDataWarehouse(...) as wh:` —
+    # ensures close() runs even on exception. Backward compatible with
+    # existing try/finally close() callers.
+    def __enter__(self) -> "MarketDataWarehouse":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    def _attach_earnings_readonly(self) -> None:
+        """Attach earnings_data.duckdb READ_ONLY for cross-DB JOINs.
+
+        Idempotency: DuckDB attaches are PROCESS-WIDE — once any
+        connection in the process attaches a file, all other connections
+        can query ``ed.*`` without re-attaching. A 2nd ATTACH from
+        another warehouse instance fails with "already exists", which we
+        treat as success (the alias IS visible to this connection via
+        process-shared catalog state — verified empirically).
+
+        Safety vs. concurrent writers: keep this attach READ_ONLY so it
+        does not take a writer lock on the file. Ingest crons writing to
+        earnings_data.duckdb from a SEPARATE process are unaffected.
+        Within THIS process: writers (e.g. fetch_and_store_earnings_events
+        via _write_earnings_events) cannot open the file directly while
+        any attach is active — see _write_earnings_events for the
+        detach-write-reattach dance.
+
+        Skipped silently if the earnings DB file doesn't exist yet
+        (one-shot migration via scripts/migrate_split_earnings_db.py
+        creates it).
+        """
+        if not self.earnings_db_path.exists():
+            logger.warning(
+                "earnings DB %s missing; cross-DB JOINs disabled. "
+                "Run scripts/migrate_split_earnings_db.py.",
+                self.earnings_db_path,
+            )
+            return
+        try:
+            self.conn.execute(
+                f"ATTACH '{self.earnings_db_path}' AS ed (READ_ONLY)"
+            )
+            self._earnings_attached = True
+        except duckdb.Error as exc:
+            msg = str(exc)
+            if "already exists" in msg or "already attached" in msg:
+                # Another warehouse in this process already attached. The
+                # `ed` alias resolves through process-shared catalog —
+                # mark as attached so queries via `ed.*` work.
+                self._earnings_attached = True
+            else:
+                logger.warning("failed to attach earnings DB: %s", exc)
 
     def _create_tables(self):
         if self.read_only:
@@ -96,31 +201,27 @@ class MarketDataWarehouse:
             )
             """
         )
-        self.conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS earnings_events (
-                symbol VARCHAR,
-                event_datetime TIMESTAMP,
-                eps_estimate DOUBLE,
-                reported_eps DOUBLE,
-                surprise_pct DOUBLE,
-                revenue_average DOUBLE,
-                is_future BOOLEAN,
-                source VARCHAR,
-                updated_at TIMESTAMP,
-                PRIMARY KEY (symbol, event_datetime)
-            )
-            """
-        )
+        # earnings_events lives in earnings_data.duckdb (attached READ_ONLY
+        # at __init__). We no longer define it here. The legacy table in
+        # market_data.duckdb is kept around as fallback until the rollout
+        # is proven, but is no longer the source of truth.
         self._migrate_earnings_events_add_time_hint()
 
     def _migrate_earnings_events_add_time_hint(self) -> None:
-        """Add time_hint column to earnings_events if missing, and backfill
-        null values from event_datetime.hour. Idempotent."""
+        """Legacy migration: add time_hint to local earnings_events if it
+        still exists. After the DB split (earnings_data.duckdb), this
+        method is a no-op when the legacy table is gone. Idempotent.
+        """
+        if self.read_only:
+            return
+        # Check whether earnings_events still exists in this local DB
+        # (it may have been dropped during the post-split cleanup).
         cols = self.conn.execute(
             "SELECT column_name FROM information_schema.columns "
-            "WHERE table_name = 'earnings_events'"
+            "WHERE table_name = 'earnings_events' AND table_catalog = current_database()"
         ).fetchall()
+        if not cols:
+            return  # legacy table already cleaned up — nothing to do
         col_names = {row[0] for row in cols}
         if "time_hint" not in col_names:
             self.conn.execute(
@@ -414,13 +515,52 @@ class MarketDataWarehouse:
                 keep="last",
             )
 
-            self.conn.execute("DELETE FROM earnings_events WHERE symbol = ?", [symbol])
-            self.conn.register("earnings_events_df", frame)
-            self.conn.execute("INSERT INTO earnings_events SELECT * FROM earnings_events_df")
-            self.conn.unregister("earnings_events_df")
+            # Write to earnings_data.duckdb (split DB). We open a fresh
+            # write connection per symbol-batch so we hold the lock for
+            # only a few ms — long enough for the standalone PEAD reader
+            # to never effectively contend.
+            self._write_earnings_events(symbol, frame)
             row_counts[symbol] = len(frame)
 
         return row_counts
+
+    def _write_earnings_events(self, symbol: str, frame: pd.DataFrame) -> None:
+        """Open a short-lived write connection to earnings_data.duckdb,
+        delete-then-insert all rows for this symbol, close. Used by
+        fetch_and_store_earnings_events to avoid holding the earnings
+        DB writer lock across the slow yfinance/AV network calls.
+        """
+        self.earnings_db_path.parent.mkdir(parents=True, exist_ok=True)
+        write_conn = duckdb.connect(str(self.earnings_db_path))
+        try:
+            # Ensure the target table exists (matches migrate_split_earnings_db.py)
+            write_conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS earnings_events (
+                    symbol VARCHAR NOT NULL,
+                    event_datetime TIMESTAMP NOT NULL,
+                    eps_estimate DOUBLE,
+                    reported_eps DOUBLE,
+                    surprise_pct DOUBLE,
+                    revenue_average DOUBLE,
+                    is_future BOOLEAN,
+                    source VARCHAR,
+                    updated_at TIMESTAMP,
+                    time_hint VARCHAR,
+                    PRIMARY KEY (symbol, event_datetime)
+                )
+                """
+            )
+            write_conn.execute(
+                "DELETE FROM earnings_events WHERE symbol = ?", [symbol]
+            )
+            write_conn.register("earnings_events_df", frame)
+            write_conn.execute(
+                "INSERT INTO earnings_events SELECT * FROM earnings_events_df"
+            )
+            write_conn.unregister("earnings_events_df")
+        finally:
+            write_conn.close()
 
     def _fetch_yfinance_earnings(
         self,
@@ -569,12 +709,22 @@ class MarketDataWarehouse:
         self,
         symbol: str,
     ) -> pd.DataFrame:
-        """Return all earnings events for a symbol, sorted by date."""
+        """Return all earnings events for a symbol, sorted by date.
+
+        Reads from the attached read-only earnings DB (ed.earnings_events).
+        Returns an empty frame if the attach failed.
+        """
+        if not self._earnings_attached:
+            return pd.DataFrame(columns=[
+                "symbol", "event_datetime", "eps_estimate", "reported_eps",
+                "surprise_pct", "revenue_average", "is_future", "source",
+                "updated_at", "time_hint",
+            ])
         query = """
             SELECT symbol, event_datetime, eps_estimate, reported_eps,
                    surprise_pct, revenue_average, is_future, source,
                    updated_at, time_hint
-            FROM earnings_events
+            FROM ed.earnings_events
             WHERE symbol = ?
             ORDER BY event_datetime
         """
@@ -615,7 +765,18 @@ class MarketDataWarehouse:
         return [row[0] for row in rows]
 
     def get_latest_fundamentals(self, symbols: Optional[Iterable[str]] = None) -> pd.DataFrame:
-        query = """
+        # Earnings tables live in the attached read-only DB. If attach
+        # failed (file missing), fall back to a SELECT that yields no
+        # rows so the LEFT JOIN populates NULLs and the rest of the query
+        # still works.
+        next_earnings_source = (
+            "ed.earnings_events"
+            if self._earnings_attached
+            else "(SELECT NULL::VARCHAR AS symbol, NULL::TIMESTAMP AS event_datetime, "
+                 "NULL::DOUBLE AS eps_estimate, NULL::DOUBLE AS revenue_average, "
+                 "FALSE AS is_future WHERE FALSE)"
+        )
+        query = f"""
             WITH ranked AS (
                 SELECT *,
                        ROW_NUMBER() OVER (
@@ -645,7 +806,7 @@ class MarketDataWarehouse:
                                PARTITION BY symbol
                                ORDER BY event_datetime ASC
                            ) AS row_num
-                    FROM earnings_events
+                    FROM {next_earnings_source}
                     WHERE is_future = TRUE
                 )
                 WHERE row_num = 1

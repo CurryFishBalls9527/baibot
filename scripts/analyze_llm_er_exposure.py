@@ -108,7 +108,8 @@ def main() -> int:
                    help="Comma-separated SQLite paths")
     p.add_argument("--warehouse",
                    default="research_data/market_data.duckdb",
-                   help="DuckDB path containing earnings_events")
+                   help="MarketDataWarehouse main DB. Earnings events are read "
+                        "via the warehouse's attached earnings_data.duckdb.")
     p.add_argument("--entry-gate-days", default="1,3,5,7",
                    help="Sweep these entry-blackout thresholds")
     p.add_argument("--out", default="results/llm_er_exposure.csv")

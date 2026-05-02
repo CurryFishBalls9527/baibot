@@ -17,9 +17,41 @@ logger = logging.getLogger(__name__)
 _MAX_WORKERS = 3
 
 
+# Strategy types this scheduler can dispatch. Every variant in
+# experiments/*.yaml MUST declare one of these (or omit strategy_type to
+# get the default Minervini Orchestrator). Adding an unknown value at
+# the YAML level used to silently fall back to the default Minervini
+# Orchestrator — which is what corrupted PEAD's Alpaca account on
+# 2026-05-01 (a `pead_view` entry got built as full Minervini and traded
+# ~$50K of unwanted positions). Now we raise instead — fail loud at
+# scheduler startup beats silent strategy contamination.
+_KNOWN_STRATEGY_TYPES = frozenset({
+    "minervini",  # default Orchestrator
+    "chan",
+    "chan_daily",
+    "intraday_mechanical",
+})
+
+
 def _build_orchestrator(variant_config: dict):
-    """Build the appropriate orchestrator based on strategy_type config."""
+    """Build the appropriate orchestrator based on strategy_type config.
+
+    Raises ValueError if strategy_type is unknown — refuses to silently
+    treat unknown variants as default Minervini. To register a new
+    strategy_type, add it to _KNOWN_STRATEGY_TYPES above and add a
+    dispatch branch below.
+    """
     strategy_type = variant_config.get("strategy_type", "minervini")
+    if strategy_type not in _KNOWN_STRATEGY_TYPES:
+        raise ValueError(
+            f"Unknown strategy_type {strategy_type!r} for variant "
+            f"{variant_config.get('variant_name', '?')!r}. Known types: "
+            f"{sorted(_KNOWN_STRATEGY_TYPES)}. If this variant is meant to "
+            "be managed OUTSIDE the scheduler (e.g. PEAD as a standalone "
+            "launchd job), it must NOT be in paper_launch_v2.yaml — see "
+            "tradingagents/dashboard/multi_variant.py for the "
+            "dashboard-only registration pattern."
+        )
     if strategy_type == "chan":
         from tradingagents.automation.chan_orchestrator import ChanOrchestrator
         return ChanOrchestrator(variant_config)

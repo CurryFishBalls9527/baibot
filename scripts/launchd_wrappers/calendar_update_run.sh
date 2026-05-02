@@ -17,7 +17,7 @@ set +a
 # Updates BOTH historical [-90d] and forecast [+180d] entries.
 exec "$REPO/.venv/bin/python" "$REPO/scripts/update_earnings_calendar.py" \
   --universe "$REPO/research_data/intraday_top250_universe.json" \
-  --db "$REPO/research_data/market_data.duckdb" \
+  --db "$REPO/research_data/earnings_data.duckdb" \
   --lookback-days 90 \
   --lookahead-days 180 \
   --delay-ms 200

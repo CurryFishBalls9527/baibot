@@ -1586,7 +1586,9 @@ class Orchestrator:
                 skipped += 1
                 continue
             try:
-                ta.reflect_state_and_remember(state, pos.unrealized_pl)
+                pl_pct = (pos.unrealized_plpc or 0.0) * 100.0
+                returns_label = f"${pos.unrealized_pl:.2f} ({pl_pct:+.2f}%)"
+                ta.reflect_state_and_remember(state, returns_label)
                 reflected += 1
             except Exception as e:
                 logger.error(f"Reflection error for {pos.symbol}: {e}")

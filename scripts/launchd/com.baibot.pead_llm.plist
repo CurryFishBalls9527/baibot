@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  PEAD LLM-gated TREATMENT arm of the A/B forward test.
+
+  Fires Mon-Fri 08:35 CDT (same instant as the existing com.baibot.pead
+  control arm). Both arms see the same set of surprise-filtered candidates.
+  This arm additionally requires earnings_llm_decisions.llm_decision='BUY'
+  for entry. Runs in DRY-RUN mode (no broker calls) — only logs what it
+  WOULD have entered to results/pead/llm_dryrun/.
+
+  After 60-90 trading days, compare:
+    Control:   trading_pead.db        (existing, --no-llm-gate, live-submit)
+    Treatment: trading_pead_llm.db    (this arm, --require-llm-buy, dry-run)
+
+  Promote treatment to live only if positive Sharpe delta net of LLM costs.
+
+  See plan /Users/myu/.claude/plans/ethereal-strolling-rocket.md.
+
+  Reads OPENAI_API_KEY (only the AMC/BMO prep batches actually call OpenAI;
+  this arm just JOINs the cache the prep batches wrote) and ALPACA_PEAD_*
+  (read-only — get_account/get_positions for sizing math; no order submits
+  thanks to dry-run mode).
+
+  Install:
+    cp scripts/launchd/com.baibot.pead_llm.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.baibot.pead_llm.plist
+
+  Force run:
+    launchctl kickstart gui/$UID/com.baibot.pead_llm
+
+  Watch:
+    tail -f /Users/myu/code/baibot/results/pead/llm_dryrun/launchd.{out,err}.log
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.baibot.pead_llm</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/myu/code/baibot/scripts/launchd_wrappers/pead_llm_gated.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/myu/code/baibot</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+  </dict>
+
+  <key>StartCalendarInterval</key>
+  <array>
+    <!-- Mon-Fri at 08:35 local CDT (same as control arm com.baibot.pead). -->
+    <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>35</integer></dict>
+    <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>35</integer></dict>
+    <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>35</integer></dict>
+    <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>35</integer></dict>
+    <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>35</integer></dict>
+  </array>
+
+  <key>RunAtLoad</key>
+  <false/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/myu/code/baibot/results/pead/llm_dryrun/launchd.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/myu/code/baibot/results/pead/llm_dryrun/launchd.err.log</string>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>

@@ -2,13 +2,125 @@
 
 from __future__ import annotations
 
+import logging
+import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, Optional
 
 import pandas as pd
 
 from .backtester import BacktestConfig, MinerviniBacktester
 from .minervini import MinerviniScreener
+
+logger = logging.getLogger(__name__)
+
+
+def _load_morning_volume_features() -> Optional[pd.DataFrame]:
+    """Load the precomputed morning_volume_features table, indexed by
+    (symbol, trade_date). Returns None if the table is unavailable. Tolerant
+    so backtests that don't gate on this feature still run normally.
+    """
+    db_path = Path("research_data/market_data.duckdb")
+    if not db_path.exists():
+        return None
+    try:
+        import duckdb
+        con = duckdb.connect(str(db_path), read_only=True)
+        try:
+            df = con.execute("""
+                SELECT symbol, trade_date, ratio AS morning_volume_ratio
+                FROM morning_volume_features
+            """).df()
+        finally:
+            con.close()
+    except Exception as e:
+        logger.warning("morning_volume_features unavailable: %s", e)
+        return None
+    if df.empty:
+        return None
+    df["trade_date"] = pd.to_datetime(df["trade_date"])
+    df = df.set_index(["symbol", "trade_date"]).sort_index()
+    return df
+
+
+def _attach_morning_volume_ratio(
+    prepared: pd.DataFrame,
+    symbol: str,
+    morning_volume_df: Optional[pd.DataFrame],
+) -> pd.DataFrame:
+    """Merge `morning_volume_ratio` column into a prepared per-symbol df by
+    date index. NaN where the feature isn't available (no harm — gates check
+    `pd.isna` before applying)."""
+    if morning_volume_df is None or prepared.empty:
+        prepared["morning_volume_ratio"] = pd.NA
+        return prepared
+    try:
+        sym_slice = morning_volume_df.xs(symbol, level="symbol", drop_level=True)
+    except KeyError:
+        prepared["morning_volume_ratio"] = pd.NA
+        return prepared
+    # Index-align via reindex; df index is naive timestamps so coerce to
+    # match. Lookup by date (truncate any time component on prepared index).
+    target_dates = pd.to_datetime(prepared.index).normalize()
+    aligned = sym_slice["morning_volume_ratio"].reindex(target_dates)
+    prepared["morning_volume_ratio"] = aligned.values
+    return prepared
+
+
+def _load_max_bar_volume_features() -> Optional[pd.DataFrame]:
+    """Load max_bar_volume_features for the pyramid add-on fake-breakout
+    gate. Returns df indexed by (symbol, trade_date) with columns
+    `max_bar_rvol_20d` and `max_bar_rvol_intraday`. Returns None if the
+    table isn't present — backtest still runs with the feature absent."""
+    db_path = Path("research_data/market_data.duckdb")
+    if not db_path.exists():
+        return None
+    try:
+        import duckdb
+        con = duckdb.connect(str(db_path), read_only=True)
+        try:
+            df = con.execute("""
+                SELECT symbol, trade_date,
+                       max_bar_rvol_20d, max_bar_rvol_intraday
+                FROM max_bar_volume_features
+            """).df()
+        finally:
+            con.close()
+    except Exception as e:
+        logger.warning("max_bar_volume_features unavailable: %s", e)
+        return None
+    if df.empty:
+        return None
+    df["trade_date"] = pd.to_datetime(df["trade_date"])
+    df = df.set_index(["symbol", "trade_date"]).sort_index()
+    return df
+
+
+def _attach_max_bar_volume(
+    prepared: pd.DataFrame,
+    symbol: str,
+    max_bar_df: Optional[pd.DataFrame],
+) -> pd.DataFrame:
+    """Merge max_bar_rvol_20d + max_bar_rvol_intraday into prepared df."""
+    if max_bar_df is None or prepared.empty:
+        prepared["max_bar_rvol_20d"] = pd.NA
+        prepared["max_bar_rvol_intraday"] = pd.NA
+        return prepared
+    try:
+        sym_slice = max_bar_df.xs(symbol, level="symbol", drop_level=True)
+    except KeyError:
+        prepared["max_bar_rvol_20d"] = pd.NA
+        prepared["max_bar_rvol_intraday"] = pd.NA
+        return prepared
+    target_dates = pd.to_datetime(prepared.index).normalize()
+    prepared["max_bar_rvol_20d"] = (
+        sym_slice["max_bar_rvol_20d"].reindex(target_dates).values
+    )
+    prepared["max_bar_rvol_intraday"] = (
+        sym_slice["max_bar_rvol_intraday"].reindex(target_dates).values
+    )
+    return prepared
 
 
 @dataclass
@@ -47,11 +159,28 @@ class PortfolioMinerviniBacktester(MinerviniBacktester):
     ) -> PortfolioBacktestResult:
         self._candidate_schedule = candidate_schedule
         self._market_extension_frame = market_extension_frame
+        # Load the morning_volume_ratio feature once per backtest run if any
+        # gate uses it. Cheap if absent (returns None).
+        morning_volume_df = (
+            _load_morning_volume_features()
+            if getattr(self.config, "min_morning_volume_ratio", 0.0) > 0
+            or getattr(self.config, "leader_cont_min_morning_volume_ratio", 0.0) > 0
+            else None
+        )
+        # Same pattern for the bar-level fake-breakout gates (pyramid add-on).
+        max_bar_df = (
+            _load_max_bar_volume_features()
+            if getattr(self.config, "min_add_on_max_bar_rvol_20d", 0.0) > 0
+            or getattr(self.config, "min_add_on_max_bar_rvol_intraday", 0.0) > 0
+            else None
+        )
         prepared_frames = {}
         for symbol, df in data_by_symbol.items():
             prepared = self.screener.prepare_features(df)
             if prepared.empty:
                 continue
+            prepared = _attach_morning_volume_ratio(prepared, symbol, morning_volume_df)
+            prepared = _attach_max_bar_volume(prepared, symbol, max_bar_df)
             prepared_frames[symbol] = prepared
         if not prepared_frames:
             empty = pd.DataFrame()

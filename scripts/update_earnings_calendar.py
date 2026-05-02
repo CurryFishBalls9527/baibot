@@ -62,7 +62,7 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--symbols", nargs="*",
                    help="Specific symbols. Default: full broad250.")
-    p.add_argument("--db", default="research_data/market_data.duckdb")
+    p.add_argument("--db", default="research_data/earnings_data.duckdb")
     p.add_argument("--universe", default="research_data/intraday_top250_universe.json")
     p.add_argument("--max-symbols", type=int, default=None,
                    help="Cap symbols processed. Default: all.")

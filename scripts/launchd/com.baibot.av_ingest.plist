@@ -55,12 +55,16 @@
 
   <key>StartCalendarInterval</key>
   <array>
-    <!-- Mon-Fri at 08:00 CDT — 35 min before PEAD's 08:35 trigger. -->
-    <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>0</integer></dict>
-    <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>0</integer></dict>
-    <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>0</integer></dict>
-    <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>0</integer></dict>
-    <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>0</integer></dict>
+    <!-- Moved 08:00 → 06:00 CDT 2026-05-02 to feed PEAD-LLM BMO batch
+         (06:30) with fresh data BEFORE the LLM analysis runs. AV's UTC
+         daily quota resets at 00:00 UTC = 19:00 CDT prior day, so by
+         06:00 we're 11h into the new day's quota window. Still 2h35min
+         before PEAD's 08:35 entry trigger. -->
+    <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>6</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>6</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>6</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>6</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>6</integer><key>Minute</key><integer>0</integer></dict>
   </array>
 
   <key>RunAtLoad</key>

@@ -279,6 +279,16 @@ class MinerviniScreener:
             (close > features["buy_point"])
             & (features["breakout_volume_ratio"] > self.config.volume_surge_multiple)
         )
+        # "Hold above pivot" feature: did yesterday's daily close exceed
+        # today's buy_point? Today's close is checked separately by the
+        # entry path (price >= buy_point gate). Together they mean: today
+        # is the 2nd consecutive day above the pivot, i.e. yesterday was
+        # the breakout day and we're confirming today. Used by the W18-
+        # verification gate `require_prior_close_above_buy_point` in the
+        # backtester.
+        features["prior_close_above_buy_point"] = (
+            close.shift(1) >= features["buy_point"]
+        )
         features["breakout_ready"] = (
             features["base_candidate"]
             & (features["distance_from_base_high_pct"] <= self.config.breakout_ready_threshold)

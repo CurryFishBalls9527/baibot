@@ -54,7 +54,9 @@ def parse_args():
     )
     p.add_argument("--account-prefix", default="PEAD",
                    help="Env var prefix: ALPACA_<PREFIX>_API_KEY/SECRET_KEY")
-    p.add_argument("--daily-db", default="research_data/market_data.duckdb")
+    p.add_argument("--daily-db", default="research_data/earnings_data.duckdb",
+                   help="Path to DuckDB containing earnings_events. Split off "
+                        "market_data.duckdb 2026-05-01.")
     p.add_argument("--universe",
                    default=None,
                    help="Optional universe filter JSON path. None = use all "
@@ -70,6 +72,17 @@ def parse_args():
     p.add_argument("--log-dir", default="results/pead/paper")
     p.add_argument("--live-submit", action="store_true",
                    help="DANGER — actually submit orders. Default is dry-run.")
+    # LLM gate (Phase 2). When enabled, signals must also have
+    # earnings_llm_decisions.llm_decision='BUY' for the (symbol, event_date).
+    # Default OFF on the existing com.baibot.pead control arm; the new
+    # com.baibot.pead_llm treatment arm passes --require-llm-buy.
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--require-llm-buy", dest="require_llm_buy",
+                   action="store_true", default=False,
+                   help="Filter signals to those with LLM BUY decision (Phase 2)")
+    g.add_argument("--no-llm-gate", dest="require_llm_buy",
+                   action="store_false",
+                   help="Explicitly disable LLM gate (default)")
     return p.parse_args()
 
 
@@ -101,15 +114,17 @@ def main():
         daily_db_path=args.daily_db,
         log_dir=Path(args.log_dir),
         dry_run=not args.live_submit,
+        require_llm_buy=args.require_llm_buy,
     )
     trader = PEADTrader(cfg, broker)
     mode = "LIVE-SUBMIT" if args.live_submit else "DRY-RUN"
     logging.warning(
         "PEAD %s | min_surprise=%.1f%% | hold=%dd | pos_pct=%.1f%% | "
-        "max_concurrent=%d | universe=%s",
+        "max_concurrent=%d | universe=%s | llm_gate=%s",
         mode, cfg.min_positive_surprise_pct, cfg.hold_days,
         cfg.position_pct * 100, cfg.max_concurrent_positions,
         args.universe or "ALL_EARNINGS_SYMBOLS",
+        "ON" if cfg.require_llm_buy else "OFF",
     )
     summary = trader.run_once()
     print(summary)

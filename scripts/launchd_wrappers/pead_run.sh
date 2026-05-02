@@ -20,7 +20,9 @@ if [ -z "${ALPACA_PEAD_API_KEY:-}" ] || [ -z "${ALPACA_PEAD_SECRET_KEY:-}" ]; th
   exit 1
 fi
 
-exec "$REPO/.venv/bin/python" "$REPO/scripts/run_pead_paper.py" \
+# Step 1: PEAD strategy run (writes to positions.json + fills.jsonl). Don't
+# `exec` so step 2 always runs even if PEAD itself errors.
+"$REPO/.venv/bin/python" "$REPO/scripts/run_pead_paper.py" \
   --account-prefix PEAD \
   --min-surprise-pct 5.0 \
   --hold-days 20 \
@@ -28,4 +30,10 @@ exec "$REPO/.venv/bin/python" "$REPO/scripts/run_pead_paper.py" \
   --max-concurrent 10 \
   --max-gross-exposure 0.5 \
   --log-dir "$REPO/results/pead/paper" \
-  --live-submit
+  --live-submit || true
+
+# Step 2: Mirror PEAD's JSON state → trading_pead.db (dashboard auto-discovery).
+# Idempotent on re-run; failure here doesn't affect PEAD's authoritative state.
+exec "$REPO/.venv/bin/python" "$REPO/scripts/sync_pead_to_dashboard.py" \
+  --state-dir "$REPO/results/pead/paper" \
+  --db "$REPO/trading_pead.db"

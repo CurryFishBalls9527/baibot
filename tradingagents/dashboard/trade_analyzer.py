@@ -10,12 +10,82 @@ from tradingagents.llm_clients.factory import create_llm_client
 logger = logging.getLogger(__name__)
 
 
+# Tells the daily reviewer to stop reproposing strategy changes that have
+# already been swept null on multi-period broad-universe evidence. Without
+# this, the LLM keeps suggesting tighter stops / single-indicator filters /
+# partial-exits week after week because each individual trade looks like
+# it would have benefited — but the counterfactual has been measured and
+# rejected. Per-trade observations are still fine; what's blocked is
+# turning a pattern-recognition hunch into a strategy proposal.
+PRIOR_NULL_FINDINGS_STANZA = """
+KNOWN DEAD ENDS — DO NOT propose these as strategy changes in the Lesson
+section. Multi-period broad-universe backtests have already rejected them.
+You may still note "this trade would have benefited from X" as observation,
+but DO NOT phrase it as "we should add X" or "tighten X for future trades":
+
+1. Tighter / earlier / trailing stops or breakeven locks. Swept null in 5+
+   memories: ATR-based stops worse on all 3 periods on intraday_mechanical;
+   21 chan_v2 exit/sizing variants all worse-or-wash; ORB breakeven-lock
+   -30 to -45pp on 2023_25; partial-exit edge collapsed on broad universe;
+   Minervini exit lineage at local optimum. Individual trades that "would
+   have benefited" from a tighter stop are anchoring on the realized
+   outcome — the counterfactual on the trades that ran is the negative
+   evidence.
+
+2. Additive single-indicator entry filters (ADX≥X, RSI/MACD confirmation,
+   stochastic, etc.). 20+ additive filters rejected in the Minervini
+   optimization-ceiling sweep. The repo prior is "subtractive accepted,
+   additive rejected" — do not propose adding a new indicator gate.
+   Volume-based gates on the leader_continuation entry path are CONCLUSIVELY
+   null in BOTH flavors:
+     - Daily-bar `breakout_volume_ratio` ≥ 1.4× / 1.5×: -54pp / -44pp on
+       2023_25 research (`project_volume_gate_null.md`).
+     - Time-of-day `morning_volume_ratio` (09:30-13:30 ET / 20-day same-
+       window avg) ≥ 1.0× / 1.2× / 1.5×: -37 to -57pp on 2023_25 across
+       both flavors (`project_morning_volume_gate_null.md`).
+   The mechanism: mature leaders have above-average ABSOLUTE volume but
+   below-average RELATIVE volume vs their own rolling baseline (the 20-day
+   MA has caught up). The continuation strategy specifically targets these
+   stocks. Gating on relative volume of any flavor filters precisely the
+   trades the strategy is designed to capture. The "weak volume" you may
+   see on continuation entries is a mechanical truth about mature
+   leaders, not a flaw to fix.
+
+3. "Add partial profit-taking" or "add pyramid scaling." Both are
+   universe-ambiguous (positive on seed, null/negative on broad). The
+   pyramid path is already wired observational-only on mechanical_v2.
+
+4. "stage=13/16 is too late" or "base_pattern=none is missing data" or
+   "template_score is below required threshold." These are NOT anomalies.
+   The Minervini lineage has TWO valid entry paths:
+   (a) Rule entry — fresh stage-1/2 base with a labeled pattern
+       (consolidation/flat_base/vcp/cup_handle), max_stage_number=3 enforced.
+   (b) Leader continuation — already-running stage-4+ leader, no fresh
+       base, base_label="none" by design, stage gate explicitly BYPASSED
+       (orchestrator.py:1389), uses its own gates (close_range≥0.15,
+       6% stop, RS still required, regime still checked).
+   template_score is a count of passing conditions out of ~25, NOT out of
+   10 — values like 17/18 are HIGH scores that pass. Do not treat
+   continuation entries as bugs; they are intentional and gated separately.
+
+What IS welcome in the Lesson section: process/instrumentation observations,
+specific data-quality flags (impossible numbers, missing fields), and
+concrete subtractive proposals (remove a filter, widen a threshold, disable
+a sleeve in a specific regime) — but only when the trade in front of you
+clearly motivates them.
+"""
+
+
 class TradeAnalyzer:
     def __init__(self):
         config = build_config()
         client = create_llm_client(
             provider=config.get("llm_provider", "openai"),
-            model=config.get("quick_think_llm", "gpt-4o-mini"),
+            # Dedicated knob mirroring weekly_review_model. Defaults to
+            # gpt-5.2 so daily post-mortems get the same model strength as
+            # the weekly review without forcing the LLM trader (13-agent
+            # graph) off its cheaper quick_think_llm.
+            model=config.get("daily_review_model", "gpt-5.2"),
         )
         self.llm = client.get_llm()
 
@@ -73,6 +143,8 @@ Entry Signal:
 """
 
         return f"""You are a trading journal analyst writing a post-mortem for a human trader who is learning technical analysis. Explain this closed trade in plain, concrete, teaching-oriented language. Reference specific levels, indicators, or price events — no vague platitudes.
+
+{PRIOR_NULL_FINDINGS_STANZA}
 
 Trade Details:
 - Symbol: {symbol}

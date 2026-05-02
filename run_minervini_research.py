@@ -126,11 +126,13 @@ def main():
             fundamentals_df = warehouse.get_latest_fundamentals(symbols)
             print(f"Stored fundamentals snapshots for {len(symbols)} symbols")
         quarterly_df = warehouse.get_quarterly_fundamentals(symbols)
+        # earnings_events lives in the attached read-only earnings DB
+        # (ed) since the 2026-05-01 split. See warehouse.py:EARNINGS_DB_PATH.
         earnings_events_df = warehouse.conn.execute(
             """
             SELECT symbol, event_datetime, eps_estimate, reported_eps,
                    surprise_pct, revenue_average, is_future
-            FROM earnings_events
+            FROM ed.earnings_events
             WHERE symbol IN ({placeholders})
             ORDER BY symbol, event_datetime DESC
             """.format(placeholders=", ".join(["?"] * len(symbols))),

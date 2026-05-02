@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  PEAD-LLM BMO batch. Fires Mon-Fri 08:10 CDT (= 09:10 ET, ~25 min before
+  PEAD's own 08:35 CDT cron). Analyzes today's pre-open earnings reporters
+  via the existing 13-agent TradingAgentsGraph pipeline; writes BUY/HOLD/SELL
+  decisions to earnings_data.duckdb earnings_llm_decisions table.
+
+  Tight 25-min budget. Internal budget guard at 22 min skips remaining
+  symbols if a busy day overflows (PEAD then sees no row for those names
+  and skips them — safe conservative default). Phase-2 parallelism will
+  ship if observed >2× in first month. See plan §risks.
+
+  Reads OPENAI_API_KEY from .env. No Alpaca creds (analysis-only).
+
+  Install:
+    cp scripts/launchd/com.baibot.pead_llm_bmo.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.baibot.pead_llm_bmo.plist
+
+  Force run NOW:
+    launchctl kickstart gui/$UID/com.baibot.pead_llm_bmo
+
+  Watch:
+    tail -f /Users/myu/code/baibot/results/pead/llm/bmo.{out,err}.log
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.baibot.pead_llm_bmo</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/myu/code/baibot/scripts/launchd_wrappers/pead_llm_bmo.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/myu/code/baibot</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+  </dict>
+
+  <key>StartCalendarInterval</key>
+  <array>
+    <!-- Moved 08:10 → 06:30 CDT 2026-05-02 — 30 min after AV ingest at
+         06:00, ~2h before PEAD's 08:35 fire. With BMO using gpt-5.4
+         (non-pro reasoning) at ~5min/candidate, this 2h budget fits
+         24+ candidates serial (vs 3 at the old 25-min budget). -->
+    <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>6</integer><key>Minute</key><integer>30</integer></dict>
+    <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>6</integer><key>Minute</key><integer>30</integer></dict>
+    <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>6</integer><key>Minute</key><integer>30</integer></dict>
+    <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>6</integer><key>Minute</key><integer>30</integer></dict>
+    <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>6</integer><key>Minute</key><integer>30</integer></dict>
+  </array>
+
+  <key>RunAtLoad</key>
+  <false/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/myu/code/baibot/results/pead/llm/bmo.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/myu/code/baibot/results/pead/llm/bmo.err.log</string>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>

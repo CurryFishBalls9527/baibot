@@ -77,7 +77,50 @@ BIAS-AUDIT RULES (from the repo's CLAUDE.md — apply to all recommendations):
    survivorship-biased universes. See `project_partial_exit_survivorship.md`.
 5. Memory insights below are point-in-time; any recommendation citing them
    must be testable against current code before acting.
+
+ALREADY-TESTED DEAD ENDS — DO NOT propose these. Multi-period broad-universe
+backtests have rejected them; the memory files cited carry the evidence:
+6. Volume-based gates on the leader_continuation entry path (any flavor).
+   - Daily-bar `breakout_volume_ratio >= 1.4 / 1.5` → -54pp / -44pp 2023_25
+     (`project_volume_gate_null.md`).
+   - Time-of-day `morning_volume_ratio` (09:30-13:30 ET) at 1.0×/1.2×/1.5×
+     → -37 to -57pp 2023_25 (`project_morning_volume_gate_null.md`).
+   - Mature leaders' relative volume reverts toward 1.0× as the rolling
+     baseline catches up. Continuation entries are SUPPOSED to lack volume
+     surge — that's the structural feature, not a bug.
+7. ADX/RSI/MACD/single-indicator additive gates on entry. 20+ rejects in
+   `project_minervini_optimization_ceiling.md`; ADX≥20 specifically tested
+   and confirmed null in `project_w18_verification_batch.md`.
+8. Tighter trailing stops (3-5% flat or aggressive regime variants below
+   10/10/7). Universe-ambiguous failures: `project_a_buildout_mfe_lock_candidate.md`
+   covers full sweep. The shipped `mfe_lock_10_5` (lock at entry+5% once up
+   +10%) is the tested winner; do not propose alternatives without
+   multi-period evidence.
+9. ATR-based stops on intraday_mechanical: `project_atr_stops_null.md` — 1×
+   ATR / 2× trail worse on ALL 3 periods, WR -20pp, trades +30%. Do not
+   propose tightening intraday stops absent a regime-conditional gate.
+
+ENTRY-PATH DESIGN — DO NOT propose "fixes" for these intentional behaviors:
+10. `base_pattern = "none"` and `stage_number > 3` on Minervini entries
+    are CORRECT for the leader_continuation entry path (an established
+    leader running in stage 4+ has no fresh base by definition). The
+    continuation path has its own gates (RS, regime, close_range≥0.15,
+    6% stop) and intentionally bypasses the base-pattern stage gate. See
+    `orchestrator.py:1389-1400` (live) and `backtester.py:_row_passes_leader_continuation_entry`.
+    If you see "none" / late-stage entries, that's not a data-quality
+    problem — it's the continuation path operating as designed.
+11. `template_score` is a count of ~25 boolean conditions, NOT out of 10.
+    Values like 17/18 are HIGH scores that PASS the typical >8 threshold.
 """
+
+
+# Closed-trade thresholds below which the LLM is told to suppress
+# interpretive sections (regime/setup/day-of-week breakdowns) and confine
+# proposals to process/instrumentation rather than strategy tuning. The
+# review still emits all raw numbers — this is an interpretive guard, not
+# a data-display gate.
+MIN_SAMPLE_FOR_INTERPRETATION = 15
+MIN_SAMPLE_FOR_BREAKDOWN = 30
 
 
 def _iso_week(d: date) -> str:
@@ -127,6 +170,54 @@ def _breakdown_by(outcomes: list, key: str) -> dict:
         k = o.get(key) or "n/a"
         buckets.setdefault(k, []).append(o)
     return {k: _compute_trade_stats(v) for k, v in buckets.items()}
+
+
+def _exit_reason_breakdown(outcomes: list) -> dict:
+    """Group by exit_reason. Captures the intraday-vs-close question
+    proposal #3 asks for: bracket_stop_loss / bracket_take_profit fire
+    intraday during RTH; eod_flatten and rule-driven exits (dead_money,
+    regime_exit, partial_profit, lost_50dma) fire at scheduled checkpoints.
+    """
+    buckets: dict = {}
+    for o in outcomes:
+        k = o.get("exit_reason") or "unknown"
+        buckets.setdefault(k, []).append(o)
+    return {k: _compute_trade_stats(v) for k, v in buckets.items()}
+
+
+def _giveback_stats(outcomes: list) -> Optional[dict]:
+    """Per-trade `giveback = max_favorable_excursion - return_pct`. Surfaces
+    whether exits systematically leave money on the table (high giveback)
+    or trades reverse hard from MFE (also high giveback). Returns None when
+    no trades have MFE populated.
+    """
+    pairs = [
+        (o.get("max_favorable_excursion"), o.get("return_pct"))
+        for o in outcomes
+        if o.get("max_favorable_excursion") is not None
+        and o.get("return_pct") is not None
+    ]
+    if not pairs:
+        return None
+    givebacks = [mfe - ret for mfe, ret in pairs]
+    givebacks_sorted = sorted(givebacks)
+    n = len(givebacks_sorted)
+    median = givebacks_sorted[n // 2]
+    p90_idx = max(0, int(n * 0.9) - 1)
+    p90 = givebacks_sorted[p90_idx]
+    avg = sum(givebacks) / n
+    # Exit efficiency = realized/MFE, clamped — only meaningful when MFE>0.
+    efficiencies = [ret / mfe for mfe, ret in pairs if mfe and mfe > 0]
+    median_eff = (
+        sorted(efficiencies)[len(efficiencies) // 2] if efficiencies else None
+    )
+    return {
+        "n": n,
+        "avg": avg,
+        "median": median,
+        "p90": p90,
+        "median_efficiency": median_eff,
+    }
 
 
 def _dow_breakdown(outcomes: list) -> dict:
@@ -316,6 +407,8 @@ def _build_prompt(
     stats: dict, regime_stats: dict, pattern_stats: dict, dow_stats: dict,
     spy_cmp: dict, qqq_cmp: dict, memories: list[dict],
     prior_proposals_block: str = "",
+    exit_reason_stats: Optional[dict] = None,
+    giveback: Optional[dict] = None,
 ) -> str:
     def _fmt_stats(s: dict) -> str:
         if not s or s.get("count", 0) == 0:
@@ -336,6 +429,29 @@ def _build_prompt(
                          f"avg {s.get('avg_return', 0):+.2%}")
         return "\n".join(lines) if lines else "  (n/a)"
 
+    if exit_reason_stats:
+        exit_lines = []
+        for reason, s in sorted(
+            exit_reason_stats.items(), key=lambda kv: -(kv[1].get("count") or 0)
+        ):
+            exit_lines.append(
+                f"- **{reason}** — {s.get('count', 0)} trades, "
+                f"WR {s.get('win_rate', 0):.0%}, avg {s.get('avg_return', 0):+.2%}"
+            )
+        exit_block = "\n".join(exit_lines)
+    else:
+        exit_block = "  (n/a)"
+
+    if giveback:
+        giveback_block = (
+            f"  n={giveback['n']} · avg={giveback['avg']:+.2%} · "
+            f"median={giveback['median']:+.2%} · p90={giveback['p90']:+.2%}"
+        )
+        if giveback.get("median_efficiency") is not None:
+            giveback_block += f" · median_efficiency={giveback['median_efficiency']:.2f}"
+    else:
+        giveback_block = "  (no trades with MFE/return populated)"
+
     memory_block = ""
     if memories:
         lines = []
@@ -347,12 +463,34 @@ def _build_prompt(
     else:
         memory_block = "(no memories logged this week)"
 
+    n_trades = stats.get("count", 0) if stats else 0
+    if n_trades < MIN_SAMPLE_FOR_INTERPRETATION:
+        sample_banner = (
+            f"\n## SAMPLE-SIZE NOTICE — N={n_trades} closed trades\n"
+            f"This window has fewer than {MIN_SAMPLE_FOR_INTERPRETATION} trades. "
+            "DO NOT draw directional conclusions from regime / setup / day-of-week "
+            "breakdowns; the breakdowns are below for reference only. Profit-factor "
+            "values like `inf` or huge numbers at this N are math artifacts, not edge.\n"
+            "Proposals MUST be limited to: (a) process/instrumentation, (b) measurement "
+            "additions, (c) noise reduction. NO strategy-knob tuning at this N — even "
+            "subtractive changes need a multi-period backtest first.\n"
+        )
+    elif n_trades < MIN_SAMPLE_FOR_BREAKDOWN:
+        sample_banner = (
+            f"\n## SAMPLE-SIZE NOTICE — N={n_trades} closed trades\n"
+            f"Aggregate-level reads are tentative; sub-bucket breakdowns "
+            f"(regime/setup/day-of-week) require N≥{MIN_SAMPLE_FOR_BREAKDOWN} for any "
+            "directional claim. Treat per-bucket lines as observational only.\n"
+        )
+    else:
+        sample_banner = ""
+
     return f"""You are a trading-strategy post-mortem analyst writing for a
 human trader who can read code but wants high-signal improvement proposals.
 Write the weekly review for ONE strategy variant.
 
 {BIAS_AUDIT_STANZA}
-
+{sample_banner}
 Variant: **{variant_name}**
 Window: {window_start} → {window_end}
 
@@ -380,6 +518,20 @@ QQQ: benchmark_return={qqq_cmp.get('benchmark_return'):+.2%}, excess={qqq_cmp.ge
 ## By day-of-week
 {_fmt_buckets(dow_stats)}
 
+## By exit reason
+{exit_block}
+> `bracket_stop_loss` and `bracket_take_profit` fire intraday (Alpaca OCO leg).
+> `eod_flatten` is the 15:55 ET intraday-strategy close. Rule-driven exits like
+> `dead_money`, `regime_exit`, `partial_profit`, `lost_50dma` fire at scheduled
+> daily-scan or 5-min-cron checkpoints. This row IS the answer to "intraday vs
+> close" — no separate flag is needed.
+
+## Giveback (MFE − realized return)
+{giveback_block}
+> High median giveback ⇒ exits leaving money on the table or trades reversing
+> hard from MFE. Low giveback + low realized return ⇒ trades not running far
+> enough. Low giveback + high realized return ⇒ exits well-timed.
+
 ## Lessons logged this week (from agent_memories)
 {memory_block}
 
@@ -398,13 +550,18 @@ Plain-English read of returns vs SPY and QQQ, Sharpe/DD posture, correlation.
 Is this variant beating buy-and-hold on this window? What drove the gap?
 
 ## Regime Breakdown
-One line per regime bucket with observation.
+One line per regime bucket with observation. If aggregate N is below
+{MIN_SAMPLE_FOR_BREAKDOWN}, write "Insufficient sample for directional reads (N={n_trades})"
+and list the buckets without commentary.
 
 ## Entry Pattern Breakdown
 Call out any setup with enough trades to draw even a tentative signal.
+Same insufficient-sample rule as above.
 
 ## Day-of-Week
-Observational only — do not over-read ≤ 2 trades per day.
+Observational only — do not over-read ≤ 2 trades per day. If aggregate N is
+below {MIN_SAMPLE_FOR_BREAKDOWN}, mark this section "noise" and skip
+inferences.
 
 ## Lessons from this week's memories
 Synthesize the logged lessons into ≤ 5 themes. Flag any that contradict
@@ -451,9 +608,11 @@ def run_weekly_review(
 
     budget = int(config.get("weekly_review_max_calls", 10))
 
-    # Use gpt-5.2 (deep-think) specifically for weekly, never mutate global.
+    # Use the most capable available model for weekly (deep-think). Never
+    # mutate global config — `weekly_review_model` is the dedicated knob.
+    # 2026-05-02: bumped default to gpt-5.5 after API availability check.
     provider = config.get("llm_provider", "openai")
-    deep_model = config.get("weekly_review_model", "gpt-5.2")
+    deep_model = config.get("weekly_review_model", "gpt-5.5")
 
     # Shared credentials across variants assumed; if individual variants need
     # different ALPACA creds they're already on the orchestrator's broker.
@@ -484,6 +643,8 @@ def run_weekly_review(
             regime_stats = _breakdown_by(outcomes, "regime_at_entry")
             pattern_stats = _breakdown_by(outcomes, "base_pattern")
             dow_stats = _dow_breakdown(outcomes)
+            exit_reason_stats = _exit_reason_breakdown(outcomes)
+            giveback = _giveback_stats(outcomes)
 
             strat_returns = _strategy_daily_returns(db, start, end)
 
@@ -505,6 +666,8 @@ def run_weekly_review(
                 spy_cmp=spy_cmp, qqq_cmp=qqq_cmp,
                 memories=memories,
                 prior_proposals_block=prior_block,
+                exit_reason_stats=exit_reason_stats,
+                giveback=giveback,
             )
 
             client = create_llm_client(provider=provider, model=deep_model)
