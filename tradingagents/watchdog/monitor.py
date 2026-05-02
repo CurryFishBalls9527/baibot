@@ -146,6 +146,7 @@ class Watchdog:
             ("calendar_freshness",        checks.check_calendar_freshness),
             ("earnings_ingest_freshness", checks.check_av_or_yfinance_freshness),
             ("pead_llm_decisions_fresh",  checks.check_pead_llm_decisions_fresh),
+            ("llm_cost_overrun",          checks.check_llm_cost_overrun),
         ):
             self.scheduler.add_job(
                 wrap(check_fn, check_id),

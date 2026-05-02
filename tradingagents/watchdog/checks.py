@@ -1057,6 +1057,59 @@ def check_av_or_yfinance_freshness(state: WatchdogState) -> List[Alert]:
     )]
 
 
+def check_llm_cost_overrun(state: WatchdogState) -> List[Alert]:
+    """Alert if any single trading day's PEAD-LLM cost exceeded $20.
+    Plan §risks #4 set this as the cost-overrun threshold; before this
+    check existed it was only a comment in the design doc.
+
+    Looks at the past 7 days so we catch overruns on weekends / off-hours
+    in case watchdog missed a daily check. Dedupe per-day so we don't
+    re-alert the same overrun every morning.
+    """
+    if not EARNINGS_DB.exists():
+        return []
+    try:
+        import duckdb
+        con = duckdb.connect(str(EARNINGS_DB), read_only=True)
+        try:
+            rows = con.execute(
+                """
+                SELECT CAST(analyzed_at AS DATE) AS day,
+                       SUM(cost_estimate_usd) AS daily_cost
+                FROM earnings_llm_decisions
+                WHERE analyzed_at >= (CURRENT_DATE - INTERVAL 7 DAY)
+                  AND cost_estimate_usd IS NOT NULL
+                GROUP BY day
+                HAVING daily_cost > 20
+                ORDER BY day DESC
+                """
+            ).fetchall()
+        finally:
+            con.close()
+    except Exception as exc:
+        logger.warning("LLM cost-overrun check failed: %s", exc)
+        return []
+
+    alerts = []
+    for day, cost in rows:
+        alerts.append(Alert(
+            category="llm_cost_overrun",
+            title=f"LLM cost on {day}: ${cost:.2f} (>$20)",
+            body=(
+                f"On {day}, the PEAD-LLM batch spent ${cost:.2f} — above the "
+                f"$20/day watchdog threshold. Common causes: candidate-count "
+                f"spike (busy earnings day), prompt-length blowup, model "
+                f"upgrade. Inspect earnings_llm_decisions for that day and "
+                f"check results/pead/llm/{{amc,bmo}}.err.log."
+            ),
+            dedupe_key=f"llm_cost_overrun:{day}",
+            priority="medium",
+            tags=["warning"],
+            ttl_hours=24,
+        ))
+    return alerts
+
+
 def check_pead_llm_decisions_fresh(state: WatchdogState) -> List[Alert]:
     """LLM-gated PEAD treatment arm depends on the AMC + BMO batch jobs
     (com.baibot.pead_llm_amc/bmo) populating earnings_llm_decisions before

@@ -36,20 +36,31 @@ but DO NOT phrase it as "we should add X" or "tighten X for future trades":
    stochastic, etc.). 20+ additive filters rejected in the Minervini
    optimization-ceiling sweep. The repo prior is "subtractive accepted,
    additive rejected" — do not propose adding a new indicator gate.
-   Volume-based gates on the leader_continuation entry path are CONCLUSIVELY
-   null in BOTH flavors:
+   Volume-based gates are CONCLUSIVELY null across THREE metric formulations
+   AND across all three live entry paths (rule, leader_continuation,
+   pyramid add-on):
      - Daily-bar `breakout_volume_ratio` ≥ 1.4× / 1.5×: -54pp / -44pp on
-       2023_25 research (`project_volume_gate_null.md`).
+       2023_25 research, leader_continuation (`project_volume_gate_null.md`).
      - Time-of-day `morning_volume_ratio` (09:30-13:30 ET / 20-day same-
        window avg) ≥ 1.0× / 1.2× / 1.5×: -37 to -57pp on 2023_25 across
        both flavors (`project_morning_volume_gate_null.md`).
+     - Bar-level `max_bar_rvol_20d` (today's biggest 30m bar / 20-day same-
+       slot baseline) ≥ 1.5× / 2.0× AND `max_bar_rvol_intraday` (within-day
+       max/mean concentration) ≥ 3.5× / 4.0× on the pyramid add-on path:
+       all 4 variants null on broad-evidence sweep, with research +19pp /
+       live -0.2pp split being a textbook universe-construction-bias
+       fingerprint (`project_max_bar_volume_gate_null.md`).
    The mechanism: mature leaders have above-average ABSOLUTE volume but
    below-average RELATIVE volume vs their own rolling baseline (the 20-day
    MA has caught up). The continuation strategy specifically targets these
-   stocks. Gating on relative volume of any flavor filters precisely the
-   trades the strategy is designed to capture. The "weak volume" you may
-   see on continuation entries is a mechanical truth about mature
-   leaders, not a flaw to fix.
+   stocks. Gating on relative volume of ANY flavor (daily, summed-window,
+   bar-level cross-day, bar-level within-day) filters precisely the trades
+   the strategy is designed to capture. The "weak volume" you may see on
+   continuation OR pyramid add-on entries is a mechanical truth about
+   mature leaders, not a flaw to fix. Do not propose another volume-gate
+   variation without a fundamentally new mechanism (e.g. regime-conditional
+   gating, gate combined with a separate signal — and even then, very
+   high prior of null).
 
 3. "Add partial profit-taking" or "add pyramid scaling." Both are
    universe-ambiguous (positive on seed, null/negative on broad). The
