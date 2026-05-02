@@ -128,6 +128,20 @@ def _iso_week(d: date) -> str:
     return f"{y}-W{w:02d}"
 
 
+def _fmt_num(v, spec: str = "{:.2f}", na: str = "n/a") -> str:
+    """Format a possibly-None numeric. Used by _build_prompt to avoid
+    crashing when a stat is missing (e.g. chan_daily 2026-W18: no closed
+    trades → no avg_hold_days → was raising
+    `unsupported format string passed to NoneType.__format__`).
+    """
+    if v is None:
+        return na
+    try:
+        return spec.format(v)
+    except (TypeError, ValueError):
+        return na
+
+
 def _last_n_bdays(d: date, n: int) -> list[date]:
     out = []
     cur = d
@@ -496,11 +510,11 @@ Window: {window_start} → {window_end}
 
 ## Aggregate stats (closed-trade level)
 {_fmt_stats(stats)}
-avg_MFE={stats.get('avg_mfe')}  avg_MAE={stats.get('avg_mae')}  avg_hold_days={stats.get('avg_hold_days'):.1f}
+avg_MFE={stats.get('avg_mfe')}  avg_MAE={stats.get('avg_mae')}  avg_hold_days={_fmt_num(stats.get('avg_hold_days'), '{:.1f}')}
 
 ## Benchmark comparison (portfolio-equity level)
-SPY: strategy_return={spy_cmp.get('strategy_return'):+.2%}, benchmark_return={spy_cmp.get('benchmark_return'):+.2%}, excess={spy_cmp.get('excess_return'):+.2%}, correlation={spy_cmp.get('correlation')}
-QQQ: benchmark_return={qqq_cmp.get('benchmark_return'):+.2%}, excess={qqq_cmp.get('excess_return'):+.2%}, correlation={qqq_cmp.get('correlation')}
+SPY: strategy_return={_fmt_num(spy_cmp.get('strategy_return'), '{:+.2%}')}, benchmark_return={_fmt_num(spy_cmp.get('benchmark_return'), '{:+.2%}')}, excess={_fmt_num(spy_cmp.get('excess_return'), '{:+.2%}')}, correlation={spy_cmp.get('correlation')}
+QQQ: benchmark_return={_fmt_num(qqq_cmp.get('benchmark_return'), '{:+.2%}')}, excess={_fmt_num(qqq_cmp.get('excess_return'), '{:+.2%}')}, correlation={qqq_cmp.get('correlation')}
 
 > **Metric definitions — these are NOT the same number.**
 > - `sum_trade_returns_pct` (Aggregate stats): sum of per-trade %-returns for trades that **closed** in the window. Each trade's return is `(exit_price - entry_price) / entry_price` weighted equally per trade. Ignores positions opened before the window or still open at window end. Ignores cash drag and position sizing.

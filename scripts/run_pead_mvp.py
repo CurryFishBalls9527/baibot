@@ -1,23 +1,42 @@
 #!/usr/bin/env python3
 """PEAD (post-earnings-announcement drift) backtester — MVP.
 
+⚠⚠⚠ SURVIVORSHIP-BIASED — RESULTS ARE NOT VALIDATION ⚠⚠⚠
+
+This backtester reads earnings_events + daily_bars from yfinance/AV-
+sourced DBs. Both data sources EXCLUDE delisted symbols. 0/15 known-
+failed names (BBBY, JCP, SHLD, BTU, RAD, ...) are present in our event
+table. This INFLATES apparent edge — particularly for longer hold
+windows (survivors compound; failures aren't there to drag returns).
+
+Production PEAD (5% surprise / 20d hold) FAILED multi-period
+validation on this very data: 2014-2017 chop regime lost -46% net,
+WR 41.5%, per-trade -0.10%. That's the regime where survivor bias is
+WEAKEST in our universe (events were already in broad250-equivalent
+back then). Strategy is fair-weather only — works in trending bull
+markets, fails in chop. The "6/7 periods positive" looks great until
+you realize the data systematically excludes the trades that died.
+
+The lookahead probe (V0_lag2 in main()) tests for FUTURE-data leakage
+only. It does NOT detect SAMPLE-selection bias. Don't conflate.
+
+User decision (2026-05-02): keep PEAD running paper-only on academic
+prior, no further engineering investment. Do NOT scale up sizing. Do
+NOT report numbers from this script as "validated edge". For proper
+validation, need PIT data source (Polygon.io $99/mo with delisted
+coverage). See `memory/project_pead_validation_failed.md`.
+
+────────────────────────────────────────────────────────────────────
+
 Tests the classic Bernard & Thomas (1989) anomaly: stocks with positive
 EPS surprises drift up for ~60 days post-announcement; negative surprises
-drift down. Documented Sharpe 0.5-1.0 across decades, hasn't been
-over-arbitraged at retail because institutions need scale.
+drift down. Documented Sharpe 0.5-1.0 across decades in CLEAN data,
+hasn't been over-arbitraged at retail because institutions need scale.
 
-Universe: 104 symbols in `earnings_events` table (yfinance source).
+Universe: ~250 symbols in `earnings_events` table (yfinance source —
+biased, see banner above).
 Cadence: daily (entry next-day-open after earnings, hold N days).
 Direction: configurable (long-only / L-S based on surprise sign).
-
-CLAUDE.md gates enforced here:
-  * 3-period broad-universe test (2018, 2020, 2023-25)
-  * Future-blanked probe (entry_lag_days knob)
-  * Slippage stress (modeled via cost_bps round-trip)
-
-Standalone — does NOT touch intraday_backtester or xsection. If gross-positive
-across periods AND lookahead-clean, escalate to proper integration + live
-deployment.
 """
 
 from __future__ import annotations
@@ -257,8 +276,19 @@ def aggregate(trades: list[PEADTrade], initial_cash: float) -> dict:
 def run_period(
     label: str, daily_db: str, begin: str, end: str,
     cfg: PEADConfig,
+    earnings_db: str | None = None,
 ) -> dict:
-    events = _load_earnings_events(daily_db, begin, end)
+    """Backtest one period.
+
+    daily_db   — DB with the `daily_bars` table (post-2026-05-01 split:
+                 `research_data/market_data.duckdb`).
+    earnings_db — DB with the `earnings_events` table (post-split:
+                 `research_data/earnings_data.duckdb`). Defaults to
+                 `daily_db` for backward-compat with pre-split callers.
+    """
+    if earnings_db is None:
+        earnings_db = daily_db
+    events = _load_earnings_events(earnings_db, begin, end)
     if events.empty:
         return {"label": label, "trades": 0, "gross_pct": 0, "net_pct": 0,
                 "win_rate": 0, "n_long": 0, "n_short": 0}
