@@ -692,8 +692,10 @@ body {
   background: var(--surface);
   border: 1px solid var(--border);
   display: flex; flex-direction: column;
-  min-height: 0;
-  overflow: hidden;
+  /* Let the page scroll instead of clipping the markdown panel — daily
+     reviews include a 600px Plotly iframe + the markdown post-mortem,
+     and a fixed inner overflow:hidden was squeezing the markdown to
+     viewport_h - 600 - summary, making long post-mortems look truncated. */
 }
 .reviews-summary {
   padding: 0.85rem 1.1rem;
@@ -709,9 +711,9 @@ body {
   font-size: 0.78rem;
   line-height: 1.65;
   color: #c9c9c2;
-  overflow-y: auto;
-  flex: 1;
-  min-height: 0;
+  /* Grow naturally; the page (body) scrolls. Previously this was
+     overflow-y:auto + flex:1, which clipped daily-review content under
+     a fixed-height parent. */
 }
 .reviews-markdown h1, .reviews-markdown h2, .reviews-markdown h3 {
   font-family: var(--serif); font-style: italic; font-weight: 400;
@@ -1749,4 +1751,94 @@ body {
 @media (max-width: 880px) {
   .layout { grid-template-columns: 200px minmax(0, 1fr) 280px; }
   .chart-eyebrow { display: none; }
+}
+
+/* ── LIVE LOG page ─────────────────────────────────────────────── */
+.log-body {
+  background: #05080d;
+  border: 1px solid #1f2937;
+  border-radius: 4px;
+  padding: 0.7rem 0.85rem;
+  height: 75vh;
+  overflow-y: auto;
+  font-family: 'JetBrains Mono', Menlo, monospace;
+  font-size: 0.74rem;
+  color: #9ca3af;
+  white-space: pre-wrap;
+  line-height: 1.45;
+  margin: 0.6rem 0 0;
+}
+.log-body .log-err { color: #ef4444; }
+
+/* ── REVIEWS top overview block ────────────────────────────────── */
+.reviews-overview {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 0.65rem;
+  margin: 0.4rem 0 0.6rem;
+}
+.reviews-card {
+  border: 1px solid #1f2937;
+  background: #0d1117;
+  border-radius: 6px;
+  padding: 0.7rem 0.85rem;
+}
+.reviews-card .rc-name {
+  font-size: 0.66rem; letter-spacing: 0.18em; color: #64748b; font-weight: 600;
+  text-transform: uppercase;
+}
+.reviews-card .rc-equity { font-size: 1.3rem; font-weight: 500; color: #e6edf3; margin-top: 0.15rem; }
+.reviews-card .rc-pl    { font-size: 0.78rem; margin-top: 0.1rem; }
+.reviews-card .rc-pl.pos { color: #10b981; }
+.reviews-card .rc-pl.neg { color: #ef4444; }
+.reviews-card .rc-line  { font-size: 0.75rem; color: #9ca3af; margin-top: 0.4rem; }
+.reviews-card .rc-meta  { font-size: 0.7rem; color: #64748b; margin-top: 0.15rem; }
+.reviews-totals {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 0.5rem;
+  margin: 0.5rem 0 0.6rem;
+}
+.reviews-totals .rt-cell {
+  border: 1px solid #1f2937; background: #0d1117;
+  border-radius: 4px; padding: 0.5rem 0.7rem;
+}
+.reviews-totals .rt-label { font-size: 0.62rem; letter-spacing: 0.2em; color: #64748b; }
+.reviews-totals .rt-value { font-size: 1.1rem; color: #e6edf3; }
+
+/* Risk page additions */
+.risk-section { margin-top: 1rem; }
+.risk-callout {
+  border: 1px solid #1f2937; background: #0d1117; border-radius: 6px;
+  padding: 0.7rem 0.85rem; margin-top: 0.5rem;
+  color: #d1d5db; font-size: 0.82rem; line-height: 1.5;
+}
+.risk-callout strong { color: #e6edf3; }
+.risk-pair-picker {
+  display: flex; gap: 0.5rem; align-items: center; margin-bottom: 0.5rem;
+}
+.risk-pair-picker select {
+  background: #0d1117; color: #e6edf3; border: 1px solid #1f2937;
+  border-radius: 4px; padding: 0.3rem 0.5rem; font-family: inherit;
+}
+.risk-ai-btn {
+  background: #f5a524; color: #0d1117; border: 0;
+  padding: 0.45rem 1rem; border-radius: 4px;
+  font-family: inherit; font-weight: 600; letter-spacing: 0.1em;
+  cursor: pointer;
+}
+.risk-ai-btn:disabled { background: #4a4a4a; cursor: not-allowed; }
+
+/* Service health pill on TODAY page header */
+.svc-pill {
+  display: inline-flex; align-items: center; gap: 0.45rem;
+  font-size: 0.68rem; letter-spacing: 0.18em; color: #9ca3af;
+  margin-left: 0.6rem;
+}
+.svc-pill .svc-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: #ef4444; box-shadow: 0 0 6px #ef4444;
+}
+.svc-pill.running .svc-dot {
+  background: #10b981; box-shadow: 0 0 6px #10b981;
 }

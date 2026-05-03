@@ -38,7 +38,7 @@ import pandas as pd
 
 from tradingagents.storage.database import TradingDatabase
 
-from ..bars import _to_unix, fetch_daily
+from ..bars import _to_unix_date, fetch_daily
 from .base import (
     Bar,
     ChartPayload,
@@ -313,7 +313,7 @@ def build_chart(
     fills: List[Fill] = []
     if row.get("filled_price"):
         fills.append(Fill(
-            time=_to_unix(row["trade_ts"]),
+            time=_to_unix_date(row["trade_ts"]),
             price=float(row["filled_price"]),
             side="buy" if str(row.get("side", "")).lower() == "buy" else "sell",
             qty=float(row.get("filled_qty") or row.get("qty") or 0),
@@ -322,7 +322,7 @@ def build_chart(
     for ex in _exit_fills(db, symbol, str(row["trade_ts"])):
         if ex.get("filled_price"):
             fills.append(Fill(
-                time=_to_unix(ex["timestamp"]),
+                time=_to_unix_date(ex["timestamp"]),
                 price=float(ex["filled_price"]),
                 side="sell",
                 qty=float(ex.get("filled_qty") or 0),

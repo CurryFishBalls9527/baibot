@@ -36,7 +36,7 @@ import pandas as pd
 
 from tradingagents.storage.database import TradingDatabase
 
-from ..bars import _to_unix, fetch_daily
+from ..bars import _to_unix_date, fetch_daily
 from .base import (
     Bar,
     ChartPayload,
@@ -278,11 +278,11 @@ def build_chart(
     first_t = bars[0]["time"] if bars else None
     last_t  = bars[-1]["time"] if bars else None
 
-    # Earnings event marker — drop a vertical accent at the event date
+    # Earnings event marker — drop a vertical accent at the event date.
+    # Align to midnight-UTC of the event's calendar date so it lands on the
+    # same bar slot as our daily candles (which are also midnight-UTC).
     if event and first_t is not None:
-        ev_unix = int(pd.Timestamp(event["event_datetime"]).tz_localize("UTC").timestamp()) \
-                  if pd.Timestamp(event["event_datetime"]).tzinfo is None \
-                  else int(pd.Timestamp(event["event_datetime"]).timestamp())
+        ev_unix = _to_unix_date(event["event_datetime"])
         # Find a price near the event for marker placement (use entry close
         # if event matches a bar, else close-of-prior-bar)
         anchor_price = float(row.get("filled_price") or bars[-1]["close"])
@@ -311,7 +311,7 @@ def build_chart(
     fills: List[Fill] = []
     if entry_price > 0:
         fills.append(Fill(
-            time=_to_unix(row["trade_ts"]),
+            time=_to_unix_date(row["trade_ts"]),
             price=entry_price,
             side="buy" if str(row.get("side", "")).lower() == "buy" else "sell",
             qty=float(row.get("filled_qty") or row.get("qty") or 0),
@@ -321,7 +321,7 @@ def build_chart(
     for ex in _exit_fills(db, symbol, str(row["trade_ts"])):
         if ex.get("filled_price"):
             fills.append(Fill(
-                time=_to_unix(ex["timestamp"]),
+                time=_to_unix_date(ex["timestamp"]),
                 price=float(ex["filled_price"]),
                 side="sell",
                 qty=float(ex.get("filled_qty") or 0),

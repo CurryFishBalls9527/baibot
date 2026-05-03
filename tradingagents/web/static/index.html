@@ -60,7 +60,7 @@
     <a class="tab" data-route="reviews"     href="#reviews">REVIEWS</a>
     <a class="tab" data-route="portfolio"   href="#portfolio">RISK</a>
     <a class="tab" data-route="proposals"   href="#proposals">PROPOSALS</a>
-    <a class="tab" data-route="ideas"       href="#ideas">IDEAS</a>
+    <a class="tab" data-route="log"         href="#log">LOG</a>
   </nav>
 
   <!-- ─── ROUTE: TRADE (default) — three-pane investigative view ── -->
@@ -190,6 +190,7 @@
     <div class="page-head">
       <h1 class="page-title">TODAY</h1>
       <span class="page-meta" id="today-meta">—</span>
+      <span class="svc-pill" id="today-svc"><span class="svc-dot"></span>SCHEDULER</span>
     </div>
 
     <div class="kpi-row" id="today-kpi"></div>
@@ -277,6 +278,15 @@
       </div>
     </div>
 
+    <div id="reviews-overview" class="reviews-overview"></div>
+    <div id="reviews-totals"   class="reviews-totals"></div>
+    <section class="page-block">
+      <header class="block-head">
+        <span class="pane-label">LAST 30 DAYS — NORMALIZED EQUITY</span>
+      </header>
+      <div id="reviews-norm-chart" class="block-chart"></div>
+    </section>
+
     <div class="reviews-grid">
       <aside class="reviews-side">
         <header class="block-head"><span class="pane-label">VARIANTS</span></header>
@@ -303,10 +313,68 @@
 
     <section class="page-block">
       <header class="block-head">
-        <span class="pane-label">DAILY-RETURN CORRELATION</span>
+        <span class="pane-label">AI SYNTHESIS</span>
+        <span class="pane-meta">gpt-5.4-pro · ~$0.05/click · cached</span>
+      </header>
+      <div style="padding:0.4rem 0.2rem;">
+        <button id="risk-ai-btn" class="risk-ai-btn">GENERATE SYNTHESIS</button>
+        <div id="risk-ai-output" class="risk-callout" hidden></div>
+      </div>
+    </section>
+
+    <section class="page-block">
+      <header class="block-head">
+        <span class="pane-label">1. CROSS-STRATEGY CORRELATION (FULL)</span>
         <span class="pane-meta" id="risk-corr-meta">last 60d</span>
       </header>
       <div id="risk-corr-table" class="block-table"></div>
+      <div id="risk-corr-callout" class="risk-callout" hidden></div>
+    </section>
+
+    <section class="page-block">
+      <header class="block-head">
+        <span class="pane-label">2. RECENT (60D) — HAS THE RELATIONSHIP SHIFTED?</span>
+      </header>
+      <div id="risk-corr-recent-table" class="block-table"></div>
+      <div id="risk-corr-shift" class="risk-callout" hidden></div>
+    </section>
+
+    <section class="page-block">
+      <header class="block-head">
+        <span class="pane-label">3. RISK-PARITY SIZING — WHO CAUSES THE SWINGS?</span>
+        <span class="pane-meta" id="risk-sizing-meta"></span>
+      </header>
+      <div id="risk-sizing-table" class="block-table"></div>
+      <div id="risk-sizing-callout" class="risk-callout" hidden></div>
+    </section>
+
+    <section class="page-block">
+      <header class="block-head">
+        <span class="pane-label">4. ROLLING CORRELATION — PICK A PAIR</span>
+      </header>
+      <div class="risk-pair-picker">
+        <span class="select-label">PAIR</span>
+        <select id="risk-pair-a"></select>
+        <span style="color:#64748b;">↔</span>
+        <select id="risk-pair-b"></select>
+      </div>
+      <div id="risk-pair-chart" class="block-chart"></div>
+      <div id="risk-pair-callout" class="risk-callout" hidden></div>
+    </section>
+
+    <section class="page-block">
+      <header class="block-head">
+        <span class="pane-label">5. REGIME-CONDITIONAL SHARPE (SPY-CLASSIFIED)</span>
+        <span class="pane-meta">confirmed-uptrend / under-pressure / correction</span>
+      </header>
+      <div id="risk-regime-table" class="block-table"></div>
+    </section>
+
+    <section class="page-block">
+      <header class="block-head">
+        <span class="pane-label">6. PER-PATTERN P&amp;L ATTRIBUTION</span>
+      </header>
+      <div id="risk-patterns-table" class="block-table"></div>
     </section>
 
     <section class="page-block">
@@ -386,6 +454,29 @@
       <div id="corpus-meta" class="corpus-meta"></div>
       <div id="corpus-results" class="block-table"></div>
     </div>
+  </section>
+
+  <!-- ─── ROUTE: LIVE LOG ───────────────────────────────────────── -->
+  <section class="route route-page" id="route-log" hidden>
+    <div class="page-head">
+      <h1 class="page-title">LIVE LOG</h1>
+      <span class="page-meta" id="log-meta">automation_service.out.log</span>
+      <div class="page-controls">
+        <span class="select-label">TAIL</span>
+        <div class="seg-control" id="log-tail-n">
+          <button class="seg-btn"        data-n="100">100</button>
+          <button class="seg-btn active" data-n="200">200</button>
+          <button class="seg-btn"        data-n="500">500</button>
+          <button class="seg-btn"        data-n="1000">1000</button>
+          <button class="seg-btn"        data-n="2000">2000</button>
+        </div>
+        <label class="dryrun-toggle">
+          <input type="checkbox" id="log-autorefresh" checked />
+          <span>auto-refresh (5s)</span>
+        </label>
+      </div>
+    </div>
+    <pre id="log-body" class="log-body">— loading —</pre>
   </section>
 
   <script src="/static/chart.js"></script>

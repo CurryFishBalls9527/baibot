@@ -49,16 +49,18 @@ async function init() {
   wireRouter();
   startLastActivityTicker();
   await loadVariants();
-  // After variants are loaded, sync the URL hash so the requested page
-  // gets its initial render (e.g. opening /#performance directly).
-  routeFromHash();
   if (state.variants.length === 0) {
     document.getElementById('chart-error').textContent = 'no variants found — check experiments/paper_launch_v2.yaml';
     document.getElementById('chart-error').hidden = false;
     return;
   }
+  // Set selectedVariant + dropdown BEFORE routing — every route's
+  // onActivate (TODAY, PERFORMANCE, etc.) reads state.selectedVariant.
+  // If we route first, landing directly on /#today shows a blank page
+  // because renderTodayPage early-returns on no variant.
   state.selectedVariant = state.variants[0].name;
   populateVariantSelect();
+  routeFromHash();
   await loadTrades(state.selectedVariant);
   startEventStream();
 }
@@ -356,13 +358,39 @@ function wireKeyboard() {
 // onActivate hook (if defined) to refresh data lazily.
 
 const ROUTES = {
-  trade:       { onActivate: () => {} /* always loaded, the live UI */ },
+  trade:       { onActivate: () => {
+    // Verified via headless Chrome: when the route div toggles from
+    // display:none → flex, .chart-frame regains its 604px height but the
+    // child #chart stays at height: 0. lightweight-charts' autoSize
+    // observer locked inline width:0; height:0 on #chart while it was
+    // hidden, and ResizeObserver doesn't re-fire for content boxes whose
+    // observed size is held flat by an inline style (chicken-and-egg).
+    //
+    // Recovery: clear the locked inline style, toggle autoSize off+on
+    // (forces ResizeObserver to disconnect and re-observe the now-visible
+    // container), and explicitly resize from .chart-frame's dimensions
+    // before re-rendering the cached payload.
+    if (!state.currentPayload) return;
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      const frame = document.querySelector('#route-trade .chart-frame');
+      const el = document.getElementById('chart');
+      if (!frame || frame.clientWidth === 0 || frame.clientHeight === 0) return;
+      if (el) { el.style.width = ''; el.style.height = ''; }
+      try {
+        state.chart.applyOptions({ autoSize: false });
+        state.chart.resize(frame.clientWidth, frame.clientHeight);
+        state.chart.applyOptions({ autoSize: true });
+      } catch (e) { console.error('chart resize failed', e); }
+      renderPayload(state.currentPayload);
+    }));
+  } },
   today:       { onActivate: () => renderTodayPage() },
   performance: { onActivate: () => renderPerformancePage() },
   reviews:     { onActivate: () => renderReviewsPage() },
   portfolio:   { onActivate: () => renderRiskPage() },
   proposals:   { onActivate: () => renderProposalsPage() },
   ideas:       { onActivate: () => renderIdeasPage() },
+  log:         { onActivate: () => renderLogPage(), onDeactivate: () => stopLogAutoRefresh() },
 };
 
 function wireRouter() {
@@ -376,15 +404,21 @@ function wireRouter() {
   window.addEventListener('hashchange', routeFromHash);
 }
 
+let _activeRoute = null;
 function routeFromHash() {
   const r = (window.location.hash.replace('#', '') || 'trade').toLowerCase();
   const route = ROUTES[r] ? r : 'trade';
+  // Fire prior route's deactivate hook so it can stop intervals etc.
+  if (_activeRoute && _activeRoute !== route) {
+    try { ROUTES[_activeRoute].onDeactivate?.(); } catch (e) { console.error(e); }
+  }
   document.querySelectorAll('.route').forEach(el => {
     el.hidden = (el.id !== `route-${route}`);
   });
   document.querySelectorAll('.tab').forEach(t => {
     t.classList.toggle('active', t.dataset.route === route);
   });
+  _activeRoute = route;
   try { ROUTES[route].onActivate(); } catch (e) { console.error(e); }
 }
 
@@ -416,6 +450,14 @@ async function renderTodayPage() {
   const maxPos = data.max_positions || 10;
 
   meta.textContent = `${variant} · ${data.strategy_type}`;
+
+  // Service-health pill (mirrors Streamlit's _service_pill)
+  fetch('/api/service_status').then(r => r.json()).then(s => {
+    const pill = document.getElementById('today-svc');
+    if (!pill) return;
+    pill.classList.toggle('running', !!s.running);
+    pill.lastChild.textContent = s.label || (s.running ? 'RUNNING' : 'STOPPED');
+  }).catch(() => {});
 
   // KPI row
   const kpiHtml = [
@@ -763,7 +805,83 @@ async function renderReviewsPage() {
     document.getElementById('reviews-date').value = _reviews.date;
     _reviews.inited = true;
   }
+  // Top overview (cross-variant cards + totals + 30d normalized strip)
+  loadReviewsOverview();
   await loadReviewsListing();
+}
+
+let _reviewsNormChart = null, _reviewsNormSeries = [];
+async function loadReviewsOverview() {
+  let data;
+  try {
+    const res = await fetch('/api/reviews/overview');
+    data = await res.json();
+  } catch { return; }
+
+  // Cards
+  const cardsHtml = (data.cards || []).map(c => {
+    const equity = c.equity != null ? `$${Math.round(c.equity).toLocaleString()}` : '—';
+    const pl = c.daily_pl;
+    const plPct = c.daily_pl_pct;
+    const plCls = (pl ?? 0) >= 0 ? 'pos' : 'neg';
+    const plLine = pl != null
+      ? `${pl >= 0 ? '+' : ''}${Math.round(pl).toLocaleString()}` +
+        (plPct != null ? ` (${(plPct * 100).toFixed(2)}%)` : '')
+      : '—';
+    const closed = c.trades_closed || 0;
+    const wl = closed
+      ? `<b>${closed}</b> closed today · <span class="pos">${c.wins}W</span> / <span class="neg">${c.losses}L</span>`
+      : `<span class="rc-meta">No trades closed today</span>`;
+    const avgRet = c.avg_return != null ? `${(c.avg_return * 100).toFixed(2)}%` : '—';
+    const mfeCap = c.mfe_capture != null ? c.mfe_capture.toFixed(2) : '—';
+    const metrics = closed
+      ? `avg ${avgRet} · MFE capture ${mfeCap}`
+      : '<span class="rc-meta">(reviews fire on exits)</span>';
+    return `<div class="reviews-card">
+      <div class="rc-name">${escapeHtml(c.variant)}</div>
+      <div class="rc-equity">${equity}</div>
+      <div class="rc-pl ${plCls}">${escapeHtml(plLine)}</div>
+      <div class="rc-line">${wl}</div>
+      <div class="rc-meta">${metrics}</div>
+    </div>`;
+  }).join('');
+  document.getElementById('reviews-overview').innerHTML = cardsHtml;
+
+  // Totals row
+  const t = data.totals || {};
+  document.getElementById('reviews-totals').innerHTML = `
+    <div class="rt-cell"><div class="rt-label">TOTAL EQUITY</div><div class="rt-value">$${Math.round(t.equity || 0).toLocaleString()}</div></div>
+    <div class="rt-cell"><div class="rt-label">TODAY P&amp;L</div><div class="rt-value ${(t.daily_pl || 0) >= 0 ? 'pos' : 'neg'}">${(t.daily_pl || 0) >= 0 ? '+' : ''}${Math.round(t.daily_pl || 0).toLocaleString()}</div></div>
+    <div class="rt-cell"><div class="rt-label">TRADES CLOSED</div><div class="rt-value">${t.trades_closed || 0}</div></div>
+    <div class="rt-cell"><div class="rt-label">W / L</div><div class="rt-value">${t.wins || 0} / ${t.losses || 0}</div></div>`;
+
+  // 30d normalized equity strip
+  if (!_reviewsNormChart) {
+    _reviewsNormChart = LightweightCharts.createChart(document.getElementById('reviews-norm-chart'), {
+      layout: { background: { color: '#111114' }, textColor: '#9aa5b1', fontFamily: 'JetBrains Mono, monospace' },
+      grid:   { vertLines: { color: '#1a2230' }, horzLines: { color: '#1a2230' } },
+      rightPriceScale: { borderColor: '#1f2937' },
+      timeScale: { borderColor: '#1f2937', timeVisible: false },
+      autoSize: true,
+    });
+  }
+  for (const s of _reviewsNormSeries) {
+    try { _reviewsNormChart.removeSeries(s); } catch {}
+  }
+  _reviewsNormSeries = [];
+  for (const [name, points] of Object.entries(data.normalized || {})) {
+    const series = _reviewsNormChart.addLineSeries({
+      color: _PERF_COLORS[name] || '#9ca3af',
+      lineWidth: 2, title: name,
+      priceLineVisible: false, lastValueVisible: false,
+    });
+    series.setData(
+      points.map(p => ({ time: dateToUnix(p.date), value: Number(p.equity_norm) }))
+            .filter(p => !isNaN(p.value))
+    );
+    _reviewsNormSeries.push(series);
+  }
+  _reviewsNormChart.timeScale().fitContent();
 }
 
 function wireReviewsControls() {
@@ -977,28 +1095,298 @@ let _riskCostChart = null, _riskCostSeries = null;
 
 async function renderRiskPage() {
   document.getElementById('risk-meta').textContent = 'loading…';
-  let corr, outcomes, cost;
+  let corrFull, corrRecent, outcomes, cost, sizing, regime, patterns;
   try {
-    [corr, outcomes, cost] = await Promise.all([
-      fetch('/api/risk/correlation').then(r => r.json()),
+    [corrFull, corrRecent, outcomes, cost, sizing, regime, patterns] = await Promise.all([
+      fetch('/api/risk/correlation?days=180').then(r => r.json()),
+      fetch('/api/risk/correlation?days=60').then(r => r.json()),
       fetch('/api/risk/outcomes').then(r => r.json()),
       fetch('/api/risk/llm_cost').then(r => r.json()),
+      fetch('/api/risk/sizing?days=60').then(r => r.json()),
+      fetch('/api/risk/regime').then(r => r.json()),
+      fetch('/api/risk/patterns').then(r => r.json()),
     ]);
   } catch (e) {
     document.getElementById('risk-meta').textContent = String(e);
     return;
   }
   document.getElementById('risk-meta').textContent =
-    `${corr.variants.length} variants · ${corr.n_days} aligned days`;
-  document.getElementById('risk-corr-table').innerHTML = renderCorrelationTable(corr);
+    `${corrFull.variants.length} variants · ${corrFull.n_days} aligned days`;
+
+  // Section 1 — full correlation
+  document.getElementById('risk-corr-table').innerHTML = renderCorrelationTable(corrFull);
   document.getElementById('risk-corr-meta').textContent =
-    corr.variants.length >= 2 ? `${corr.n_days}d window · pairwise` : 'need ≥2 variants';
+    corrFull.variants.length >= 2 ? `${corrFull.n_days}d full history · pairwise` : 'need ≥2 variants';
+  renderCorrCallout(corrFull);
+
+  // Section 2 — recent vs full
+  document.getElementById('risk-corr-recent-table').innerHTML = renderCorrelationTable(corrRecent);
+  renderCorrShift(corrFull, corrRecent);
+
+  // Section 3 — risk-parity sizing
+  renderSizingTable(sizing);
+
+  // Section 4 — rolling pair correlation
+  setupPairPicker(corrFull.variants);
+
+  // Section 5 — regime Sharpe
+  renderRegimeTable(regime);
+
+  // Section 6 — per-pattern attribution
+  renderPatternsTable(patterns);
 
   document.getElementById('risk-outcomes-meta').textContent =
     `${outcomes.outcomes.length} closes · ${outcomes.start} → ${outcomes.end}`;
   document.getElementById('risk-outcomes').innerHTML = renderOutcomesTable(outcomes.outcomes);
 
   renderRiskCost(cost);
+
+  // AI synthesis button
+  const aiBtn = document.getElementById('risk-ai-btn');
+  aiBtn.onclick = () => triggerAiSynthesis();
+}
+
+function renderCorrCallout(corr) {
+  const el = document.getElementById('risk-corr-callout');
+  if (!corr.variants || corr.variants.length < 2) { el.hidden = true; return; }
+  const pairs = [];
+  for (let i = 0; i < corr.variants.length; i++) {
+    for (let j = i + 1; j < corr.variants.length; j++) {
+      const c = corr.matrix[i][j];
+      if (c != null) pairs.push([corr.variants[i], corr.variants[j], c]);
+    }
+  }
+  pairs.sort((a, b) => Math.abs(b[2]) - Math.abs(a[2]));
+  const redundant = pairs.filter(p => p[2] > 0.6).slice(0, 5);
+  const independent = pairs.filter(p => Math.abs(p[2]) < 0.2).slice(0, 5);
+  const hedges = pairs.filter(p => p[2] < -0.3).slice(0, 3);
+  const fmt = arr => arr.map(p => `<code>${escapeHtml(p[0])} ↔ ${escapeHtml(p[1])}</code> (${p[2] >= 0 ? '+' : ''}${p[2].toFixed(2)})`).join(', ');
+  const lines = [];
+  if (redundant.length)   lines.push(`<strong>Redundant pairs</strong> (>0.6 — same trade): ${fmt(redundant)}.`);
+  if (independent.length) lines.push(`<strong>Genuinely independent</strong> (|r|<0.2): ${fmt(independent)}.`);
+  if (hedges.length)      lines.push(`<strong>Natural hedges</strong> (negative): ${fmt(hedges)}.`);
+  if (!lines.length)      lines.push("Most pairs in 0.2–0.6 range — moderate diversification.");
+  el.innerHTML = lines.join('<br><br>');
+  el.hidden = false;
+}
+
+function renderCorrShift(full, recent) {
+  const el = document.getElementById('risk-corr-shift');
+  if (!recent.variants || recent.variants.length < 2 || !full.variants) { el.hidden = true; return; }
+  const fullMap = new Map();
+  for (let i = 0; i < full.variants.length; i++) {
+    for (let j = i + 1; j < full.variants.length; j++) {
+      fullMap.set(`${full.variants[i]}|${full.variants[j]}`, full.matrix[i][j]);
+    }
+  }
+  const shifts = [];
+  for (let i = 0; i < recent.variants.length; i++) {
+    for (let j = i + 1; j < recent.variants.length; j++) {
+      const a = recent.variants[i], b = recent.variants[j];
+      const r = recent.matrix[i][j];
+      const f = fullMap.get(`${a}|${b}`) ?? fullMap.get(`${b}|${a}`);
+      if (r == null || f == null) continue;
+      const d = r - f;
+      if (Math.abs(d) > 0.2) shifts.push([a, b, f, r, d]);
+    }
+  }
+  if (!shifts.length) {
+    el.innerHTML = `<strong>All pairs stable within ±0.2.</strong> No major regime shift; full-history correlations remain a fair guide for current sizing.`;
+  } else {
+    shifts.sort((a, b) => Math.abs(b[4]) - Math.abs(a[4]));
+    el.innerHTML = `<strong>Pairs that shifted >0.2 between full and recent:</strong><br>` +
+      shifts.slice(0, 8).map(s =>
+        `<code>${escapeHtml(s[0])} ↔ ${escapeHtml(s[1])}</code>: ${s[2].toFixed(2)} → ${s[3].toFixed(2)} (${s[4] >= 0 ? 'stronger' : 'weaker'})`
+      ).join('<br>');
+  }
+  el.hidden = false;
+}
+
+function renderSizingTable(sizing) {
+  const tbl = document.getElementById('risk-sizing-table');
+  const meta = document.getElementById('risk-sizing-meta');
+  const callout = document.getElementById('risk-sizing-callout');
+  if (!sizing.rows || !sizing.rows.length) {
+    tbl.innerHTML = `<div class="tb-empty">— need ≥5 fully-paired days; have ${sizing.n_days || 0} —</div>`;
+    callout.hidden = true;
+    meta.textContent = '';
+    return;
+  }
+  meta.textContent = `paired ${sizing.n_days}d · annualized σ ≈ ${sizing.portfolio_sigma_annual.toFixed(1)}%`;
+  const rows = sizing.rows.map(r => `<tr>
+    <td><b>${escapeHtml(r.variant)}</b></td>
+    <td class="num">$${Math.round(r.current_dollars).toLocaleString()}</td>
+    <td class="num">${(r.current_weight * 100).toFixed(1)}%</td>
+    <td class="num">${r.daily_vol_pct.toFixed(2)}%</td>
+    <td class="num">${(r.pct_of_portfolio_swings * 100).toFixed(0)}%</td>
+    <td class="num">${(r.risk_parity_weight * 100).toFixed(1)}%</td>
+    <td class="num ${r.shift_pp >= 0 ? 'pos' : 'neg'}">${r.shift_pp >= 0 ? '+' : ''}${r.shift_pp.toFixed(1)}pp</td>
+  </tr>`).join('');
+  tbl.innerHTML = `<table class="tb"><thead><tr>
+    <th>STRATEGY</th><th class="num">CURRENT $</th><th class="num">WEIGHT</th>
+    <th class="num">DAILY VOL</th><th class="num">% SWINGS</th>
+    <th class="num">RISK-PARITY</th><th class="num">SHIFT</th>
+    </tr></thead><tbody>${rows}</tbody></table>`;
+
+  // Bottom-line callout — top 2 contributors
+  const sorted = sizing.rows.slice().sort((a, b) => b.pct_of_portfolio_swings - a.pct_of_portfolio_swings);
+  const top2 = sorted.slice(0, 2);
+  if (top2.length === 2) {
+    const share = (top2[0].pct_of_portfolio_swings + top2[1].pct_of_portfolio_swings) * 100;
+    const biggestShifts = sizing.rows.slice().sort((a, b) => Math.abs(b.shift_pp) - Math.abs(a.shift_pp)).slice(0, 3);
+    callout.innerHTML = `<strong>Bottom line</strong>: <code>${escapeHtml(top2[0].variant)}</code> (${(top2[0].pct_of_portfolio_swings * 100).toFixed(0)}%) and <code>${escapeHtml(top2[1].variant)}</code> (${(top2[1].pct_of_portfolio_swings * 100).toFixed(0)}%) cause <strong>${share.toFixed(0)}%</strong> of portfolio swings.<br><br>` +
+      `Annualized σ ≈ ${sizing.portfolio_sigma_annual.toFixed(1)}% (SPY runs 15-20%).<br><br>` +
+      `Biggest risk-parity shifts: ${biggestShifts.map(s => `<code>${escapeHtml(s.variant)}</code> ${s.shift_pp >= 0 ? '+' : ''}${s.shift_pp.toFixed(1)}pp`).join(', ')}.`;
+    callout.hidden = false;
+  } else {
+    callout.hidden = true;
+  }
+}
+
+let _riskPairChart = null, _riskPairSeries = null;
+function setupPairPicker(variants) {
+  if (!variants || variants.length < 2) return;
+  const aSel = document.getElementById('risk-pair-a');
+  const bSel = document.getElementById('risk-pair-b');
+  const opts = variants.map(v => `<option value="${escapeHtml(v)}">${escapeHtml(v)}</option>`).join('');
+  aSel.innerHTML = opts; bSel.innerHTML = opts;
+  aSel.value = variants[0]; bSel.value = variants[1];
+  const onChange = () => loadRollingCorr(aSel.value, bSel.value);
+  aSel.onchange = onChange; bSel.onchange = onChange;
+  loadRollingCorr(aSel.value, bSel.value);
+}
+
+async function loadRollingCorr(a, b) {
+  const callout = document.getElementById('risk-pair-callout');
+  if (a === b) {
+    callout.innerHTML = '<em>Pick two different variants.</em>'; callout.hidden = false;
+    return;
+  }
+  let data;
+  try {
+    data = await fetch(`/api/risk/rolling_corr?a=${encodeURIComponent(a)}&b=${encodeURIComponent(b)}&window=20`).then(r => r.json());
+  } catch (e) { callout.innerHTML = String(e); callout.hidden = false; return; }
+
+  if (!_riskPairChart) {
+    _riskPairChart = LightweightCharts.createChart(document.getElementById('risk-pair-chart'), {
+      layout: { background: { color: '#111114' }, textColor: '#9aa5b1', fontFamily: 'JetBrains Mono, monospace' },
+      grid:   { vertLines: { color: '#1a2230' }, horzLines: { color: '#1a2230' } },
+      rightPriceScale: { borderColor: '#1f2937' },
+      timeScale: { borderColor: '#1f2937', timeVisible: false },
+      autoSize: true,
+    });
+  }
+  if (_riskPairSeries) { try { _riskPairChart.removeSeries(_riskPairSeries); } catch {} }
+  _riskPairSeries = _riskPairChart.addLineSeries({
+    color: '#0097a7', lineWidth: 2,
+    priceLineVisible: false, lastValueVisible: false,
+  });
+  const points = (data.points || [])
+    .map(p => ({ time: dateToUnix(p.date), value: p.corr }))
+    .filter(p => !isNaN(p.value) && p.value != null);
+  _riskPairSeries.setData(points);
+  _riskPairChart.timeScale().fitContent();
+
+  if (!points.length) {
+    callout.innerHTML = data.note ? escapeHtml(data.note) : 'no overlap';
+    callout.hidden = false;
+    return;
+  }
+  const cur = points[points.length - 1].value;
+  const vals = points.map(p => p.value);
+  const min = Math.min(...vals), max = Math.max(...vals);
+  let line = `<strong>Now</strong>: <code>${escapeHtml(a)}</code> ↔ <code>${escapeHtml(b)}</code> = ${cur >= 0 ? '+' : ''}${cur.toFixed(2)} `;
+  line += Math.abs(cur) > 0.6 ? '(<strong>redundant</strong>)' : Math.abs(cur) > 0.3 ? '(moderately related)' : '(mostly independent)';
+  line += `.<br><br>`;
+  if (max - min > 0.4) {
+    line += `<strong>Historically unstable</strong>: range ${min.toFixed(2)} to ${max.toFixed(2)}. Size assuming the high-correlation case.`;
+  } else {
+    line += `<strong>Historically stable</strong>: range ${min.toFixed(2)} to ${max.toFixed(2)}. Current number is reliable.`;
+  }
+  callout.innerHTML = line;
+  callout.hidden = false;
+}
+
+function renderRegimeTable(regime) {
+  const tbl = document.getElementById('risk-regime-table');
+  if (!regime.available || !regime.rows || !regime.rows.length) {
+    tbl.innerHTML = '<div class="tb-empty">— SPY history unavailable —</div>';
+    return;
+  }
+  // Pivot rows: variant × regime → (sharpe, n_days)
+  const variants = Array.from(new Set(regime.rows.map(r => r.variant)));
+  const regimes = ["confirmed_uptrend", "uptrend_under_pressure", "market_correction"];
+  const map = new Map();
+  for (const r of regime.rows) map.set(`${r.variant}|${r.regime}`, r);
+  const head = '<th></th>' + regimes.map(rg => `<th>${escapeHtml(rg.replace(/_/g, ' '))}</th>`).join('');
+  const trs = variants.map(v => {
+    const cells = regimes.map(rg => {
+      const r = map.get(`${v}|${rg}`);
+      if (!r || r.sharpe == null) return '<td class="cell-na">—</td>';
+      const cls = r.sharpe >= 0.5 ? 'cell-pos-strong' : r.sharpe > 0 ? 'cell-pos' : r.sharpe < -0.5 ? 'cell-neg-strong' : 'cell-neg';
+      return `<td class="${cls}">${r.sharpe >= 0 ? '+' : ''}${r.sharpe.toFixed(1)}<br><span style="font-size:0.62rem;color:#64748b;">over ${r.n_days}d</span></td>`;
+    }).join('');
+    return `<tr><th>${escapeHtml(v)}</th>${cells}</tr>`;
+  }).join('');
+  tbl.innerHTML = `<table class="corr-table"><thead><tr>${head}</tr></thead><tbody>${trs}</tbody></table>`;
+}
+
+function renderPatternsTable(patterns) {
+  const tbl = document.getElementById('risk-patterns-table');
+  if (!patterns.rows || !patterns.rows.length) {
+    tbl.innerHTML = '<div class="tb-empty">— no closed-trade outcomes yet —</div>';
+    return;
+  }
+  // Sort by variant then by total_return desc within variant
+  const rows = patterns.rows.slice().sort((a, b) => {
+    if (a.variant !== b.variant) return a.variant.localeCompare(b.variant);
+    return (b.total_return_pct || 0) - (a.total_return_pct || 0);
+  });
+  const trs = rows.map(r => `<tr>
+    <td>${escapeHtml(r.variant)}</td>
+    <td>${escapeHtml(r.base_pattern)}</td>
+    <td class="num">${r.n_trades}</td>
+    <td class="num">${(r.win_rate * 100).toFixed(1)}%</td>
+    <td class="num ${r.avg_return_pct >= 0 ? 'pos' : 'neg'}">${(r.avg_return_pct * 100).toFixed(2)}%</td>
+    <td class="num">${(r.median_return_pct * 100).toFixed(2)}%</td>
+    <td class="num ${r.total_return_pct >= 0 ? 'pos' : 'neg'}">${(r.total_return_pct * 100).toFixed(2)}%</td>
+    <td class="num">${r.avg_hold_days != null ? r.avg_hold_days.toFixed(1) : '—'}</td>
+  </tr>`).join('');
+  tbl.innerHTML = `<table class="tb"><thead><tr>
+    <th>STRATEGY</th><th>PATTERN</th><th class="num">TRADES</th><th class="num">WIN%</th>
+    <th class="num">AVG %</th><th class="num">MEDIAN %</th><th class="num">TOTAL %</th><th class="num">HELD</th>
+    </tr></thead><tbody>${trs}</tbody></table>`;
+}
+
+async function triggerAiSynthesis() {
+  const btn = document.getElementById('risk-ai-btn');
+  const out = document.getElementById('risk-ai-output');
+  btn.disabled = true;
+  out.hidden = false;
+  out.innerHTML = '<em>gpt-5.4-pro reading the data…</em>';
+  try {
+    const res = await fetch('/api/risk/synthesis', { method: 'POST' });
+    if (!res.ok) {
+      const err = await res.text();
+      out.innerHTML = `<span class="neg">synthesis failed: ${escapeHtml(err)}</span>`;
+      return;
+    }
+    const data = await res.json();
+    const meta = `<small style="color:#64748b;">${escapeHtml(data.model)} · ${data.duration_s}s · ~$${data.cost_estimate_usd.toFixed(2)} · ${data.cached ? 'cached' : 'fresh'}</small><br><br>`;
+    // Render markdown if marked is loaded; else escape + linebreaks
+    let body;
+    if (typeof marked !== 'undefined') {
+      try { body = marked.parse(data.text || '', { breaks: true, gfm: true }); }
+      catch { body = escapeHtml(data.text || '').replace(/\n/g, '<br>'); }
+    } else {
+      body = escapeHtml(data.text || '').replace(/\n/g, '<br>');
+    }
+    out.innerHTML = meta + body;
+  } catch (e) {
+    out.innerHTML = `<span class="neg">${escapeHtml(String(e))}</span>`;
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 function renderCorrelationTable(corr) {
@@ -1473,6 +1861,12 @@ function populateVariantSelect() {
   sel.addEventListener('change', async e => {
     state.selectedVariant = e.target.value;
     await loadTrades(state.selectedVariant);
+    // Switch the variant's per-account TODAY/PERFORMANCE/REVIEWS data too.
+    // loadTrades only refreshes the TRADE page's left rail + chart; non-trade
+    // routes need their onActivate re-fired to pull the new variant's data.
+    if (_activeRoute && _activeRoute !== 'trade') {
+      try { ROUTES[_activeRoute].onActivate?.(); } catch (e) { console.error(e); }
+    }
   });
 }
 
@@ -1776,7 +2170,15 @@ function renderPayload(p) {
   // Indicators (volume / MACD) — applies pane layout via scaleMargins
   buildIndicators(p.bars);
 
+  // Full reset on trade/variant switch — fitContent alone only resets the
+  // time axis; without re-enabling autoScale on each price pane, the
+  // previous trade's price range stays locked (e.g. switching from a $50
+  // stock to a $500 stock leaves the y-axis on the old range, hiding the
+  // new candles). Mirror fitChart()'s full reset.
   state.chart.timeScale().fitContent();
+  state.candleSeries.priceScale().applyOptions({ autoScale: true });
+  if (state.volumeSeries)   state.chart.priceScale('volume').applyOptions({ autoScale: true });
+  if (state.macdLineSeries) state.chart.priceScale('macd').applyOptions({ autoScale: true });
 }
 
 // In-place re-render used by the live-tail refresh — same pipeline as
@@ -1959,7 +2361,7 @@ function renderReasoning(r) {
 }
 
 function escapeHtml(s) {
-  return s.replace(/[&<>"']/g, c => ({
+  return String(s ?? '').replace(/[&<>"']/g, c => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
   })[c]);
 }
@@ -1968,6 +2370,71 @@ function showError(msg) {
   const el = document.getElementById('chart-error');
   el.textContent = msg;
   el.hidden = false;
+}
+
+// ── Page: LIVE LOG ──────────────────────────────────────────────────
+const _log = {
+  inited: false,
+  n: 200,
+  autoRefresh: true,
+  timer: null,
+};
+
+async function renderLogPage() {
+  if (!_log.inited) {
+    document.querySelectorAll('#log-tail-n .seg-btn').forEach(b => {
+      b.addEventListener('click', () => {
+        document.querySelectorAll('#log-tail-n .seg-btn').forEach(x => x.classList.remove('active'));
+        b.classList.add('active');
+        _log.n = parseInt(b.dataset.n, 10) || 200;
+        loadLogTail();
+      });
+    });
+    document.getElementById('log-autorefresh').addEventListener('change', e => {
+      _log.autoRefresh = e.target.checked;
+      if (_log.autoRefresh) startLogAutoRefresh();
+      else stopLogAutoRefresh();
+    });
+    _log.inited = true;
+  }
+  await loadLogTail();
+  if (_log.autoRefresh) startLogAutoRefresh();
+}
+
+async function loadLogTail() {
+  const meta = document.getElementById('log-meta');
+  const body = document.getElementById('log-body');
+  try {
+    const res = await fetch(`/api/log/tail?n=${_log.n}`);
+    const data = await res.json();
+    if (!data.exists) {
+      meta.textContent = `${data.path} · missing`;
+      body.textContent = '(log file not found)';
+      return;
+    }
+    const mt = data.mtime ? new Date(data.mtime * 1000).toLocaleTimeString() : '';
+    meta.textContent = `${data.path} · last write ${mt} · ${data.lines.length} lines`;
+    // Color-code error lines via spans; preserve original ordering.
+    body.innerHTML = data.lines.map(line => {
+      const isErr = /ERROR|Traceback|\berror\b/i.test(line);
+      const safe = escapeHtml(line);
+      return isErr ? `<span class="log-err">${safe}</span>` : safe;
+    }).join('\n');
+    body.scrollTop = body.scrollHeight;
+  } catch (e) {
+    meta.textContent = `error: ${e}`;
+  }
+}
+
+function startLogAutoRefresh() {
+  stopLogAutoRefresh();
+  _log.timer = setInterval(() => {
+    if (document.visibilityState === 'visible') loadLogTail();
+  }, 5000);
+}
+
+function stopLogAutoRefresh() {
+  if (_log.timer) { clearInterval(_log.timer); _log.timer = null; }
 }
 
 // ── SSE event feed ───────────────────────────────────────────────────
@@ -1992,7 +2459,7 @@ function appendEvent(rec) {
   li.innerHTML = `
     <span class="ts">${ts}</span>
     <span class="cat">${escapeHtml(rec.category || '?')}</span>
-    <span class="msg">${escapeHtml(rec.message || '')}${rec.symbol ? ' · ' + rec.symbol : ''}</span>`;
+    <span class="msg">${escapeHtml(rec.message || '')}${rec.symbol ? ' · ' + escapeHtml(rec.symbol) : ''}</span>`;
   ul.insertBefore(li, ul.firstChild);
   // Cap at 200 rows
   while (ul.children.length > 200) ul.removeChild(ul.lastChild);

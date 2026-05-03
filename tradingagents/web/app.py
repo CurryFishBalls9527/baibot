@@ -691,16 +691,19 @@ async def _tail_events() -> AsyncIterator[str]:
     f = path.open("r", encoding="utf-8", errors="replace")
     try:
         f.seek(0, 2)  # EOF
+        idle_polls = 0
         while True:
             line = f.readline()
             if not line:
-                # Heartbeat every 15s so proxies don't drop the connection,
-                # and so the client can detect server-side liveness.
-                await asyncio.sleep(1.0)
-                # Send a comment line every ~15 polls (~15s).
+                # Heartbeat every ~15s so proxies don't drop the connection.
                 # Comment frames are ignored by EventSource clients.
-                yield ": ping\n\n"
+                await asyncio.sleep(1.0)
+                idle_polls += 1
+                if idle_polls >= 15:
+                    yield ": ping\n\n"
+                    idle_polls = 0
                 continue
+            idle_polls = 0
             line = line.strip()
             if line:
                 yield f"data: {line}\n\n"
@@ -853,6 +856,479 @@ async def variant_stream(variant: str, request: Request) -> StreamingResponse:
             "Connection": "keep-alive",
         },
     )
+
+
+# ── Service status (launchctl pill on TODAY) ─────────────────────────
+
+
+@app.get("/api/service_status")
+def service_status() -> dict:
+    """Mirror dashboard/app.py:_service_pill — is the scheduler launchd job running?
+
+    NB: lives at /api/service_status (not /api/today/service_status) because
+    FastAPI registers /api/today/{variant} earlier in this file and matches
+    routes by registration order, so any path under /api/today/* gets caught
+    by the parameterized handler.
+    """
+    import subprocess
+    try:
+        uid = subprocess.check_output(["id", "-u"], text=True).strip()
+        out = subprocess.run(
+            ["launchctl", "print", f"gui/{uid}/com.tradingagents.scheduler"],
+            capture_output=True, text=True, check=False,
+        )
+        running = "state = running" in (out.stdout or "")
+    except Exception:
+        running = False
+    return {"running": running, "label": "RUNNING" if running else "STOPPED"}
+
+
+# ── Reviews cross-variant overview (top of Reviews page) ─────────────
+
+
+@app.get("/api/reviews/overview")
+def reviews_overview(days: int = 30) -> dict:
+    """Per-variant cards + 30-day normalized equity for the Reviews page top.
+
+    For each variant: latest equity, daily P&L, today's closed-trade outcomes
+    (trades_closed, wins, losses, avg_return, MFE capture), and a 30-day
+    snapshot series normalized to base=100 for the strip chart.
+    """
+    from datetime import date as _date
+    today_iso = _date.today().isoformat()
+    cards: List[dict] = []
+    norm_series: Dict[str, list] = {}
+    for v in _discover_variants():
+        name = v["name"]
+        try:
+            db = TradingDatabase(v["db_path"])
+            snaps = db.get_snapshots_in_range(
+                (_date.today() - __import__("datetime").timedelta(days=days)).isoformat(),
+                today_iso,
+            ) or []
+            outcomes = db.get_trade_outcomes_in_range(today_iso, today_iso) or []
+        except Exception:
+            snaps, outcomes = [], []
+
+        equity = daily_pl = daily_pl_pct = None
+        if snaps:
+            last = snaps[-1]
+            equity = float(last.get("equity") or 0)
+            daily_pl = float(last.get("daily_pl") or 0)
+            daily_pl_pct = float(last.get("daily_pl_pct") or 0) if last.get("daily_pl_pct") is not None else None
+
+        rets = [o["return_pct"] for o in outcomes if o.get("return_pct") is not None]
+        wins = sum(1 for r in rets if r > 0)
+        losses = sum(1 for r in rets if r < 0)
+        avg_return = (sum(rets) / len(rets)) if rets else None
+        mfes = [o.get("max_favorable_excursion") for o in outcomes
+                if isinstance(o.get("max_favorable_excursion"), (int, float))]
+        avg_mfe = (sum(mfes) / len(mfes)) if mfes else None
+        mfe_capture = (avg_return / avg_mfe) if (avg_return is not None and avg_mfe and avg_mfe > 0) else None
+
+        cards.append({
+            "variant": name,
+            "equity": equity,
+            "daily_pl": daily_pl,
+            "daily_pl_pct": daily_pl_pct,
+            "trades_closed": len(outcomes),
+            "wins": wins,
+            "losses": losses,
+            "avg_return": avg_return,
+            "avg_mfe": avg_mfe,
+            "mfe_capture": mfe_capture,
+        })
+
+        # Normalized 30-day strip
+        if snaps:
+            base = float(snaps[0].get("equity") or 0)
+            if base > 0:
+                norm_series[name] = [
+                    {"date": s["date"], "equity_norm": float(s["equity"]) / base * 100.0}
+                    for s in snaps
+                ]
+
+    totals = {
+        "equity":         sum((c["equity"] or 0) for c in cards),
+        "daily_pl":       sum((c["daily_pl"] or 0) for c in cards),
+        "trades_closed":  sum(c["trades_closed"] for c in cards),
+        "wins":           sum(c["wins"] for c in cards),
+        "losses":         sum(c["losses"] for c in cards),
+    }
+    return {"cards": cards, "totals": totals, "normalized": norm_series}
+
+
+# ── Risk page additions ──────────────────────────────────────────────
+
+
+def _returns_wide(days: int) -> "tuple":
+    """Return (variants, dates, matrix) where matrix[i][j] is return for
+    variants[i] on dates[j], or None if missing. Plus latest_equity dict."""
+    snaps_by_v: Dict[str, Dict[str, float]] = {}
+    latest_eq: Dict[str, float] = {}
+    for v in _discover_variants():
+        try:
+            db = TradingDatabase(v["db_path"])
+            rows = db.get_snapshots(days=days) or []
+        except Exception:
+            rows = []
+        rows = list(reversed(rows))  # ascending
+        snaps_by_v[v["name"]] = {r["date"]: float(r["equity"]) for r in rows}
+        if rows:
+            latest_eq[v["name"]] = float(rows[-1]["equity"])
+    rets_by_v: Dict[str, Dict[str, float]] = {}
+    for variant, eq in snaps_by_v.items():
+        dates = sorted(eq.keys())
+        out: Dict[str, float] = {}
+        for i in range(1, len(dates)):
+            prev_eq = eq[dates[i - 1]]
+            cur_eq = eq[dates[i]]
+            if prev_eq > 0:
+                out[dates[i]] = (cur_eq / prev_eq) - 1.0
+        rets_by_v[variant] = out
+    variants = sorted([v for v, m in rets_by_v.items() if len(m) >= 2])
+    all_dates = sorted({d for v in variants for d in rets_by_v[v]})
+    matrix: List[List[Optional[float]]] = [
+        [rets_by_v[v].get(d) for d in all_dates] for v in variants
+    ]
+    return variants, all_dates, matrix, latest_eq
+
+
+@app.get("/api/risk/sizing")
+def risk_sizing(days: int = 60) -> dict:
+    """Risk-parity sizing table (Section 3 of the Streamlit Risk page).
+
+    For each variant: current $, current weight, daily volatility,
+    % of portfolio swings caused, risk-parity-suggested weight, and the
+    pp shift to risk-parity. Plus annualized portfolio σ.
+    """
+    import math
+    variants, all_dates, matrix, latest_eq = _returns_wide(days)
+    if len(variants) < 2 or len(all_dates) < 5:
+        return {"variants": variants, "rows": [], "portfolio_sigma_annual": None,
+                "n_days": len(all_dates)}
+
+    # Drop columns with any None to get a fully-paired matrix (cov needs that).
+    paired_idx = [j for j in range(len(all_dates))
+                  if all(matrix[i][j] is not None for i in range(len(variants)))]
+    if len(paired_idx) < 5:
+        return {"variants": variants, "rows": [], "portfolio_sigma_annual": None,
+                "n_days": len(paired_idx)}
+    n = len(paired_idx)
+    means = [sum(matrix[i][j] for j in paired_idx) / n for i in range(len(variants))]
+    cov: List[List[float]] = [[0.0] * len(variants) for _ in variants]
+    for a in range(len(variants)):
+        for b in range(len(variants)):
+            cov[a][b] = sum(
+                (matrix[a][j] - means[a]) * (matrix[b][j] - means[b])
+                for j in paired_idx
+            ) / max(n - 1, 1)
+    eq_vec = [latest_eq.get(v, 0.0) for v in variants]
+    total = sum(eq_vec) or 1.0
+    w = [e / total for e in eq_vec]
+
+    # Portfolio variance: w' Σ w
+    pvar = sum(w[a] * cov[a][b] * w[b] for a in range(len(variants)) for b in range(len(variants)))
+    psigma = math.sqrt(pvar) if pvar > 0 else 0.0
+
+    # Marginal contribution to risk: (w * (Σw)) / σ
+    sigma_w = [sum(cov[a][b] * w[b] for b in range(len(variants))) for a in range(len(variants))]
+    if psigma > 0:
+        mcr = [w[a] * sigma_w[a] / psigma for a in range(len(variants))]
+        mcr_sum = sum(mcr) or 1.0
+        pct_contrib = [m / mcr_sum for m in mcr]
+    else:
+        pct_contrib = [0.0] * len(variants)
+
+    # Risk-parity inverse-vol weights
+    inv_vol = [1.0 / math.sqrt(cov[i][i]) if cov[i][i] > 0 else 0.0 for i in range(len(variants))]
+    inv_sum = sum(inv_vol) or 1.0
+    rp_w = [iv / inv_sum for iv in inv_vol]
+
+    rows = []
+    for i, v in enumerate(variants):
+        rows.append({
+            "variant": v,
+            "current_dollars": eq_vec[i],
+            "current_weight": w[i],
+            "daily_vol_pct": math.sqrt(cov[i][i]) * 100.0,
+            "pct_of_portfolio_swings": pct_contrib[i],
+            "risk_parity_weight": rp_w[i],
+            "shift_pp": (rp_w[i] - w[i]) * 100.0,
+        })
+    return {
+        "variants": variants,
+        "rows": rows,
+        "portfolio_sigma_annual": psigma * math.sqrt(252) * 100.0,
+        "n_days": n,
+    }
+
+
+@app.get("/api/risk/rolling_corr")
+def risk_rolling_corr(a: str, b: str, window: int = 60, days: int = 365) -> dict:
+    """Rolling correlation series between two variants' daily returns."""
+    import math
+    variants, all_dates, matrix, _ = _returns_wide(days)
+    if a not in variants or b not in variants:
+        return {"a": a, "b": b, "points": []}
+    ai = variants.index(a); bi = variants.index(b)
+    pairs = [(all_dates[j], matrix[ai][j], matrix[bi][j]) for j in range(len(all_dates))
+             if matrix[ai][j] is not None and matrix[bi][j] is not None]
+    if len(pairs) < window:
+        return {"a": a, "b": b, "points": [], "note": f"need {window} paired days, have {len(pairs)}"}
+    points = []
+    for k in range(window - 1, len(pairs)):
+        win = pairs[k - window + 1:k + 1]
+        xs = [p[1] for p in win]; ys = [p[2] for p in win]
+        mx = sum(xs) / window; my = sum(ys) / window
+        num = sum((xs[i] - mx) * (ys[i] - my) for i in range(window))
+        dx = math.sqrt(sum((x - mx) ** 2 for x in xs))
+        dy = math.sqrt(sum((y - my) ** 2 for y in ys))
+        corr = (num / (dx * dy)) if (dx > 0 and dy > 0) else None
+        points.append({"date": pairs[k][0], "corr": corr})
+    return {"a": a, "b": b, "window": window, "points": points}
+
+
+@app.get("/api/risk/regime")
+def risk_regime(days: int = 365) -> dict:
+    """Per-variant Sharpe per SPY regime (confirmed/under-pressure/correction).
+
+    Mirrors Streamlit's _load_spy_regime + per-variant per-regime Sharpe.
+    Regime uses Minervini's standard SPY rules.
+    """
+    import math
+    market_db = Path("research_data/market_data.duckdb")
+    if not market_db.exists():
+        return {"available": False, "rows": []}
+    try:
+        import duckdb
+        con = duckdb.connect(str(market_db), read_only=True)
+        try:
+            spy_rows = con.execute(
+                "SELECT trade_date, close FROM daily_bars "
+                "WHERE symbol='SPY' ORDER BY trade_date"
+            ).fetchall()
+        finally:
+            con.close()
+    except Exception as exc:
+        return {"available": False, "error": str(exc), "rows": []}
+    if not spy_rows:
+        return {"available": False, "rows": []}
+
+    closes = [(str(r[0]), float(r[1])) for r in spy_rows]
+    # Compute SMA50 / SMA200 + rising-200 flag.
+    sma50: Dict[str, float] = {}
+    sma200: Dict[str, float] = {}
+    sma200_20d: Dict[str, float] = {}
+    for i, (d, _c) in enumerate(closes):
+        if i >= 49:
+            sma50[d] = sum(c for _, c in closes[i - 49:i + 1]) / 50
+        if i >= 199:
+            sma200[d] = sum(c for _, c in closes[i - 199:i + 1]) / 200
+    for i, (d, _c) in enumerate(closes):
+        if i >= 219 and closes[i - 20][0] in sma200:
+            sma200_20d[d] = sma200[closes[i - 20][0]]
+    regime_for: Dict[str, str] = {}
+    for d, c in closes:
+        if d not in sma200:
+            continue
+        above_50 = (d in sma50) and c > sma50[d]
+        above_200 = c > sma200[d]
+        rising_200 = (d in sma200_20d) and sma200[d] > sma200_20d[d]
+        if above_50 and above_200 and rising_200:
+            regime_for[d] = "confirmed_uptrend"
+        elif above_200:
+            regime_for[d] = "uptrend_under_pressure"
+        else:
+            regime_for[d] = "market_correction"
+
+    variants, all_dates, matrix, _ = _returns_wide(days)
+    rows: List[dict] = []
+    for i, v in enumerate(variants):
+        by_regime: Dict[str, List[float]] = {
+            "confirmed_uptrend": [], "uptrend_under_pressure": [], "market_correction": []
+        }
+        for j, d in enumerate(all_dates):
+            r = matrix[i][j]
+            reg = regime_for.get(d)
+            if r is not None and reg in by_regime:
+                by_regime[reg].append(r)
+        for reg, arr in by_regime.items():
+            if len(arr) >= 2:
+                m = sum(arr) / len(arr)
+                var = sum((x - m) ** 2 for x in arr) / max(len(arr) - 1, 1)
+                std = math.sqrt(var) if var > 0 else 0.0
+                sharpe = (m / std) * math.sqrt(252) if std > 0 else None
+            else:
+                sharpe = None
+            rows.append({
+                "variant": v, "regime": reg, "n_days": len(arr),
+                "mean_pct": (sum(arr) / len(arr)) if arr else None,
+                "sharpe": sharpe,
+                "win_rate": (sum(1 for x in arr if x > 0) / len(arr)) if arr else None,
+            })
+    return {"available": True, "rows": rows}
+
+
+@app.get("/api/risk/patterns")
+def risk_patterns() -> dict:
+    """Per-strategy entry-pattern P&L attribution (Section 6).
+
+    Aggregates trade_outcomes by (variant, base_pattern).
+    """
+    rows: List[dict] = []
+    for v in _discover_variants():
+        try:
+            db = TradingDatabase(v["db_path"])
+            outs = db.conn.execute(
+                "SELECT base_pattern, return_pct, hold_days, exit_reason "
+                "FROM trade_outcomes WHERE return_pct IS NOT NULL"
+            ).fetchall()
+        except Exception:
+            outs = []
+        # Aggregate
+        groups: Dict[str, List[float]] = {}
+        holds:  Dict[str, List[float]] = {}
+        for r in outs:
+            d = dict(r)
+            pat = d.get("base_pattern") or "(unknown)"
+            groups.setdefault(pat, []).append(float(d["return_pct"]))
+            if d.get("hold_days") is not None:
+                holds.setdefault(pat, []).append(float(d["hold_days"]))
+        for pat, arr in groups.items():
+            n = len(arr)
+            wins = sum(1 for x in arr if x > 0)
+            avg = sum(arr) / n
+            arr_sorted = sorted(arr)
+            median = arr_sorted[n // 2] if n % 2 else (arr_sorted[n // 2 - 1] + arr_sorted[n // 2]) / 2
+            rows.append({
+                "variant": v["name"],
+                "base_pattern": pat,
+                "n_trades": n,
+                "win_rate": wins / n,
+                "avg_return_pct": avg,
+                "median_return_pct": median,
+                "total_return_pct": sum(arr),
+                "avg_hold_days": (sum(holds.get(pat, [])) / len(holds.get(pat, []))) if holds.get(pat) else None,
+            })
+    return {"rows": rows}
+
+
+# AI synthesis is cached by the hash of the prompt that gets fed in. Reusing
+# this dict across requests means clicking "Generate" twice within the same
+# server lifetime won't re-pay for the same data.
+_SYNTHESIS_CACHE: Dict[str, dict] = {}
+
+
+@app.post("/api/risk/synthesis")
+def risk_synthesis() -> dict:
+    """One-shot gpt-5.4-pro synthesis across the Risk page sections.
+
+    Pulls live data from /api/risk/* endpoints (in-process), composes a
+    structured prompt, calls the LLM, and returns text + cost + model.
+    Cached by data hash within the process lifetime (~$0.05/call).
+    """
+    import hashlib
+    from datetime import datetime, timezone
+
+    # Gather inputs
+    corr = risk_correlation(days=180)
+    sizing = risk_sizing(days=60)
+    regime = risk_regime(days=365)
+    patterns = risk_patterns()
+
+    parts = [
+        "You are a quantitative portfolio analyst reviewing live paper-trading "
+        "data for a multi-strategy book. Be terse, specific, actionable. "
+        "Cross-reference between sections — that's the value-add over the "
+        "rule-based per-section narratives the user already sees.",
+        "",
+        "## Portfolio scope",
+        f"Variants: {corr.get('variants', [])}",
+        f"Days of pairwise overlap (correlation): {corr.get('n_days', 0)}",
+        "",
+        "## Pairwise correlation matrix (last 180 days)",
+        json.dumps(corr.get("matrix", []), default=str),
+        "",
+        "## Risk-parity sizing table",
+        json.dumps(sizing.get("rows", []), default=str),
+        f"Annualized portfolio σ: {sizing.get('portfolio_sigma_annual')}",
+        "",
+        "## Per-regime Sharpe (SPY-classified)",
+        json.dumps(regime.get("rows", []), default=str),
+        "",
+        "## Per-pattern P&L attribution",
+        json.dumps(patterns.get("rows", []), default=str),
+        "",
+        "## Your task",
+        "Write 4-7 sentences that:",
+        "1. Cross-reference between sections",
+        "2. Call out genuinely surprising or actionable findings",
+        "3. Name ONE specific decision the user should make",
+        "4. If data is too sparse for firm conclusions, say so explicitly",
+        "Do NOT rehash per-section findings.",
+    ]
+    prompt = "\n".join(parts)
+    key = hashlib.sha1(prompt.encode("utf-8")).hexdigest()[:16]
+    if key in _SYNTHESIS_CACHE:
+        return {**_SYNTHESIS_CACHE[key], "cached": True}
+
+    try:
+        from tradingagents.llm_clients.factory import create_llm_client
+        client = create_llm_client(provider="openai", model="gpt-5.4-pro")
+        llm = client.get_llm()
+        started = datetime.now(timezone.utc)
+        result = llm.invoke(prompt)
+        duration = (datetime.now(timezone.utc) - started).total_seconds()
+        raw = result.content
+        if isinstance(raw, list):
+            text = "\n".join(
+                block.get("text", "") for block in raw
+                if isinstance(block, dict) and block.get("type") == "text"
+            )
+        else:
+            text = str(raw)
+    except Exception as exc:
+        raise HTTPException(500, f"AI synthesis failed: {exc}")
+
+    payload = {
+        "text": text,
+        "model": "gpt-5.4-pro",
+        "duration_s": round(duration, 1),
+        "generated_at": started.isoformat(timespec="seconds"),
+        "cost_estimate_usd": 0.05,
+        "cached": False,
+    }
+    _SYNTHESIS_CACHE[key] = payload
+    return payload
+
+
+# ── Live log tail (raw automation_service.out.log) ───────────────────
+
+
+@app.get("/api/log/tail")
+def log_tail(n: int = 200) -> dict:
+    """Tail the scheduler's automation_service.out.log.
+
+    Returns the last ``n`` lines plus the file's mtime. Sister to
+    ``/events/stream`` (which streams the structured events.jsonl) — this
+    is the raw freeform stdout of the launchd service.
+    """
+    log_path = Path("results/service_logs/automation_service.out.log")
+    if not log_path.exists():
+        return {"path": str(log_path), "exists": False, "lines": [], "mtime": None}
+    try:
+        with log_path.open("r", encoding="utf-8", errors="replace") as h:
+            lines = h.readlines()[-int(n):]
+    except Exception as exc:
+        return {"path": str(log_path), "exists": True, "lines": [],
+                "mtime": None, "error": str(exc)}
+    return {
+        "path": str(log_path),
+        "exists": True,
+        "lines": [l.rstrip("\n") for l in lines],
+        "mtime": int(log_path.stat().st_mtime),
+    }
 
 
 # ── Static frontend ──────────────────────────────────────────────────

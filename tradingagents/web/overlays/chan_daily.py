@@ -20,7 +20,7 @@ import pandas as pd
 
 from tradingagents.storage.database import TradingDatabase
 
-from ..bars import _to_unix, fetch_daily
+from ..bars import _to_unix_date, fetch_daily
 from .base import (
     Bar,
     ChartPayload,
@@ -150,9 +150,9 @@ def _structures_to_overlays(structures: dict) -> List[dict]:
     for bi in structures.get("bi_list", []):
         overlays.append(LineOverlay(
             kind="line",
-            from_t=_to_unix(bi["start_time"]),
+            from_t=_to_unix_date(bi["start_time"]),
             from_p=float(bi["start_val"]),
-            to_t=_to_unix(bi["end_time"]),
+            to_t=_to_unix_date(bi["end_time"]),
             to_p=float(bi["end_val"]),
             label=None, style="dashed",
             color="#5b8def" if bi["dir"] == "up" else "#9aa5b1",
@@ -161,9 +161,9 @@ def _structures_to_overlays(structures: dict) -> List[dict]:
     for seg in structures.get("seg_list", []):
         overlays.append(LineOverlay(
             kind="line",
-            from_t=_to_unix(seg["start_time"]),
+            from_t=_to_unix_date(seg["start_time"]),
             from_p=float(seg["start_val"]),
-            to_t=_to_unix(seg["end_time"]),
+            to_t=_to_unix_date(seg["end_time"]),
             to_p=float(seg["end_val"]),
             label="SEG", style="solid",
             color="#1f78b4" if seg["dir"] == "up" else "#5d6d7e",
@@ -172,15 +172,15 @@ def _structures_to_overlays(structures: dict) -> List[dict]:
     for zs in structures.get("zs_list", []):
         overlays.append(ZoneOverlay(
             kind="zone",
-            from_t=_to_unix(zs["begin_time"]),
-            to_t=_to_unix(zs["end_time"]),
+            from_t=_to_unix_date(zs["begin_time"]),
+            to_t=_to_unix_date(zs["end_time"]),
             low=float(zs["low"]), high=float(zs["high"]),
             label="ZS", color="rgba(245, 165, 36, 0.18)",
         ))
     for bsp in structures.get("bsp_list", []):
         overlays.append(MarkerOverlay(
             kind="marker",
-            time=_to_unix(bsp["time"]),
+            time=_to_unix_date(bsp["time"]),
             price=float(bsp["price"]),
             label=bsp.get("types") or "BSP",
             side="buy" if bsp["is_buy"] else "sell",
@@ -266,7 +266,7 @@ def build_chart(
     fills: List[Fill] = []
     if row.get("filled_price"):
         fills.append(Fill(
-            time=_to_unix(row["trade_ts"]),
+            time=_to_unix_date(row["trade_ts"]),
             price=float(row["filled_price"]),
             side="buy" if str(row.get("side", "")).lower() == "buy" else "sell",
             qty=float(row.get("filled_qty") or row.get("qty") or 0),
@@ -275,7 +275,7 @@ def build_chart(
     for ex in _exit_fills(db, symbol, str(row["trade_ts"])):
         if ex.get("filled_price"):
             fills.append(Fill(
-                time=_to_unix(ex["timestamp"]),
+                time=_to_unix_date(ex["timestamp"]),
                 price=float(ex["filled_price"]),
                 side="sell",
                 qty=float(ex.get("filled_qty") or 0),

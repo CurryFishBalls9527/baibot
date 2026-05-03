@@ -11,9 +11,10 @@ All readers return ``List[Bar]`` (see ``overlays/base.py``).
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
+from zoneinfo import ZoneInfo
 
 import duckdb
 import pandas as pd
@@ -21,27 +22,64 @@ import pandas as pd
 from .overlays.base import Bar
 
 
+# Bars in our DuckDB stores (bars_30m, bars_15m, daily_bars) are written as
+# naive timestamps in ET wall-clock time. Localizing as UTC would shift the
+# unix epoch by 4-5h, which renders the chart's time axis wrong in any non-UTC
+# browser. Treat naive intraday timestamps as ET, then convert to UTC for the
+# wire. Daily timestamps are conceptually a *date*, not an instant — so we
+# strip the time-of-day and emit midnight-UTC (lightweight-charts requires
+# uniform 86400s deltas for its daily-resolution detection; emitting 04:00
+# UTC bars from naive-ET conversion would break that detection AND mis-align
+# markers/overlays whose times may fall anywhere in the trading day).
+_MARKET_TZ = ZoneInfo("America/New_York")
+
+
 def _to_unix(ts) -> int:
+    """Intraday-grade unix conversion (treats naive timestamps as ET)."""
     if isinstance(ts, (int, float)):
         return int(ts)
     if isinstance(ts, str):
         ts = pd.to_datetime(ts)
     if isinstance(ts, pd.Timestamp):
         if ts.tzinfo is None:
-            ts = ts.tz_localize("UTC")
+            ts = ts.tz_localize(_MARKET_TZ)
         return int(ts.timestamp())
     if isinstance(ts, datetime):
         if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
+            ts = ts.replace(tzinfo=_MARKET_TZ)
         return int(ts.timestamp())
     raise TypeError(f"unsupported timestamp type: {type(ts)}")
 
 
-def _df_to_bars(df: pd.DataFrame) -> List[Bar]:
+def _to_unix_date(ts) -> int:
+    """Daily-grade unix conversion: align to midnight UTC of the calendar date.
+
+    Use this for everything that lands on a daily chart — bars, overlay
+    line/zone/level endpoints, fill markers, BSP markers — so lightweight-
+    charts' daily resolution detection works and markers align to bars.
+    """
+    if isinstance(ts, (int, float)):
+        # Already a unix epoch — round down to the date in UTC.
+        d = datetime.fromtimestamp(int(ts), tz=__import__("datetime").timezone.utc).date()
+    else:
+        if isinstance(ts, str):
+            ts = pd.to_datetime(ts)
+        if isinstance(ts, pd.Timestamp):
+            d = ts.date()
+        elif isinstance(ts, datetime):
+            d = ts.date()
+        else:
+            raise TypeError(f"unsupported timestamp type: {type(ts)}")
+    # Build a midnight-UTC Timestamp for that date and emit unix.
+    return int(pd.Timestamp(d).tz_localize("UTC").timestamp())
+
+
+def _df_to_bars(df: pd.DataFrame, daily: bool = False) -> List[Bar]:
+    convert = _to_unix_date if daily else _to_unix
     bars: List[Bar] = []
     for _, r in df.iterrows():
         bars.append({
-            "time":   _to_unix(r["ts"]),
+            "time":   convert(r["ts"]),
             "open":   float(r["open"]),
             "high":   float(r["high"]),
             "low":    float(r["low"]),
@@ -108,7 +146,7 @@ def fetch_30m(
                 .sort_values("ts")
                 .reset_index(drop=True)
             )
-        return _df_to_bars(df)
+        return _df_to_bars(df, daily=False)
     finally:
         con.close()
 
@@ -167,7 +205,7 @@ def fetch_daily(
                 .sort_values("ts")
                 .reset_index(drop=True)
             )
-        return _df_to_bars(df)
+        return _df_to_bars(df, daily=True)
     finally:
         con.close()
 
