@@ -1,0 +1,393 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>baibot — live trade telemetry</title>
+
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=JetBrains+Mono:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
+
+  <link rel="stylesheet" href="/static/style.css" />
+  <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+</head>
+<body>
+
+  <!-- Atmospheric layers, behind everything -->
+  <div class="bg bg-grain" aria-hidden="true"></div>
+  <div class="bg bg-glow" aria-hidden="true"></div>
+  <div class="bg bg-grid" aria-hidden="true"></div>
+
+  <!-- ─── TOP BAR ─────────────────────────────────────────────── -->
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">baibot</span>
+      <span class="brand-rule"></span>
+      <span class="brand-status">LIVE TRADE TELEMETRY</span>
+    </div>
+
+    <div class="topbar-controls">
+      <span id="last-activity" class="last-activity" title="time since last trade fired">
+        <span class="la-dot" aria-hidden="true"></span>
+        <span class="la-label">LAST</span>
+        <span id="last-activity-value" class="la-value">—</span>
+      </span>
+
+      <button id="btn-awake" class="chip-btn" title="keep screen on (iPad / laptop)">
+        <span class="chip-glyph">☀</span><span class="chip-label">AWAKE</span>
+      </button>
+
+      <label class="select-wrap" aria-label="variant">
+        <span class="select-label">VARIANT</span>
+        <select id="variant-select" class="variant-select"></select>
+        <span class="select-chevron" aria-hidden="true">▾</span>
+      </label>
+
+      <span id="event-status" class="event-status">
+        <span class="event-status-dot" aria-hidden="true"></span>
+        connecting…
+      </span>
+    </div>
+  </header>
+
+  <!-- ─── TAB NAVIGATION ──────────────────────────────────────── -->
+  <nav class="tabs" role="tablist">
+    <a class="tab" data-route="trade"       href="#trade">TRADE</a>
+    <a class="tab" data-route="today"       href="#today">TODAY</a>
+    <a class="tab" data-route="performance" href="#performance">PERFORMANCE</a>
+    <a class="tab" data-route="reviews"     href="#reviews">REVIEWS</a>
+    <a class="tab" data-route="portfolio"   href="#portfolio">RISK</a>
+    <a class="tab" data-route="proposals"   href="#proposals">PROPOSALS</a>
+    <a class="tab" data-route="ideas"       href="#ideas">IDEAS</a>
+  </nav>
+
+  <!-- ─── ROUTE: TRADE (default) — three-pane investigative view ── -->
+  <main class="layout route" id="route-trade">
+
+    <!-- LEFT — TRADE TICKETS -->
+    <aside class="pane pane-trades">
+
+      <section class="incoming-section">
+        <header class="pane-head pane-head-incoming">
+          <span class="pane-label">INCOMING</span>
+          <span class="pane-meta">
+            <span id="incoming-count">0</span>
+            <button id="btn-clear-incoming"
+                    class="incoming-clear"
+                    title="dismiss all incoming"
+                    hidden>× CLEAR</button>
+          </span>
+        </header>
+        <ul id="incoming-list" class="trades-list incoming-list"></ul>
+        <div id="incoming-empty" class="incoming-empty">— quiet —</div>
+      </section>
+
+      <section class="recent-section">
+        <header class="pane-head">
+          <span class="pane-label">RECENT TRADES</span>
+          <span class="pane-meta">last 80</span>
+        </header>
+        <ul id="trades-list" class="trades-list"></ul>
+      </section>
+
+    </aside>
+
+    <!-- CENTER — CHART VIEWPORT -->
+    <section class="pane pane-chart">
+      <header class="chart-head">
+        <div class="chart-head-left">
+          <span class="chart-eyebrow">SUBJECT</span>
+          <h1 id="chart-title" class="chart-title">—</h1>
+        </div>
+        <span id="chart-meta" class="chart-meta"></span>
+      </header>
+
+      <div class="chart-toolbar" role="toolbar" aria-label="chart controls">
+        <button id="btn-fit"        class="tb-btn" title="Fit content (F)">
+          <span class="tb-glyph">⤢</span><span class="tb-label">FIT</span>
+        </button>
+        <span class="tb-sep"></span>
+        <button id="btn-structures" class="tb-btn active" title="Toggle Chan structures (S)">
+          <span class="tb-glyph">▦</span><span class="tb-label">STRUCTURES</span>
+        </button>
+        <button id="btn-volume"     class="tb-btn active" title="Toggle volume (V)">
+          <span class="tb-glyph">▮</span><span class="tb-label">VOLUME</span>
+        </button>
+        <button id="btn-macd"       class="tb-btn"        title="Toggle MACD (M)">
+          <span class="tb-glyph">∿</span><span class="tb-label">MACD</span>
+        </button>
+        <span class="tb-sep tb-sep-flex"></span>
+        <span class="tb-hint">WHEEL · ZOOM &nbsp;&nbsp; DRAG · PAN &nbsp;&nbsp; F·S·V·M</span>
+      </div>
+
+      <div class="chart-frame">
+        <span class="bracket br-tl" aria-hidden="true"></span>
+        <span class="bracket br-tr" aria-hidden="true"></span>
+        <span class="bracket br-bl" aria-hidden="true"></span>
+        <span class="bracket br-br" aria-hidden="true"></span>
+        <span class="frame-tick frame-tick-tl" aria-hidden="true">N · 36.7728</span>
+        <span class="frame-tick frame-tick-tr" aria-hidden="true">W · 122.3946</span>
+        <div id="chart" class="chart"></div>
+        <div id="chart-error" class="chart-error" hidden></div>
+      </div>
+
+      <footer class="chart-foot">
+        <span class="foot-cell">CHAN-30M · BI/SEG/ZS/BSP</span>
+        <span class="foot-divider"></span>
+        <span class="foot-cell">paper · NOT FINANCIAL ADVICE</span>
+        <span class="foot-divider"></span>
+        <span class="foot-cell foot-cell-pulse">SIGNAL · LIVE</span>
+      </footer>
+    </section>
+
+    <!-- RIGHT — REASONING / "WHY" -->
+    <aside class="pane pane-reasoning">
+
+      <section class="reasoning-section">
+        <header class="pane-head">
+          <span class="pane-label">THESIS</span>
+        </header>
+        <div id="reasoning-headline" class="reasoning-headline">—</div>
+      </section>
+
+      <section class="reasoning-section">
+        <header class="pane-head">
+          <span class="pane-label">CRITERIA</span>
+        </header>
+        <ul id="reasoning-criteria" class="criteria"></ul>
+      </section>
+
+      <section class="reasoning-section">
+        <header class="pane-head">
+          <span class="pane-label">METRICS</span>
+        </header>
+        <dl id="reasoning-metrics" class="metrics"></dl>
+      </section>
+
+      <section class="reasoning-section">
+        <header class="pane-head">
+          <span class="pane-label">NARRATIVE</span>
+        </header>
+        <pre id="reasoning-narrative" class="narrative">—</pre>
+      </section>
+
+      <section class="reasoning-section reasoning-events">
+        <header class="pane-head">
+          <span class="pane-label">EVENT FEED</span>
+          <span class="pane-meta"><span class="pulse-dot"></span> live</span>
+        </header>
+        <ul id="event-feed" class="event-feed"></ul>
+      </section>
+
+    </aside>
+
+  </main>
+
+  <!-- ─── ROUTE: TODAY ──────────────────────────────────────────── -->
+  <section class="route route-page" id="route-today" hidden>
+    <div class="page-head">
+      <h1 class="page-title">TODAY</h1>
+      <span class="page-meta" id="today-meta">—</span>
+    </div>
+
+    <div class="kpi-row" id="today-kpi"></div>
+
+    <div class="page-grid page-grid-today">
+      <section class="page-block">
+        <header class="block-head">
+          <span class="pane-label">EQUITY CURVE</span>
+          <span class="pane-meta" id="today-equity-meta"></span>
+        </header>
+        <div id="today-equity-chart" class="block-chart"></div>
+      </section>
+
+      <section class="page-block">
+        <header class="block-head">
+          <span class="pane-label">OPEN POSITIONS</span>
+          <span class="pane-meta" id="today-positions-meta"></span>
+        </header>
+        <div id="today-positions" class="block-table"></div>
+      </section>
+
+      <section class="page-block page-block-wide">
+        <header class="block-head">
+          <span class="pane-label">TRADE HISTORY</span>
+          <span class="pane-meta">last 50</span>
+        </header>
+        <div id="today-trades" class="block-table"></div>
+      </section>
+    </div>
+  </section>
+
+  <!-- ─── ROUTE: PERFORMANCE ────────────────────────────────────── -->
+  <section class="route route-page" id="route-performance" hidden>
+    <div class="page-head">
+      <h1 class="page-title">PERFORMANCE</h1>
+      <span class="page-meta" id="perf-meta">cross-variant comparison</span>
+      <div class="page-controls">
+        <span class="select-label">PERIOD</span>
+        <div class="seg-control" id="perf-period">
+          <button class="seg-btn active" data-period="D">DAILY</button>
+          <button class="seg-btn"        data-period="W">WEEKLY</button>
+          <button class="seg-btn"        data-period="ME">MONTHLY</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="variant-filter" id="perf-variants"></div>
+
+    <section class="page-block">
+      <header class="block-head"><span class="pane-label">EQUITY CURVES</span></header>
+      <div id="perf-equity-chart" class="block-chart"></div>
+    </section>
+
+    <section class="page-block">
+      <header class="block-head"><span class="pane-label">PERIOD RETURNS (%)</span></header>
+      <div id="perf-returns-chart" class="block-chart"></div>
+    </section>
+
+    <section class="page-block">
+      <header class="block-head"><span class="pane-label">DRAWDOWN (%)</span></header>
+      <div id="perf-drawdown-chart" class="block-chart"></div>
+    </section>
+
+    <section class="page-block">
+      <header class="block-head"><span class="pane-label">TRADE ACTIVITY</span></header>
+      <div id="perf-activity-chart" class="block-chart"></div>
+    </section>
+  </section>
+
+  <!-- ─── ROUTE: REVIEWS ────────────────────────────────────────── -->
+  <section class="route route-page" id="route-reviews" hidden>
+    <div class="page-head">
+      <h1 class="page-title">REVIEWS</h1>
+      <span class="page-meta" id="reviews-meta">daily and weekly post-mortems</span>
+      <div class="page-controls">
+        <div class="seg-control" id="reviews-mode">
+          <button class="seg-btn active" data-mode="daily">DAILY</button>
+          <button class="seg-btn"        data-mode="weekly">WEEKLY</button>
+        </div>
+        <input type="date" id="reviews-date" class="date-input" />
+        <label class="dryrun-toggle">
+          <input type="checkbox" id="reviews-dry" />
+          <span>incl. dry-run</span>
+        </label>
+      </div>
+    </div>
+
+    <div class="reviews-grid">
+      <aside class="reviews-side">
+        <header class="block-head"><span class="pane-label">VARIANTS</span></header>
+        <div id="reviews-variants" class="reviews-variant-list"></div>
+        <header class="block-head"><span class="pane-label">FILES</span></header>
+        <div id="reviews-files" class="reviews-file-list"></div>
+      </aside>
+      <section class="reviews-content">
+        <div id="reviews-summary" class="reviews-summary"></div>
+        <div id="reviews-chart"   class="reviews-chart"></div>
+        <article id="reviews-md"  class="reviews-markdown">
+          <div class="tb-empty">— pick a date and a file to read —</div>
+        </article>
+      </section>
+    </div>
+  </section>
+
+  <!-- ─── ROUTE: PORTFOLIO RISK ─────────────────────────────────── -->
+  <section class="route route-page" id="route-portfolio" hidden>
+    <div class="page-head">
+      <h1 class="page-title">PORTFOLIO RISK</h1>
+      <span class="page-meta" id="risk-meta">cross-strategy diagnostics</span>
+    </div>
+
+    <section class="page-block">
+      <header class="block-head">
+        <span class="pane-label">DAILY-RETURN CORRELATION</span>
+        <span class="pane-meta" id="risk-corr-meta">last 60d</span>
+      </header>
+      <div id="risk-corr-table" class="block-table"></div>
+    </section>
+
+    <section class="page-block">
+      <header class="block-head">
+        <span class="pane-label">TRADE OUTCOMES (LAST 90D)</span>
+        <span class="pane-meta" id="risk-outcomes-meta"></span>
+      </header>
+      <div id="risk-outcomes" class="block-table"></div>
+    </section>
+
+    <section class="page-block">
+      <header class="block-head">
+        <span class="pane-label">LLM COST (DAILY)</span>
+        <span class="pane-meta" id="risk-cost-meta"></span>
+      </header>
+      <div id="risk-cost-chart" class="block-chart"></div>
+      <div id="risk-cost-table" class="block-table"></div>
+    </section>
+  </section>
+
+  <!-- ─── ROUTE: PROPOSALS ──────────────────────────────────────── -->
+  <section class="route route-page" id="route-proposals" hidden>
+    <div class="page-head">
+      <h1 class="page-title">PROPOSALS</h1>
+      <span class="page-meta" id="prop-meta">weekly improvement queue</span>
+      <div class="page-controls">
+        <div class="seg-control" id="prop-status">
+          <button class="seg-btn active" data-status="open">OPEN</button>
+          <button class="seg-btn active" data-status="accepted">ACCEPTED</button>
+          <button class="seg-btn"        data-status="tested">TESTED</button>
+          <button class="seg-btn"        data-status="rejected">REJECTED</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="kpi-row" id="prop-kpi"></div>
+    <div id="prop-list" class="proposals-list"></div>
+  </section>
+
+  <!-- ─── ROUTE: IDEAS ──────────────────────────────────────────── -->
+  <section class="route route-page" id="route-ideas" hidden>
+    <div class="page-head">
+      <h1 class="page-title">IDEAS</h1>
+      <span class="page-meta">weekly novelty digest + raw chat corpus</span>
+      <div class="page-controls">
+        <div class="seg-control" id="ideas-mode">
+          <button class="seg-btn active" data-mode="digest">DIGEST</button>
+          <button class="seg-btn"        data-mode="corpus">CORPUS</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="ideas-digest" class="ideas-pane">
+      <aside class="ideas-side">
+        <header class="block-head"><span class="pane-label">WEEKS</span></header>
+        <ul id="ideas-digest-list" class="ideas-week-list"></ul>
+      </aside>
+      <article id="ideas-digest-content" class="reviews-markdown">
+        <div class="tb-empty">— pick a week —</div>
+      </article>
+    </div>
+
+    <div id="ideas-corpus" class="ideas-pane" hidden>
+      <div class="corpus-controls">
+        <input id="corpus-q"      class="text-input" type="text" placeholder="search text" />
+        <input id="corpus-author" class="text-input" type="text" placeholder="author" />
+        <label class="num-input">days
+          <input id="corpus-days" type="number" min="1" max="365" value="30" />
+        </label>
+        <label class="num-input">limit
+          <input id="corpus-limit" type="number" min="50" max="5000" value="500" step="50" />
+        </label>
+        <button id="corpus-search-btn" class="chip-btn active">
+          <span class="chip-glyph">⚲</span><span class="chip-label">SEARCH</span>
+        </button>
+      </div>
+      <div id="corpus-meta" class="corpus-meta"></div>
+      <div id="corpus-results" class="block-table"></div>
+    </div>
+  </section>
+
+  <script src="/static/chart.js"></script>
+</body>
+</html>

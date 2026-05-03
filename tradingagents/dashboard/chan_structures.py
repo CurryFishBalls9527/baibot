@@ -37,13 +37,27 @@ def extract_chan_structures(
     begin: str,
     end: str,
     db_path: str,
+    config_overrides: dict | None = None,
 ) -> dict:
     """Run Chan analysis and return structures as plain dicts for Plotly.
 
     Returns dict with keys: bi_list, seg_list, zs_list, bsp_list.
+
+    ``config_overrides`` lets callers tweak the chan config (e.g. switch
+    to ``zs_algo='over_seg'`` for more aggressive ZS detection on the web
+    view without changing the existing dashboard's defaults).
     """
     DuckDBIntradayAPI.DB_PATH = db_path
-    chan_cfg = CChanConfig(_DEFAULT_CHAN_CFG)
+    # CChanConfig mutates (empties) the dict it's given in-place — verified
+    # 2026-05-03 against chan.py vendored at third_party/chan.py. Without a
+    # copy here, any process that calls this function twice gets an
+    # AssertionError on the second call (`assert self.conf.trigger_step`
+    # fires because trigger_step has been popped). Pass a deep copy.
+    import copy as _copy
+    cfg = _copy.deepcopy(_DEFAULT_CHAN_CFG)
+    if config_overrides:
+        cfg.update(config_overrides)
+    chan_cfg = CChanConfig(cfg)
 
     chan = CChan(
         code=symbol,
