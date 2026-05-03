@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Weekly chat-novelty extractor. Saturday 10:00 CDT (= 11:00 ET, 1h
+  after weekly_review job fires at 10:00 ET to give it headroom).
+  Reads chat_corpus.duckdb for last 7 days, calls gpt-5.4 with the
+  project memory file as context, writes digest to
+  results/chat_novelty/<isoweek>.md.
+
+  Cost ~$0.30-1 per run. Useful as the project's "did we miss any
+  research ideas this week" passive scanner.
+
+  Install:
+    cp scripts/launchd/com.baibot.chat_novelty_extractor.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.baibot.chat_novelty_extractor.plist
+
+  Force run NOW:
+    launchctl kickstart gui/$UID/com.baibot.chat_novelty_extractor
+
+  Watch:
+    tail -f /Users/myu/code/baibot/results/telegram/novelty.{out,err}.log
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.baibot.chat_novelty_extractor</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/myu/code/baibot/scripts/launchd_wrappers/chat_novelty_extractor_run.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/myu/code/baibot</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+  </dict>
+
+  <key>StartCalendarInterval</key>
+  <array>
+    <!-- Saturday 10:00 CDT (= 11:00 ET) -->
+    <dict><key>Weekday</key><integer>6</integer><key>Hour</key><integer>10</integer><key>Minute</key><integer>0</integer></dict>
+  </array>
+
+  <key>RunAtLoad</key>
+  <false/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/myu/code/baibot/results/telegram/novelty.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/myu/code/baibot/results/telegram/novelty.err.log</string>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>

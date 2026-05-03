@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Persistent Telegram User-API listener. Lurks in groups configured via
+  CHAN_CHAT_IDS in .env, writes new messages to research_data/chat_corpus.duckdb.
+
+  KeepAlive: launchd restarts on crash (network drop, telegram disconnect,
+  unhandled exception). ThrottleInterval prevents tight crash loops.
+
+  Install (after one-time auth via scripts/telegram_auth_setup.py):
+    cp scripts/launchd/com.baibot.telegram_listener.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.baibot.telegram_listener.plist
+
+  Watch:
+    tail -f /Users/myu/code/baibot/results/telegram/listener.{out,err}.log
+
+  Stop temporarily:
+    launchctl unload ~/Library/LaunchAgents/com.baibot.telegram_listener.plist
+
+  Force restart (after editing wrapper or .env):
+    launchctl kickstart -k gui/$UID/com.baibot.telegram_listener
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.baibot.telegram_listener</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/myu/code/baibot/scripts/launchd_wrappers/telegram_listener_run.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/myu/code/baibot</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+
+  <key>StandardOutPath</key>
+  <string>/Users/myu/code/baibot/results/telegram/listener.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/myu/code/baibot/results/telegram/listener.err.log</string>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>
