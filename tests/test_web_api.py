@@ -54,7 +54,6 @@ def _is_midnight_utc(unix_ts: int) -> bool:
     "/api/risk/patterns",
     "/api/risk/llm_cost",
     "/api/risk/outcomes",
-    "/api/reviews/overview",
     "/api/proposals",
     "/api/log/tail",
 ])
@@ -257,18 +256,6 @@ def test_risk_rolling_corr_pair(web_server):
              f"/api/risk/rolling_corr?a={variants[0]}&b={variants[1]}&window=5").json()
     assert r["a"] == variants[0] and r["b"] == variants[1]
     assert "points" in r
-
-
-# ── Reviews overview (parity-build addition) ────────────────────────
-
-
-def test_reviews_overview_schema(web_server):
-    r = _get(web_server, "/api/reviews/overview").json()
-    assert {"cards", "totals", "normalized"} <= set(r)
-    for c in r["cards"]:
-        assert {"variant", "equity", "daily_pl", "trades_closed",
-                "wins", "losses"} <= set(c)
-    assert {"equity", "daily_pl", "trades_closed", "wins", "losses"} <= set(r["totals"])
 
 
 # ── Service status pill ──────────────────────────────────────────────

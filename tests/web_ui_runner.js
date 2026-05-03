@@ -224,18 +224,7 @@ async function main() {
       if (present === true) throw new Error('IDEAS tab still in nav');
     });
 
-    // ── 9. Reviews top overview cards render (parity feature) ──────
-    await test('reviews_overview_cards_present', async () => {
-      await ev('window.location.hash = "reviews"');
-      await new Promise(r => setTimeout(r, 1500));
-      const n = await ev('document.querySelectorAll("#reviews-overview .reviews-card").length');
-      const totals = await ev('document.querySelectorAll("#reviews-totals .rt-cell").length');
-      if (typeof n !== 'number' || n < 1) throw new Error(`reviews-overview cards: ${n}`);
-      if (totals !== 4) throw new Error(`reviews-totals cells: ${totals} (want 4)`);
-      return `${n} cards, ${totals} totals`;
-    });
-
-    // ── 10. Risk page sections render (parity feature, no errors) ──
+    // ── 9. Risk page sections render (parity feature, no errors) ──
     await test('risk_page_renders_all_sections', async () => {
       const exBefore = exceptions.length;
       await ev('window.location.hash = "portfolio"');

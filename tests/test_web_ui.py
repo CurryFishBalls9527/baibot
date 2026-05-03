@@ -132,7 +132,6 @@ def _result(ui_results, name: str) -> dict:
     "variant_change_refreshes_today",
     "daily_review_not_truncated",
     "ideas_tab_hidden_from_nav",
-    "reviews_overview_cards_present",
     "risk_page_renders_all_sections",
     "ai_synthesis_does_not_auto_fire",          # cost-protection guard
     "performance_renders_four_charts",

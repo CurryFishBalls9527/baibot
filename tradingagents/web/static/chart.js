@@ -800,83 +800,7 @@ async function renderReviewsPage() {
     document.getElementById('reviews-date').value = _reviews.date;
     _reviews.inited = true;
   }
-  // Top overview (cross-variant cards + totals + 30d normalized strip)
-  loadReviewsOverview();
   await loadReviewsListing();
-}
-
-let _reviewsNormChart = null, _reviewsNormSeries = [];
-async function loadReviewsOverview() {
-  let data;
-  try {
-    const res = await fetch('/api/reviews/overview');
-    data = await res.json();
-  } catch { return; }
-
-  // Cards
-  const cardsHtml = (data.cards || []).map(c => {
-    const equity = c.equity != null ? `$${Math.round(c.equity).toLocaleString()}` : '—';
-    const pl = c.daily_pl;
-    const plPct = c.daily_pl_pct;
-    const plCls = (pl ?? 0) >= 0 ? 'pos' : 'neg';
-    const plLine = pl != null
-      ? `${pl >= 0 ? '+' : ''}${Math.round(pl).toLocaleString()}` +
-        (plPct != null ? ` (${(plPct * 100).toFixed(2)}%)` : '')
-      : '—';
-    const closed = c.trades_closed || 0;
-    const wl = closed
-      ? `<b>${closed}</b> closed today · <span class="pos">${c.wins}W</span> / <span class="neg">${c.losses}L</span>`
-      : `<span class="rc-meta">No trades closed today</span>`;
-    const avgRet = c.avg_return != null ? `${(c.avg_return * 100).toFixed(2)}%` : '—';
-    const mfeCap = c.mfe_capture != null ? c.mfe_capture.toFixed(2) : '—';
-    const metrics = closed
-      ? `avg ${avgRet} · MFE capture ${mfeCap}`
-      : '<span class="rc-meta">(reviews fire on exits)</span>';
-    return `<div class="reviews-card">
-      <div class="rc-name">${escapeHtml(c.variant)}</div>
-      <div class="rc-equity">${equity}</div>
-      <div class="rc-pl ${plCls}">${escapeHtml(plLine)}</div>
-      <div class="rc-line">${wl}</div>
-      <div class="rc-meta">${metrics}</div>
-    </div>`;
-  }).join('');
-  document.getElementById('reviews-overview').innerHTML = cardsHtml;
-
-  // Totals row
-  const t = data.totals || {};
-  document.getElementById('reviews-totals').innerHTML = `
-    <div class="rt-cell"><div class="rt-label">TOTAL EQUITY</div><div class="rt-value">$${Math.round(t.equity || 0).toLocaleString()}</div></div>
-    <div class="rt-cell"><div class="rt-label">TODAY P&amp;L</div><div class="rt-value ${(t.daily_pl || 0) >= 0 ? 'pos' : 'neg'}">${(t.daily_pl || 0) >= 0 ? '+' : ''}${Math.round(t.daily_pl || 0).toLocaleString()}</div></div>
-    <div class="rt-cell"><div class="rt-label">TRADES CLOSED</div><div class="rt-value">${t.trades_closed || 0}</div></div>
-    <div class="rt-cell"><div class="rt-label">W / L</div><div class="rt-value">${t.wins || 0} / ${t.losses || 0}</div></div>`;
-
-  // 30d normalized equity strip
-  if (!_reviewsNormChart) {
-    _reviewsNormChart = LightweightCharts.createChart(document.getElementById('reviews-norm-chart'), {
-      layout: { background: { color: '#111114' }, textColor: '#9aa5b1', fontFamily: 'JetBrains Mono, monospace' },
-      grid:   { vertLines: { color: '#1a2230' }, horzLines: { color: '#1a2230' } },
-      rightPriceScale: { borderColor: '#1f2937' },
-      timeScale: { borderColor: '#1f2937', timeVisible: false },
-      autoSize: true,
-    });
-  }
-  for (const s of _reviewsNormSeries) {
-    try { _reviewsNormChart.removeSeries(s); } catch {}
-  }
-  _reviewsNormSeries = [];
-  for (const [name, points] of Object.entries(data.normalized || {})) {
-    const series = _reviewsNormChart.addLineSeries({
-      color: _PERF_COLORS[name] || '#9ca3af',
-      lineWidth: 2, title: name,
-      priceLineVisible: false, lastValueVisible: false,
-    });
-    series.setData(
-      points.map(p => ({ time: dateToUnix(p.date), value: Number(p.equity_norm) }))
-            .filter(p => !isNaN(p.value))
-    );
-    _reviewsNormSeries.push(series);
-  }
-  _reviewsNormChart.timeScale().fitContent();
 }
 
 function wireReviewsControls() {
@@ -942,7 +866,11 @@ function _firstReviewFile() {
   if (_reviews.mode === 'daily') {
     const slot = (_reviews.payload?.by_variant || {})[_reviews.selectedVariant];
     if (!slot) return null;
-    return slot.summary || slot.closed[0] || slot.held[0] || null;
+    // Prefer a per-trade review so the chart appears immediately. The
+    // summary file aggregates multiple trades and has no chart_payload,
+    // so auto-selecting it leaves the chart pane empty (which has been
+    // confusing — users assumed the chart was broken).
+    return (slot.closed && slot.closed[0]) || (slot.held && slot.held[0]) || slot.summary || null;
   }
   return _reviews.selectedVariant;
 }
