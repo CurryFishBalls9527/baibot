@@ -452,6 +452,51 @@ def daily_reviews(review_date: str, include_dry_run: bool = False) -> dict:
     return {"directory": str(base), "exists": True, "by_variant": by_variant}
 
 
+def _resolve_review_trade(
+    review_date: str, name: str,
+) -> Optional[tuple]:
+    """Map a daily-review filename to (variant_dict, trade_id).
+
+    Filename pattern: ``{variant_name}_{symbol}.md`` for closed reviews,
+    ``{variant_name}_{symbol}_HELD.md`` for held-position health checks.
+    The matching trade is the SELL on the review date (closed) or the
+    most-recent BUY on/before that date (held). Returns None if the
+    name doesn't match a known variant or no trade exists.
+    """
+    is_held = name.endswith("_HELD")
+    stem = name[: -len("_HELD")] if is_held else name
+    # Longest-prefix match — must come before "chan", "mechanical".
+    for v in _discover_variants():
+        prefix = f"{v['name']}_"
+        if not stem.startswith(prefix):
+            continue
+        symbol = stem[len(prefix):]
+        try:
+            db = TradingDatabase(v["db_path"])
+            if is_held:
+                # Most recent BUY on/before review_date — the held position.
+                row = db.conn.execute(
+                    "SELECT id FROM trades WHERE symbol = ? "
+                    "AND LOWER(side) = 'buy' AND timestamp <= ? "
+                    "ORDER BY timestamp DESC LIMIT 1",
+                    [symbol, review_date + "T23:59:59Z"],
+                ).fetchone()
+            else:
+                # SELL on the review date (string-prefix match works for
+                # both space-separated and ISO-T timestamp formats).
+                row = db.conn.execute(
+                    "SELECT id FROM trades WHERE symbol = ? "
+                    "AND LOWER(side) = 'sell' AND timestamp LIKE ? "
+                    "ORDER BY timestamp DESC LIMIT 1",
+                    [symbol, f"{review_date}%"],
+                ).fetchone()
+        except Exception:
+            row = None
+        if row:
+            return v, int(row["id"])
+    return None
+
+
 @app.get("/api/reviews/daily/{review_date}/file/{name}")
 def daily_review_file(review_date: str, name: str, include_dry_run: bool = False) -> dict:
     base = Path("results/daily_reviews") / review_date
@@ -460,14 +505,36 @@ def daily_review_file(review_date: str, name: str, include_dry_run: bool = False
     target = base / f"{name}.md"
     if not target.exists() or target.parent != base:
         raise HTTPException(404, f"file {name!r} not found")
+
     chart_html = None
     chart_path = base / "charts" / f"{name}.html"
     if chart_path.exists():
         chart_html = chart_path.read_text(encoding="utf-8")
+
+    # Build a chart_payload via the same overlay pipeline the TRADE tab
+    # uses, so the reviews chart looks/behaves identically. Falls back
+    # to chart_html if the trade can't be located.
+    chart_payload = None
+    resolved = _resolve_review_trade(review_date, name)
+    if resolved is not None:
+        v, trade_id = resolved
+        try:
+            db = TradingDatabase(v["db_path"])
+            chart_payload = overlays.build_for(
+                strategy_type=v["strategy_type"], db=db, trade_id=trade_id,
+                variant_config={
+                    "name": v["name"], "strategy_type": v["strategy_type"],
+                    **v["config_overrides"],
+                },
+            )
+        except Exception:
+            chart_payload = None
+
     return {
         "name": name,
         "content": target.read_text(encoding="utf-8"),
         "chart_html": chart_html,
+        "chart_payload": chart_payload,
     }
 
 

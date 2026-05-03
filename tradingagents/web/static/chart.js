@@ -1038,10 +1038,15 @@ function renderReviewContent(data) {
   document.getElementById('reviews-md').innerHTML = renderMarkdown(md);
   document.getElementById('reviews-summary').innerHTML = '';
 
-  // Embedded chart for daily reviews — chart_html is a full plotly HTML doc
-  const chartHost = document.getElementById('reviews-chart');
-  chartHost.innerHTML = '';
-  if (data.chart_html) {
+  // Embedded chart — prefer the lightweight-charts payload (same
+  // pipeline as the TRADE tab); fall back to the legacy Plotly iframe
+  // only if the backend couldn't resolve the trade.
+  if (data.chart_payload) {
+    renderReviewLightweightChart(data.chart_payload);
+  } else if (data.chart_html) {
+    _teardownReviewLightweightChart();
+    const chartHost = document.getElementById('reviews-chart');
+    chartHost.innerHTML = '';
     const iframe = document.createElement('iframe');
     iframe.style.width = '100%';
     iframe.style.height = '600px';
@@ -1049,13 +1054,122 @@ function renderReviewContent(data) {
     iframe.style.background = '#0a0a0d';
     iframe.srcdoc = data.chart_html;
     chartHost.appendChild(iframe);
+  } else {
+    _teardownReviewLightweightChart();
+    document.getElementById('reviews-chart').innerHTML = '';
   }
+}
+
+// Reviews-tab chart instance — kept separate from the TRADE tab's
+// state.chart so navigating between routes doesn't clobber either.
+const _reviewsChart = {
+  chart: null,
+  candleSeries: null,
+  overlaySeries: [],
+  fillPriceLines: [],
+};
+
+function _teardownReviewLightweightChart() {
+  if (!_reviewsChart.chart) return;
+  for (const pl of _reviewsChart.fillPriceLines) {
+    try { _reviewsChart.candleSeries.removePriceLine(pl); } catch {}
+  }
+  _reviewsChart.fillPriceLines = [];
+  for (const s of _reviewsChart.overlaySeries) {
+    try { _reviewsChart.chart.removeSeries(s); } catch {}
+  }
+  _reviewsChart.overlaySeries = [];
+  try { _reviewsChart.chart.remove(); } catch {}
+  _reviewsChart.chart = null;
+  _reviewsChart.candleSeries = null;
+}
+
+function renderReviewLightweightChart(payload) {
+  const host = document.getElementById('reviews-chart');
+  // Lazy-create on first render. We tear down + re-create on each file
+  // selection so the price-scale auto-fit picks up the new symbol's
+  // range cleanly (same reasoning as the trade-page autoScale toggle).
+  _teardownReviewLightweightChart();
+  host.innerHTML =
+    '<div id="reviews-chart-canvas" class="reviews-chart-canvas"></div>';
+  const el = document.getElementById('reviews-chart-canvas');
+  _reviewsChart.chart = LightweightCharts.createChart(el, {
+    layout: {
+      background: { color: '#0a0e14' }, textColor: '#9ca3af',
+      fontFamily: 'IBM Plex Mono, Menlo, monospace',
+    },
+    grid: { vertLines: { color: '#1a2230' }, horzLines: { color: '#1a2230' } },
+    crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+    rightPriceScale: { borderColor: '#1f2937' },
+    timeScale: { borderColor: '#1f2937', timeVisible: true, secondsVisible: false },
+    autoSize: true,
+  });
+  _reviewsChart.candleSeries = _reviewsChart.chart.addCandlestickSeries({
+    upColor: '#26a69a', downColor: '#ef5350',
+    borderUpColor: '#26a69a', borderDownColor: '#ef5350',
+    wickUpColor: '#26a69a', wickDownColor: '#ef5350',
+  });
+  // Bars
+  _reviewsChart.candleSeries.setData((payload.bars || []).map(b => ({
+    time: b.time, open: b.open, high: b.high, low: b.low, close: b.close,
+  })));
+  // Overlays — reuse the same vocabulary as the TRADE chart, but map
+  // 'zone' onto a horizontal price-band-style level pair (no DOM-rect
+  // fancy stuff — keeps this chart self-contained).
+  for (const o of payload.overlays || []) {
+    if (o.kind === 'line') {
+      const s = _reviewsChart.chart.addLineSeries({
+        color: o.color || '#9ca3af',
+        lineWidth: o.width || 1,
+        lineStyle: o.style === 'dashed' ? 2 : (o.style === 'dotted' ? 3 : 0),
+        priceLineVisible: false, lastValueVisible: false,
+      });
+      s.setData([{ time: o.from_t, value: o.from_p },
+                 { time: o.to_t,   value: o.to_p }]);
+      _reviewsChart.overlaySeries.push(s);
+    } else if (o.kind === 'level') {
+      const pl = _reviewsChart.candleSeries.createPriceLine({
+        price: o.price, color: o.color || '#9aa5b1',
+        lineWidth: 1, lineStyle: o.style === 'dashed' ? 2 : (o.style === 'dotted' ? 3 : 0),
+        axisLabelVisible: true, title: o.label || '',
+      });
+      _reviewsChart.fillPriceLines.push(pl);
+    } else if (o.kind === 'ma') {
+      const s = _reviewsChart.chart.addLineSeries({
+        color: o.color || '#9ca3af', lineWidth: 1,
+        priceLineVisible: false, lastValueVisible: false, title: o.label,
+      });
+      s.setData((o.values || []).map(([t, v]) => ({ time: t, value: v })));
+      _reviewsChart.overlaySeries.push(s);
+    }
+    // 'zone' / 'band' / 'marker' — markers are surfaced via setMarkers below.
+  }
+  // Markers (BSPs from chan + entry/exit fills)
+  const bspMarkers = (payload.overlays || [])
+    .filter(o => o.kind === 'marker').map(markerToSeries);
+  const fillMarkers = _buildFillMarkers(payload.fills);
+  _reviewsChart.candleSeries.setMarkers(
+    [...bspMarkers, ...fillMarkers].sort((a, b) => a.time - b.time),
+  );
+  // Fill price lines (entry + exits) — same look as the TRADE tab
+  for (const f of payload.fills || []) {
+    const pl = _reviewsChart.candleSeries.createPriceLine({
+      price: Number(f.price),
+      color: f.side === 'buy' ? '#10b981' : '#ef4444',
+      lineWidth: 1, lineStyle: 2,
+      axisLabelVisible: true,
+      title: f.side === 'buy' ? 'BUY' : 'SELL',
+    });
+    _reviewsChart.fillPriceLines.push(pl);
+  }
+  _reviewsChart.chart.timeScale().fitContent();
 }
 
 function clearReviewContent() {
   document.getElementById('reviews-md').innerHTML =
     '<div class="tb-empty">— pick a date and a file to read —</div>';
   document.getElementById('reviews-summary').innerHTML = '';
+  _teardownReviewLightweightChart();
   document.getElementById('reviews-chart').innerHTML = '';
 }
 

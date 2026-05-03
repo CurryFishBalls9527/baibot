@@ -359,6 +359,39 @@ def test_closed_trade_has_return_metric(web_server):
     )
 
 
+# ── Daily review chart payload (parity with TRADE-tab chart) ────────
+
+
+def test_daily_review_file_includes_chart_payload(web_server):
+    """Daily-review file endpoint should include a `chart_payload` so
+    the frontend can render the same lightweight-charts visualization
+    as the TRADE tab — not the legacy Plotly iframe."""
+    # Walk recent dates until we find a directory with reviews.
+    from datetime import date as _date, timedelta as _td
+    base_url = web_server
+    for offset in range(0, 14):
+        d = (_date.today() - _td(days=offset)).isoformat()
+        listing = _get(base_url, f"/api/reviews/daily/{d}").json()
+        if listing.get("exists") and listing.get("by_variant"):
+            for variant, slot in listing["by_variant"].items():
+                files = (slot.get("closed") or []) + (slot.get("held") or [])
+                for fname in files:
+                    payload = _get(base_url, f"/api/reviews/daily/{d}/file/{fname}").json()
+                    if payload.get("chart_payload"):
+                        cp = payload["chart_payload"]
+                        assert "bars" in cp and "fills" in cp, (
+                            f"chart_payload malformed for {d}/{fname}: {list(cp.keys())}"
+                        )
+                        # Closed reviews should have ≥2 fills (entry + ≥1 exit)
+                        if not fname.endswith("_HELD"):
+                            sides = {(f["side"] or "").lower() for f in cp["fills"]}
+                            assert "buy" in sides, (
+                                f"closed review {fname} missing BUY in fills"
+                            )
+                        return  # success
+    pytest.skip("no daily reviews found in last 14 days")
+
+
 # ── Path-traversal guards (defenses are silent — pin them down) ─────
 
 

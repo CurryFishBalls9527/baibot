@@ -324,7 +324,46 @@ async function main() {
       return `body=${body.length}c`;
     });
 
-    // ── 15. Closed-trade chart shows entry + exit price lines ─────
+    // ── 15. Daily review chart uses lightweight-charts (not iframe) ─
+    await test('daily_review_uses_lightweight_charts', async () => {
+      await ev('window.location.hash = "reviews"');
+      await new Promise(r => setTimeout(r, 1500));
+      // Walk recent dates until we find one with a per-trade closed review.
+      // Auto-select picks the variant summary which has no chart_payload;
+      // we need to click an entry from the "Closed" section explicitly.
+      const dates = ['2026-05-01', '2026-04-30', '2026-04-29', '2026-04-28', '2026-04-27'];
+      let clicked = false;
+      for (const d of dates) {
+        await ev(`(() => { const el=document.getElementById('reviews-date'); el.value='${d}'; el.dispatchEvent(new Event('change')); })()`);
+        await new Promise(r => setTimeout(r, 1500));
+        // Look for a non-summary, non-section <li> in the file list.
+        const ok = await ev(`(() => {
+          const items = Array.from(document.querySelectorAll('#reviews-files li'));
+          // Skip section headers (.rfl-section) and summary entries
+          // (the dataset.kind === 'summary'). Click the first 'closed' file.
+          const closed = items.find(el =>
+            el.dataset.kind === 'closed' && !el.classList.contains('rfl-section')
+          );
+          if (closed) { closed.click(); return true; }
+          return false;
+        })()`);
+        if (ok) { clicked = true; break; }
+      }
+      if (!clicked) return 'skipped — no closed daily reviews on disk for recent dates';
+      await new Promise(r => setTimeout(r, 2000));  // Give chart_payload fetch + render time
+      const dims = await ev(`(() => {
+        const canvas = document.querySelectorAll('#reviews-chart-canvas canvas').length;
+        const iframe = document.querySelectorAll('#reviews-chart iframe').length;
+        return JSON.stringify({ canvas, iframe });
+      })()`);
+      const r = JSON.parse(dims);
+      if (r.canvas < 1) throw new Error(`no lightweight-charts canvas (canvas=${r.canvas} iframe=${r.iframe})`);
+      const lines = await ev('_reviewsChart.fillPriceLines.length');
+      if (typeof lines !== 'number' || lines < 1) throw new Error(`no fill price lines on review chart: ${lines}`);
+      return `canvas=${r.canvas} fillPriceLines=${lines}`;
+    });
+
+    // ── 16. Closed-trade chart shows entry + exit price lines ─────
     //    Pin the "clicking SELL renders both buy + sell" + price-line
     //    visualization improvement.
     await test('closed_trade_shows_entry_and_exit_price_lines', async () => {
@@ -356,7 +395,7 @@ async function main() {
       return `lines=${lines} buys=${buySides} sells=${sellSides}`;
     });
 
-    // ── 16. No JS exceptions during whole session ─────────────────
+    // ── 17. No JS exceptions during whole session ─────────────────
     await test('no_js_exceptions_during_session', async () => {
       if (exceptions.length) throw new Error('JS exceptions accumulated: ' + exceptions.join(' | '));
     });
