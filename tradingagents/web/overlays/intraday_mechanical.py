@@ -34,6 +34,7 @@ import pandas as pd
 from tradingagents.storage.database import TradingDatabase
 
 from ..bars import _to_unix, fetch_15m
+from ._trade_lookup import find_entry_id, list_cycle_exits, trade_summary
 from .base import (
     Bar,
     ChartPayload,
@@ -65,20 +66,6 @@ def _trade_with_signal(db: TradingDatabase, trade_id: int) -> Optional[dict]:
         [trade_id],
     ).fetchall()
     return dict(rows[0]) if rows else None
-
-
-def _exit_fills(db: TradingDatabase, symbol: str, entry_ts: str) -> List[dict]:
-    rows = db.conn.execute(
-        """
-        SELECT timestamp, side, filled_qty, filled_price, reasoning
-        FROM trades
-        WHERE symbol = ? AND LOWER(side) = 'sell' AND timestamp > ?
-        ORDER BY timestamp ASC
-        LIMIT 1
-        """,
-        [symbol, entry_ts],
-    ).fetchall()
-    return [dict(r) for r in rows]
 
 
 def _build_overlays(meta: dict, bars: List[Bar]) -> List[dict]:
@@ -178,12 +165,15 @@ def _build_overlays(meta: dict, bars: List[Bar]) -> List[dict]:
     return overlays
 
 
-def _build_reasoning(trade_row: dict, meta: dict) -> Reasoning:
+def _build_reasoning(trade_row: dict, meta: dict, summary: dict) -> Reasoning:
     family = meta.get("setup_family", "?")
     vol_ratio = meta.get("volume_ratio")
     breakout_pct = meta.get("breakout_distance_pct")
 
-    headline = f"{family} BUY on {trade_row['symbol']}"
+    if summary.get("is_closed") and summary.get("return_pct") is not None:
+        headline = f"{family} · Closed {summary['return_pct']*100:+.2f}% on {trade_row['symbol']}"
+    else:
+        headline = f"{family} BUY on {trade_row['symbol']}"
 
     metrics: List[Metric] = [
         {"label": "Setup family",   "value": family},
@@ -195,6 +185,14 @@ def _build_reasoning(trade_row: dict, meta: dict) -> Reasoning:
         {"label": "D-1 high",       "value": f"{meta.get('prior_session_high'):.2f}" if meta.get("prior_session_high") else "—"},
         {"label": "Stop pct",       "value": f"{trade_row.get('stop_loss') or 0:.2%}"},
     ]
+    if summary.get("is_closed"):
+        metrics.extend([
+            {"label": "Entry price",  "value": f"{float(trade_row['filled_price']):.2f}" if trade_row.get('filled_price') else "—"},
+            {"label": "Exit price",   "value": f"{summary['exit_price']:.2f}" if summary.get('exit_price') else "—"},
+            {"label": "Return %",     "value": f"{summary['return_pct']*100:+.2f}%" if summary.get("return_pct") is not None else "—"},
+            {"label": "Held",         "value": summary.get("held_str") or "—"},
+            {"label": "Exit reason",  "value": summary.get("exit_reason") or "—"},
+        ])
 
     criteria: List[Criterion] = [
         {"name": "Min volume ratio (≥1.3 NR4 / ≥1.5 default)",
@@ -227,7 +225,8 @@ def build_chart(
     trade_id: int,
     variant_config: dict,
 ) -> ChartPayload:
-    row = _trade_with_signal(db, trade_id)
+    entry_id = find_entry_id(db, trade_id) or trade_id
+    row = _trade_with_signal(db, entry_id)
     if row is None:
         return ChartPayload(
             symbol="?", variant=variant_config.get("name", "?"),
@@ -255,16 +254,17 @@ def build_chart(
         pivot_ts=str(row["trade_ts"]),
     )
 
+    exits = list_cycle_exits(db, symbol, str(row["trade_ts"]))
     fills: List[Fill] = []
     if row.get("filled_price"):
         fills.append(Fill(
             time=_to_unix(row["trade_ts"]),
             price=float(row["filled_price"]),
-            side="buy" if str(row.get("side", "")).lower() == "buy" else "sell",
+            side="buy",
             qty=float(row.get("filled_qty") or row.get("qty") or 0),
             reasoning=row.get("trade_reasoning"),
         ))
-    for ex in _exit_fills(db, symbol, str(row["trade_ts"])):
+    for ex in exits:
         if ex.get("filled_price"):
             fills.append(Fill(
                 time=_to_unix(ex["timestamp"]),
@@ -274,6 +274,7 @@ def build_chart(
                 reasoning=ex.get("reasoning"),
             ))
 
+    summary = trade_summary(row, exits)
     return ChartPayload(
         symbol=symbol,
         variant=variant_config.get("name", "?"),
@@ -282,6 +283,6 @@ def build_chart(
         bars=bars,
         overlays=_build_overlays(meta, bars),
         fills=fills,
-        reasoning=_build_reasoning(row, meta),
+        reasoning=_build_reasoning(row, meta, summary),
         error=None if bars else "no 15m bars in window — check intraday_15m.duckdb",
     )

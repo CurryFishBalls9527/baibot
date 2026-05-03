@@ -138,6 +138,7 @@ def _result(ui_results, name: str) -> dict:
     "performance_renders_four_charts",
     "escapeHtml_handles_non_strings",
     "log_page_renders_and_stops_on_leave",
+    "closed_trade_shows_entry_and_exit_price_lines",
     "no_js_exceptions_during_session",
 ])
 def test_ui_scenario(ui_results, scenario):

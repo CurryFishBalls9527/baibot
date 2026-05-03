@@ -291,6 +291,74 @@ def test_log_tail_returns_lines(web_server):
         assert len(r["lines"]) <= 5
 
 
+# ── Trade-cycle: clicking a SELL row resolves to the entry ──────────
+#   Bug: previously the SELL's reasoning panel showed empty meta (so all
+#   criteria rendered red ✗) and the chart only had the SELL marker, no
+#   entry. Fix: every overlay redirects to find_entry_id and rebuilds the
+#   chart from there.
+
+
+def _find_closed_buy_sell_pair(base: str) -> Optional[Dict]:
+    """Find a (variant, buy_id, sell_id) where the buy was followed by a
+    sell of the same symbol and the variant has an overlay extractor.
+    Returns dict with keys variant, buy_id, sell_id, symbol, or None."""
+    for v in _get(base, "/api/variants").json():
+        if v["strategy_type"] not in ("chan", "chan_v2", "chan_daily", "mechanical",
+                                       "llm", "intraday_mechanical", "pead", "pead_llm"):
+            continue
+        rows = _get(base, f"/api/variants/{v['name']}/trades?limit=200").json()
+        # Walk back: for each SELL, find a recent BUY of the same symbol.
+        sells = [r for r in rows if (r.get("side") or "").lower() == "sell"]
+        for s in sells:
+            sym = s["symbol"]
+            buys_before = [r for r in rows
+                           if (r.get("side") or "").lower() == "buy"
+                           and r["symbol"] == sym
+                           and str(r["timestamp"]) < str(s["timestamp"])]
+            if buys_before:
+                latest_buy = max(buys_before, key=lambda r: r["timestamp"])
+                return {"variant": v["name"], "buy_id": latest_buy["trade_id"],
+                        "sell_id": s["trade_id"], "symbol": sym,
+                        "strategy_type": v["strategy_type"]}
+    return None
+
+
+def test_clicking_sell_returns_same_chart_as_clicking_buy(web_server):
+    """Clicking the SELL trade row should show the entry's reasoning +
+    both buy + sell fills (same payload as clicking the BUY)."""
+    pair = _find_closed_buy_sell_pair(web_server)
+    if pair is None:
+        pytest.skip("no buy→sell pair on disk")
+    buy_chart = _get(web_server, f"/api/trade/{pair['variant']}/{pair['buy_id']}/chart").json()
+    sell_chart = _get(web_server, f"/api/trade/{pair['variant']}/{pair['sell_id']}/chart").json()
+    # Symbol identical
+    assert buy_chart["symbol"] == sell_chart["symbol"] == pair["symbol"]
+    # Both should have at least 2 fills (one buy, one sell)
+    sell_sides_buy = {(f["side"] or "").lower() for f in sell_chart.get("fills", [])}
+    sell_sides_sell = {(f["side"] or "").lower() for f in sell_chart.get("fills", [])}
+    assert "buy" in sell_sides_buy, (
+        f"clicking SELL didn't surface BUY fill (regression): {sell_chart.get('fills')}"
+    )
+    assert "sell" in sell_sides_sell
+    # Reasoning headline should reflect the closed trade ("Closed +X.XX%")
+    headline = sell_chart["reasoning"]["headline"]
+    assert "Closed" in headline or any(
+        c.get("passed") for c in sell_chart["reasoning"]["criteria"]
+    ), f"SELL-click rendered all-red criteria: {headline} criteria={[c['passed'] for c in sell_chart['reasoning']['criteria']]}"
+
+
+def test_closed_trade_has_return_metric(web_server):
+    """For a closed cycle the reasoning metrics include Return %."""
+    pair = _find_closed_buy_sell_pair(web_server)
+    if pair is None:
+        pytest.skip("no closed cycles")
+    chart = _get(web_server, f"/api/trade/{pair['variant']}/{pair['sell_id']}/chart").json()
+    labels = [m["label"] for m in chart["reasoning"]["metrics"]]
+    assert "Return %" in labels, (
+        f"closed-trade metrics missing Return %: {labels}"
+    )
+
+
 # ── Path-traversal guards (defenses are silent — pin them down) ─────
 
 

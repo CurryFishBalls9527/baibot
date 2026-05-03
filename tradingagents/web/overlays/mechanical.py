@@ -39,6 +39,7 @@ import pandas as pd
 from tradingagents.storage.database import TradingDatabase
 
 from ..bars import _to_unix_date, fetch_daily
+from ._trade_lookup import find_entry_id, list_cycle_exits, trade_summary
 from .base import (
     Bar,
     ChartPayload,
@@ -81,20 +82,6 @@ def _trade_with_signal(db: TradingDatabase, trade_id: int) -> Optional[dict]:
     return dict(rows[0]) if rows else None
 
 
-def _exit_fills(db: TradingDatabase, symbol: str, entry_ts: str) -> List[dict]:
-    rows = db.conn.execute(
-        """
-        SELECT timestamp, side, filled_qty, filled_price, reasoning
-        FROM trades
-        WHERE symbol = ? AND LOWER(side) = 'sell' AND timestamp > ?
-        ORDER BY timestamp ASC
-        LIMIT 1
-        """,
-        [symbol, entry_ts],
-    ).fetchall()
-    return [dict(r) for r in rows]
-
-
 # ── MA time series ───────────────────────────────────────────────────
 
 
@@ -134,7 +121,7 @@ def _fmt_num(v, places: int = 2) -> str:
     return f"{v:.{places}f}"
 
 
-def _build_reasoning(trade_row: dict, fa: dict) -> Reasoning:
+def _build_reasoning(trade_row: dict, fa: dict, summary: dict) -> Reasoning:
     sym       = trade_row["symbol"]
     close     = fa.get("close")
     pivot     = fa.get("pivot_price") or fa.get("buy_point")
@@ -158,12 +145,15 @@ def _build_reasoning(trade_row: dict, fa: dict) -> Reasoning:
     if isinstance(close, (int, float)) and isinstance(lo52, (int, float)) and lo52 > 0:
         dist_from_low = (close - lo52) / lo52
 
-    headline_kind = (
-        "Leader continuation" if fa.get("leader_continuation_actionable")
-        else "Watch · leader" if fa.get("leader_continuation_watch")
-        else "Breakout"        if fa.get("breakout_signal")
-        else "Setup"
-    )
+    if summary.get("is_closed") and summary.get("return_pct") is not None:
+        headline_kind = f"Closed {summary['return_pct']*100:+.2f}%"
+    else:
+        headline_kind = (
+            "Leader continuation" if fa.get("leader_continuation_actionable")
+            else "Watch · leader" if fa.get("leader_continuation_watch")
+            else "Breakout"        if fa.get("breakout_signal")
+            else "Setup"
+        )
     headline = f"{headline_kind} · {sym} @ {_fmt_num(close)}"
 
     criteria: List[Criterion] = [
@@ -206,6 +196,14 @@ def _build_reasoning(trade_row: dict, fa: dict) -> Reasoning:
         {"label": "Status",      "value": candidate},
         {"label": "Sector",      "value": fa.get("sector") or "—"},
     ]
+    if summary.get("is_closed"):
+        metrics.extend([
+            {"label": "Entry price",  "value": _fmt_num(trade_row.get('filled_price'))},
+            {"label": "Exit price",   "value": _fmt_num(summary.get('exit_price'))},
+            {"label": "Return %",     "value": _fmt_pct(summary.get('return_pct'))},
+            {"label": "Held",         "value": summary.get("held_str") or "—"},
+            {"label": "Exit reason",  "value": summary.get("exit_reason") or "—"},
+        ])
 
     narrative_lines = [trade_row.get("signal_reasoning") or trade_row.get("trade_reasoning") or ""]
     earnings_days = fa.get("earnings_days_away")
@@ -234,7 +232,8 @@ def build_chart(
     trade_id: int,
     variant_config: dict,
 ) -> ChartPayload:
-    row = _trade_with_signal(db, trade_id)
+    entry_id = find_entry_id(db, trade_id) or trade_id
+    row = _trade_with_signal(db, entry_id)
     if row is None:
         return ChartPayload(
             symbol="?", variant=variant_config.get("name", "?"),
@@ -309,17 +308,18 @@ def build_chart(
             if not dup:
                 overlays.append(ov)
 
-    # Fills
+    # Fills — entry + every SELL until the next BUY of this symbol
+    exits = list_cycle_exits(db, symbol, str(row["trade_ts"]))
     fills: List[Fill] = []
     if row.get("filled_price"):
         fills.append(Fill(
             time=_to_unix_date(row["trade_ts"]),
             price=float(row["filled_price"]),
-            side="buy" if str(row.get("side", "")).lower() == "buy" else "sell",
+            side="buy",
             qty=float(row.get("filled_qty") or row.get("qty") or 0),
             reasoning=row.get("trade_reasoning"),
         ))
-    for ex in _exit_fills(db, symbol, str(row["trade_ts"])):
+    for ex in exits:
         if ex.get("filled_price"):
             fills.append(Fill(
                 time=_to_unix_date(ex["timestamp"]),
@@ -329,6 +329,7 @@ def build_chart(
                 reasoning=ex.get("reasoning"),
             ))
 
+    summary = trade_summary(row, exits)
     return ChartPayload(
         symbol=symbol,
         variant=variant_config.get("name", "?"),
@@ -337,6 +338,6 @@ def build_chart(
         bars=bars,
         overlays=overlays,
         fills=fills,
-        reasoning=_build_reasoning(row, fa),
+        reasoning=_build_reasoning(row, fa, summary),
         error=None if bars else "no daily bars in window — check market_data.duckdb",
     )

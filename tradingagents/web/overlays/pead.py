@@ -37,6 +37,7 @@ import pandas as pd
 from tradingagents.storage.database import TradingDatabase
 
 from ..bars import _to_unix_date, fetch_daily
+from ._trade_lookup import find_entry_id, list_cycle_exits, trade_summary
 from .base import (
     Bar,
     ChartPayload,
@@ -69,20 +70,6 @@ def _trade_with_signal(db: TradingDatabase, trade_id: int) -> Optional[dict]:
         [trade_id],
     ).fetchall()
     return dict(rows[0]) if rows else None
-
-
-def _exit_fills(db: TradingDatabase, symbol: str, entry_ts: str) -> List[dict]:
-    rows = db.conn.execute(
-        """
-        SELECT timestamp, side, filled_qty, filled_price, reasoning
-        FROM trades
-        WHERE symbol = ? AND LOWER(side) = 'sell' AND timestamp > ?
-        ORDER BY timestamp ASC
-        LIMIT 1
-        """,
-        [symbol, entry_ts],
-    ).fetchall()
-    return [dict(r) for r in rows]
 
 
 def _fetch_earnings_event(
@@ -159,21 +146,25 @@ def _build_reasoning(
     event: Optional[dict],
     llm_decision: Optional[dict],
     holding_days: Optional[int],
+    summary: dict,
 ) -> Reasoning:
     sym = trade_row["symbol"]
     surprise = event["surprise_pct"] if event else None
     eps_est  = event["eps_estimate"] if event else None
     eps_act  = event["reported_eps"] if event else None
     time_hint= event.get("time_hint") if event else None
+    closed = summary.get("is_closed")
 
-    if surprise is not None and surprise > 0:
+    if closed and summary.get("return_pct") is not None:
+        headline_kind = f"Closed {summary['return_pct']*100:+.2f}%"
+    elif surprise is not None and surprise > 0:
         headline_kind = "Positive surprise"
     elif surprise is not None and surprise < 0:
         headline_kind = "Negative surprise"
     else:
         headline_kind = "PEAD entry"
     headline = f"{headline_kind} · {sym}"
-    if surprise is not None:
+    if surprise is not None and not closed:
         headline += f"  +{surprise:.1f}%" if surprise >= 0 else f"  {surprise:.1f}%"
 
     criteria: List[Criterion] = [
@@ -209,6 +200,13 @@ def _build_reasoning(
             {"label": "LLM model",    "value": llm_decision.get("deep_think_model") or "—"},
             {"label": "LLM duration", "value": f"{llm_decision.get('duration_seconds') or 0:.0f}s"},
             {"label": "LLM cost",     "value": f"${llm_decision.get('cost_estimate_usd') or 0:.2f}"},
+        ])
+    if closed:
+        metrics.extend([
+            {"label": "Exit price",   "value": f"{summary['exit_price']:.2f}" if summary.get('exit_price') else "—"},
+            {"label": "Return %",     "value": f"{summary['return_pct']*100:+.2f}%" if summary.get("return_pct") is not None else "—"},
+            {"label": "Held",         "value": summary.get("held_str") or (f"{holding_days}d" if holding_days else "—")},
+            {"label": "Exit reason",  "value": summary.get("exit_reason") or "—"},
         ])
 
     # Narrative — the 13-agent debate transcript if pead_llm, else the
@@ -246,7 +244,8 @@ def build_chart(
     variant_config: dict,
 ) -> ChartPayload:
     is_llm = variant_config.get("strategy_type") == "pead_llm"
-    row = _trade_with_signal(db, trade_id)
+    entry_id = find_entry_id(db, trade_id) or trade_id
+    row = _trade_with_signal(db, entry_id)
     if row is None:
         return ChartPayload(
             symbol="?", variant=variant_config.get("name", "?"),
@@ -307,18 +306,19 @@ def build_chart(
     # PEAD has no stop — surface the "exit by date" target instead.
     # The bridge populates current_stop=0.0; we don't draw one.
 
-    # Fills (entry + exit)
+    # Fills (entry + every SELL until next BUY of this symbol)
+    exits = list_cycle_exits(db, symbol, str(row["trade_ts"]))
     fills: List[Fill] = []
     if entry_price > 0:
         fills.append(Fill(
             time=_to_unix_date(row["trade_ts"]),
             price=entry_price,
-            side="buy" if str(row.get("side", "")).lower() == "buy" else "sell",
+            side="buy",
             qty=float(row.get("filled_qty") or row.get("qty") or 0),
             reasoning=row.get("trade_reasoning"),
         ))
     holding_days = None
-    for ex in _exit_fills(db, symbol, str(row["trade_ts"])):
+    for ex in exits:
         if ex.get("filled_price"):
             fills.append(Fill(
                 time=_to_unix_date(ex["timestamp"]),
@@ -337,6 +337,7 @@ def build_chart(
     if not bars:           err_parts.append("no daily bars")
     if event_err:          err_parts.append(event_err)
 
+    summary = trade_summary(row, exits)
     return ChartPayload(
         symbol=symbol,
         variant=variant_config.get("name", "?"),
@@ -345,6 +346,6 @@ def build_chart(
         bars=bars,
         overlays=overlays,
         fills=fills,
-        reasoning=_build_reasoning(row, event, llm_decision, holding_days),
+        reasoning=_build_reasoning(row, event, llm_decision, holding_days, summary),
         error=" · ".join(err_parts) or None,
     )

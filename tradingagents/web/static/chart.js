@@ -13,6 +13,7 @@ const state = {
   chart: null,
   candleSeries: null,
   overlaySeries: [],   // line series we own; cleared on each chart redraw
+  fillPriceLines: [],  // IPriceLine handles for entry/exit price lines
   zsBoxes:       [],   // {el, from_t, to_t, low, high} — DOM rectangles
   zsLayer:       null, // overlay div sibling to the chart canvas
   zsRafActive:   false,
@@ -291,13 +292,7 @@ function toggleStructures() {
   }
   // Markers (BSPs + fills) — re-set the fills only when structures are off
   if (state.currentPayload) {
-    const fillMarkers = (state.currentPayload.fills || []).map(f => ({
-      time: f.time,
-      position: f.side === 'buy' ? 'belowBar' : 'aboveBar',
-      color: f.side === 'buy' ? '#5ec5b7' : '#e85a5a',
-      shape: f.side === 'buy' ? 'arrowUp' : 'arrowDown',
-      text: `${f.side.toUpperCase()} ${Number(f.qty).toFixed(0)}@${Number(f.price).toFixed(2)}`,
-    }));
+    const fillMarkers = _buildFillMarkers(state.currentPayload.fills);
     let bspMarkers = [];
     if (state.indicators.structures) {
       bspMarkers = (state.currentPayload.overlays || [])
@@ -2120,6 +2115,11 @@ function clearChart() {
   state.candleSeries.setData([]);
   state.overlaySeries.forEach(s => state.chart.removeSeries(s));
   state.overlaySeries = [];
+  // Remove entry/exit price lines from previous trade
+  for (const pl of state.fillPriceLines) {
+    try { state.candleSeries.removePriceLine(pl); } catch {}
+  }
+  state.fillPriceLines = [];
   // Clear ZS boxes (DOM nodes + tracking)
   for (const box of state.zsBoxes) box.el.remove();
   state.zsBoxes = [];
@@ -2138,14 +2138,7 @@ function renderPayload(p) {
   }));
   state.candleSeries.setData(candleData);
 
-  // Overlays — only build structures if the toggle is on
-  const fillMarkers = (p.fills || []).map(f => ({
-    time: f.time,
-    position: f.side === 'buy' ? 'belowBar' : 'aboveBar',
-    color: f.side === 'buy' ? '#5ec5b7' : '#e85a5a',
-    shape: f.side === 'buy' ? 'arrowUp' : 'arrowDown',
-    text: `${f.side.toUpperCase()} ${Number(f.qty).toFixed(0)}@${Number(f.price).toFixed(2)}`,
-  }));
+  const fillMarkers = _buildFillMarkers(p.fills);
 
   const bspMarkers = [];
   if (state.indicators.structures) {
@@ -2162,10 +2155,11 @@ function renderPayload(p) {
     }
   }
 
-  // Markers (BSP labels + entry/exit fills)
+  // Markers (BSP labels + entry/exit fills) + horizontal price lines for fills
   state.candleSeries.setMarkers(
     [...bspMarkers, ...fillMarkers].sort((a, b) => a.time - b.time),
   );
+  _drawFillPriceLines(p.fills);
 
   // Indicators (volume / MACD) — applies pane layout via scaleMargins
   buildIndicators(p.bars);
@@ -2179,6 +2173,44 @@ function renderPayload(p) {
   state.candleSeries.priceScale().applyOptions({ autoScale: true });
   if (state.volumeSeries)   state.chart.priceScale('volume').applyOptions({ autoScale: true });
   if (state.macdLineSeries) state.chart.priceScale('macd').applyOptions({ autoScale: true });
+}
+
+// Build prominent BUY/SELL markers. The text is intentionally short
+// ("▲ BUY 102.45" / "▼ SELL 116.30") so it's readable at the chart edge
+// without overlapping; the qty isn't displayed here (it's in the
+// reasoning panel). The unicode triangle gives a stronger visual cue
+// than lightweight-charts' default arrow shape alone.
+function _buildFillMarkers(fills) {
+  return (fills || []).map(f => {
+    const isBuy = f.side === 'buy';
+    return {
+      time: f.time,
+      position: isBuy ? 'belowBar' : 'aboveBar',
+      color: isBuy ? '#10b981' : '#ef4444',
+      shape: isBuy ? 'arrowUp' : 'arrowDown',
+      text: `${isBuy ? '▲ BUY' : '▼ SELL'} ${Number(f.price).toFixed(2)}`,
+      size: 2,  // larger than default 1
+    };
+  });
+}
+
+// Horizontal price lines at each fill price — green for entry, red for
+// exit — span the full chart width. Much more visible than the marker
+// arrows alone, especially for closed trades where you want to read off
+// the entry-to-exit travel at a glance.
+function _drawFillPriceLines(fills) {
+  for (const f of fills || []) {
+    const isBuy = f.side === 'buy';
+    const pl = state.candleSeries.createPriceLine({
+      price: Number(f.price),
+      color: isBuy ? '#10b981' : '#ef4444',
+      lineWidth: 1,
+      lineStyle: 2,  // dashed
+      axisLabelVisible: true,
+      title: isBuy ? 'BUY' : 'SELL',
+    });
+    state.fillPriceLines.push(pl);
+  }
 }
 
 // In-place re-render used by the live-tail refresh — same pipeline as
@@ -2195,13 +2227,7 @@ function renderPayloadInPlace(p) {
   }));
   state.candleSeries.setData(candleData);
 
-  const fillMarkers = (p.fills || []).map(f => ({
-    time: f.time,
-    position: f.side === 'buy' ? 'belowBar' : 'aboveBar',
-    color: f.side === 'buy' ? '#5ec5b7' : '#e85a5a',
-    shape: f.side === 'buy' ? 'arrowUp' : 'arrowDown',
-    text: `${f.side.toUpperCase()} ${Number(f.qty).toFixed(0)}@${Number(f.price).toFixed(2)}`,
-  }));
+  const fillMarkers = _buildFillMarkers(p.fills);
 
   const bspMarkers = [];
   if (state.indicators.structures) {
@@ -2219,6 +2245,7 @@ function renderPayloadInPlace(p) {
   state.candleSeries.setMarkers(
     [...bspMarkers, ...fillMarkers].sort((a, b) => a.time - b.time),
   );
+  _drawFillPriceLines(p.fills);
   buildIndicators(p.bars);
 
   if (visible) state.chart.timeScale().setVisibleLogicalRange(visible);

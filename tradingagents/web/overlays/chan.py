@@ -46,6 +46,7 @@ from tradingagents.dashboard.chan_structures import extract_chan_structures
 from tradingagents.storage.database import TradingDatabase
 
 from ..bars import _to_unix, fetch_30m
+from ._trade_lookup import find_entry_id, list_cycle_exits, trade_summary
 from .base import (
     Bar,
     ChartPayload,
@@ -81,26 +82,6 @@ def _trade_with_signal(db: TradingDatabase, trade_id: int) -> Optional[dict]:
     if not rows:
         return None
     return dict(rows[0])
-
-
-def _exit_fills(db: TradingDatabase, symbol: str, entry_ts: str) -> List[dict]:
-    """SELL trades for the same symbol that occurred after ``entry_ts``.
-
-    Used to render the exit marker on the same chart. We only return the
-    *first* exit after entry — partial fills can come later but the chart
-    cares about the resolution event.
-    """
-    rows = db.conn.execute(
-        """
-        SELECT timestamp, symbol, side, filled_qty, filled_price, reasoning
-        FROM trades
-        WHERE symbol = ? AND LOWER(side) = 'sell' AND timestamp > ?
-        ORDER BY timestamp ASC
-        LIMIT 1
-        """,
-        [symbol, entry_ts],
-    ).fetchall()
-    return [dict(r) for r in rows]
 
 
 def _build_overlays(
@@ -171,8 +152,14 @@ def _build_overlays(
     return overlays
 
 
-def _build_reasoning(trade_row: dict, meta: dict) -> Reasoning:
-    """Compose the side-panel reasoning from signal_metadata + signal text."""
+def _build_reasoning(trade_row: dict, meta: dict, summary: dict) -> Reasoning:
+    """Compose the side-panel reasoning from signal_metadata + signal text.
+
+    ``summary`` is the closed-trade summary from
+    ``_trade_lookup.trade_summary``; when present, we surface exit/return/
+    held-time metrics so closed-trade views are informative instead of
+    showing dashes everywhere.
+    """
     types = meta.get("t_types") or "—"
     bsp_reason = meta.get("bsp_reason") or trade_row.get("signal_reasoning") or ""
     bi_low = meta.get("bi_low")
@@ -180,7 +167,13 @@ def _build_reasoning(trade_row: dict, meta: dict) -> Reasoning:
     market_score = meta.get("market_score")
     confidence = meta.get("confidence")
 
-    headline = f"{types} {trade_row.get('action') or 'BUY'} on {trade_row['symbol']}"
+    closed = summary.get("is_closed")
+    headline_kind = (
+        f"Closed · {summary['return_pct']*100:+.2f}%"
+        if closed and summary.get("return_pct") is not None
+        else (trade_row.get('action') or 'BUY')
+    )
+    headline = f"{types} {headline_kind} on {trade_row['symbol']}"
 
     metrics: List[Metric] = [
         {"label": "T-types",        "value": types},
@@ -191,6 +184,14 @@ def _build_reasoning(trade_row: dict, meta: dict) -> Reasoning:
         {"label": "Stop pct",       "value": f"{trade_row.get('stop_loss') or 0:.2%}"},
         {"label": "Take-profit pct","value": f"{trade_row.get('take_profit') or 0:.2%}"},
     ]
+    if closed:
+        metrics.extend([
+            {"label": "Entry price",  "value": f"{float(trade_row['filled_price']):.2f}"},
+            {"label": "Exit price",   "value": f"{summary['exit_price']:.2f}"},
+            {"label": "Return %",     "value": f"{summary['return_pct']*100:+.2f}%" if summary.get("return_pct") is not None else "—"},
+            {"label": "Held",         "value": summary.get("held_str") or "—"},
+            {"label": "Exit reason",  "value": summary.get("exit_reason") or "—"},
+        ])
 
     # Criteria — the chan filters that had to pass for this signal to fire.
     # We don't have per-criterion booleans persisted, but the presence of
@@ -217,7 +218,11 @@ def build_chart(
     trade_id: int,
     variant_config: dict,
 ) -> ChartPayload:
-    row = _trade_with_signal(db, trade_id)
+    # Redirect to the cycle's BUY (entry) so the reasoning panel reads
+    # the entry signal's metadata and the chart pivots on the entry.
+    # SELL rows otherwise rendered all-red criteria + missing entry marker.
+    entry_id = find_entry_id(db, trade_id) or trade_id
+    row = _trade_with_signal(db, entry_id)
     if row is None:
         return ChartPayload(
             symbol="?", variant=variant_config.get("name", "?"),
@@ -290,17 +295,19 @@ def build_chart(
             row.get("signal_reasoning") or row.get("trade_reasoning")
         )
 
-    # Fills — the trade itself + its first SELL.
+    # Fills — entry + every SELL that closes this cycle (until the next BUY
+    # of this symbol, which would belong to the next cycle).
+    exits = list_cycle_exits(db, symbol, str(row["trade_ts"]))
     fills: List[Fill] = []
     if row.get("filled_price"):
         fills.append(Fill(
             time=_to_unix(row["trade_ts"]),
             price=float(row["filled_price"]),
-            side="buy" if str(row.get("side", "")).lower() == "buy" else "sell",
+            side="buy",
             qty=float(row.get("filled_qty") or row.get("qty") or 0),
             reasoning=row.get("trade_reasoning"),
         ))
-    for ex in _exit_fills(db, symbol, str(row["trade_ts"])):
+    for ex in exits:
         if ex.get("filled_price"):
             fills.append(Fill(
                 time=_to_unix(ex["timestamp"]),
@@ -310,6 +317,7 @@ def build_chart(
                 reasoning=ex.get("reasoning"),
             ))
 
+    summary = trade_summary(row, exits)
     return ChartPayload(
         symbol=symbol,
         variant=variant_config.get("name", "?"),
@@ -318,6 +326,6 @@ def build_chart(
         bars=bars,
         overlays=overlays,
         fills=fills,
-        reasoning=_build_reasoning(row, meta),
+        reasoning=_build_reasoning(row, meta, summary),
         error=err,
     )

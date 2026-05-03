@@ -324,7 +324,39 @@ async function main() {
       return `body=${body.length}c`;
     });
 
-    // ── 15. No JS exceptions during whole session ─────────────────
+    // ── 15. Closed-trade chart shows entry + exit price lines ─────
+    //    Pin the "clicking SELL renders both buy + sell" + price-line
+    //    visualization improvement.
+    await test('closed_trade_shows_entry_and_exit_price_lines', async () => {
+      // Navigate to TRADE
+      await ev('window.location.hash = "trade"');
+      await new Promise(r => setTimeout(r, 1500));
+      // Find a SELL row in the trades list (status filled, side sell)
+      const sellId = await ev(`(() => {
+        for (const t of (state.trades || [])) {
+          if ((t.side || '').toLowerCase() === 'sell') return t.trade_id;
+        }
+        return null;
+      })()`);
+      if (sellId == null) return 'skipped — no sell rows in current variant';
+      // Click the matching <li>
+      const clicked = await ev(`(() => {
+        const el = document.querySelector('.trades-list li[data-trade-id="${sellId}"]');
+        if (el) { el.click(); return true; }
+        return false;
+      })()`);
+      if (!clicked) return `skipped — no <li> for trade_id=${sellId}`;
+      await new Promise(r => setTimeout(r, 1500));
+      const lines = await ev('state.fillPriceLines.length');
+      const buySides = await ev(`(state.currentPayload.fills || []).map(f => f.side).filter(s => s === 'buy').length`);
+      const sellSides = await ev(`(state.currentPayload.fills || []).map(f => f.side).filter(s => s === 'sell').length`);
+      if (typeof lines !== 'number' || lines < 2) throw new Error(`expected ≥2 price lines, got ${lines}`);
+      if (buySides < 1) throw new Error('SELL-click missing BUY fill (regression)');
+      if (sellSides < 1) throw new Error('SELL-click missing SELL fill');
+      return `lines=${lines} buys=${buySides} sells=${sellSides}`;
+    });
+
+    // ── 16. No JS exceptions during whole session ─────────────────
     await test('no_js_exceptions_during_session', async () => {
       if (exceptions.length) throw new Error('JS exceptions accumulated: ' + exceptions.join(' | '));
     });
