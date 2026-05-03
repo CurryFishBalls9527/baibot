@@ -1,0 +1,7 @@
+{
+  "name": "baibot-web-ui-tests",
+  "private": true,
+  "dependencies": {
+    "chrome-remote-interface": "^0.33.0"
+  }
+}

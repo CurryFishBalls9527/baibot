@@ -2,6 +2,10 @@
 .claude/
 .agents/
 
+# Test-runner npm tree (chrome-remote-interface for headless UI tests).
+# package.json + package-lock.json ARE committed for reproducible installs.
+tests/node_modules/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
