@@ -362,6 +362,27 @@ def test_closed_trade_has_return_metric(web_server):
 # ── Daily review chart payload (parity with TRADE-tab chart) ────────
 
 
+def test_daily_review_file_strips_interactive_chart_link(web_server):
+    """The "[Interactive chart](charts/...)" hyperlink in raw review
+    markdown 404s under the API route AND duplicates the embedded
+    chart. Server should strip it from `content`."""
+    from datetime import date as _date, timedelta as _td
+    for offset in range(0, 14):
+        d = (_date.today() - _td(days=offset)).isoformat()
+        listing = _get(web_server, f"/api/reviews/daily/{d}").json()
+        if not (listing.get("exists") and listing.get("by_variant")):
+            continue
+        for variant, slot in listing["by_variant"].items():
+            for fname in (slot.get("closed") or []):
+                payload = _get(web_server, f"/api/reviews/daily/{d}/file/{fname}").json()
+                content = payload.get("content") or ""
+                assert "[Interactive chart](" not in content, (
+                    f"{d}/{fname}: legacy interactive-chart link not stripped"
+                )
+                return
+    pytest.skip("no closed daily reviews found in last 14 days")
+
+
 def test_daily_review_file_includes_chart_payload(web_server):
     """Daily-review file endpoint should include a `chart_payload` so
     the frontend can render the same lightweight-charts visualization

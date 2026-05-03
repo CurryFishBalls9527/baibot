@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 from pathlib import Path
 from typing import AsyncIterator, Dict, List, Optional
 
@@ -530,9 +531,18 @@ def daily_review_file(review_date: str, name: str, include_dry_run: bool = False
         except Exception:
             chart_payload = None
 
+    # Strip the "[Interactive chart](charts/<file>.html)" line — the daily
+    # review generator writes it for the legacy file-system view, but the
+    # web UI embeds the chart above the markdown, and the relative path
+    # 404s under the FastAPI route. Easier to remove than to serve it.
+    content = target.read_text(encoding="utf-8")
+    content = re.sub(
+        r"^\[Interactive chart\]\(charts/[^)]+\)\s*\n?",
+        "", content, flags=re.MULTILINE,
+    )
     return {
         "name": name,
-        "content": target.read_text(encoding="utf-8"),
+        "content": content,
         "chart_html": chart_html,
         "chart_payload": chart_payload,
     }
