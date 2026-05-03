@@ -62,6 +62,12 @@ class ChanDailyBacktestConfig:
     chan_min_zs_cnt: int = 1
     chan_bi_strict: bool = True
     require_sure: bool = True   # set False to act on BSPs on the live (unsure) bi
+    chan_bsp2_follow_1: bool = True
+    chan_bsp3_follow_1: bool = True
+    chan_bsp3_peak: bool = False
+    chan_strict_bsp3: bool = False
+    chan_bsp3a_max_zs_cnt: int = 1
+    chan_zs_algo: str = "normal"  # "normal" | "over_seg" | "auto"
 
     # Direction
     enable_longs: bool = True
@@ -740,8 +746,13 @@ class PortfolioChanDailyBacktester:
             "macd_algo": cfg.chan_macd_algo,
             "bs_type": cfg.chan_bs_type,
             "min_zs_cnt": cfg.chan_min_zs_cnt,
+            "bsp2_follow_1": cfg.chan_bsp2_follow_1,
+            "bsp3_follow_1": cfg.chan_bsp3_follow_1,
+            "bsp3_peak": cfg.chan_bsp3_peak,
+            "strict_bsp3": cfg.chan_strict_bsp3,
+            "bsp3a_max_zs_cnt": cfg.chan_bsp3a_max_zs_cnt,
             "print_warning": False,
-            "zs_algo": "normal",
+            "zs_algo": cfg.chan_zs_algo,
         })
 
         bars = self._load_bars(symbols, begin, end)

@@ -80,6 +80,12 @@ def _make_config(args: argparse.Namespace) -> ChanDailyBacktestConfig:
         chan_divergence_rate=args.divergence_rate,
         chan_min_zs_cnt=args.min_zs_cnt,
         chan_bi_strict=not args.no_bi_strict,
+        chan_bsp2_follow_1=not args.no_bsp2_follow_1,
+        chan_bsp3_follow_1=not args.no_bsp3_follow_1,
+        chan_bsp3_peak=args.bsp3_peak,
+        chan_strict_bsp3=args.strict_bsp3,
+        chan_bsp3a_max_zs_cnt=args.bsp3a_max_zs_cnt,
+        chan_zs_algo=args.zs_algo,
         atr_period=args.atr_period,
         stop_atr_mult=args.stop_atr_mult,
         time_stop_bars=args.time_stop_bars,
@@ -259,7 +265,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--position-pct", type=float, default=0.10)
     p.add_argument("--sizing-mode", default="fixed", choices=["fixed", "atr_parity"])
     p.add_argument("--risk-per-trade", type=float, default=0.005,
-                   help="atr_parity only: equity at risk per trade (default 0.5%)")
+                   help="atr_parity only: equity at risk per trade (default 0.5%%)")
     p.add_argument("--bs-type", default="1,2,2s,3a,3b")
     p.add_argument("--buy-types", default="T1,T2,T2S,T3A,T3B")
     p.add_argument("--no-bi-strict", action="store_true",
@@ -269,6 +275,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--macd-algo", default="area")
     p.add_argument("--divergence-rate", type=float, default=0.6)
     p.add_argument("--min-zs-cnt", type=int, default=1)
+    p.add_argument("--no-bsp2-follow-1", action="store_true",
+                   help="Allow second buy/sell points without a prior first point (small-to-large reversal probe).")
+    p.add_argument("--no-bsp3-follow-1", action="store_true",
+                   help="Allow third buy/sell points without a prior first point.")
+    p.add_argument("--bsp3-peak", action="store_true",
+                   help="Require third buy/sell breakout leg to clear the ZS peak/trough.")
+    p.add_argument("--strict-bsp3", action="store_true",
+                   help="Require the third buy/sell ZS to be adjacent to its related first point.")
+    p.add_argument("--bsp3a-max-zs-cnt", type=int, default=1,
+                   help="Maximum ZS count crossed by 3a buy/sell detection.")
+    p.add_argument("--zs-algo", default="normal", choices=["normal", "over_seg", "auto"],
+                   help="Chan ZS algorithm: normal=inside segment, over_seg=cross-segment, auto=mixed.")
     p.add_argument("--atr-period", type=int, default=20)
     p.add_argument("--stop-atr-mult", type=float, default=2.0)
     p.add_argument("--time-stop-bars", type=int, default=60)
@@ -354,7 +372,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--vol-scale", action="store_true",
                    help="Scale per-trade risk inversely to recent ATR/price (target/actual, clipped 0.5-2x)")
     p.add_argument("--vol-scale-target", type=float, default=0.02,
-                   help="Target ATR/price ratio (default 2%)")
+                   help="Target ATR/price ratio (default 2%%)")
     p.add_argument("--entry-priority", default="fifo", choices=["fifo", "momentum", "rank_random"],
                    help="When cash binds, which signal gets funded first. fifo=alphabetical (current), momentum=strongest first.")
     p.add_argument("--volume-confirm", action="store_true",
@@ -370,13 +388,13 @@ def parse_args() -> argparse.Namespace:
                    help="同级别分解: only enter when last bi is confirmed UP "
                         "(pullback bottomed). Avoids chasing mid-decline.")
     p.add_argument("--equity-dd-threshold", type=float, default=0.0,
-                   help="Pause entries when account DD vs high-water > X (e.g. 0.05 for 5%). 0=off")
+                   help="Pause entries when account DD vs high-water > X (e.g. 0.05 for 5%%). 0=off")
     p.add_argument("--equity-dd-resume", type=float, default=0.0,
-                   help="Resume entries when DD recovers below X (e.g. 0.03 for 3%). 0=off")
+                   help="Resume entries when DD recovers below X (e.g. 0.03 for 3%%). 0=off")
     p.add_argument("--equity-sector-cap", type=int, default=0,
                    help="Max concurrent positions in equity-correlated group (SPY/QQQ/IWM/DIA/XL*). 0=off")
     p.add_argument("--donchian-breakout-min-pct", type=float, default=0.0,
-                   help="Donchian breakout requires close > Donchian-high × (1+X). 0.005 = 0.5% margin")
+                   help="Donchian breakout requires close > Donchian-high × (1+X). 0.005 = 0.5%% margin")
     p.add_argument("--pyramid", action="store_true",
                    help="Pyramid scale-in: add to winners as MFE crosses thresholds")
     p.add_argument("--pyramid-thresholds", default="1.5,3.0",
@@ -432,6 +450,12 @@ def main() -> None:
                 "position_pct": cfg.position_pct,
                 "buy_types": list(cfg.buy_types),
                 "bs_type": cfg.chan_bs_type,
+                "bsp2_follow_1": cfg.chan_bsp2_follow_1,
+                "bsp3_follow_1": cfg.chan_bsp3_follow_1,
+                "bsp3_peak": cfg.chan_bsp3_peak,
+                "strict_bsp3": cfg.chan_strict_bsp3,
+                "bsp3a_max_zs_cnt": cfg.chan_bsp3a_max_zs_cnt,
+                "zs_algo": cfg.chan_zs_algo,
                 "atr_period": cfg.atr_period,
                 "stop_atr_mult": cfg.stop_atr_mult,
                 "time_stop_bars": cfg.time_stop_bars,

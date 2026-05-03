@@ -96,6 +96,12 @@ class ChanDailyOrchestrator:
             donchian_period=30,
             chan_macd_algo="slope",
             chan_divergence_rate=0.7,
+            chan_bsp2_follow_1=config.get("chan_bsp2_follow_1", True),
+            chan_bsp3_follow_1=config.get("chan_bsp3_follow_1", True),
+            chan_bsp3_peak=config.get("chan_bsp3_peak", False),
+            chan_strict_bsp3=config.get("chan_strict_bsp3", False),
+            chan_bsp3a_max_zs_cnt=config.get("chan_bsp3a_max_zs_cnt", 1),
+            chan_zs_algo=config.get("chan_zs_algo", "normal"),
             momentum_rank_lookback=63,
             momentum_rank_top_k=10,
             time_stop_bars=100,
@@ -258,8 +264,13 @@ class ChanDailyOrchestrator:
             "macd_algo": self.bt_cfg.chan_macd_algo,
             "bs_type": self.bt_cfg.chan_bs_type,
             "min_zs_cnt": self.bt_cfg.chan_min_zs_cnt,
+            "bsp2_follow_1": self.bt_cfg.chan_bsp2_follow_1,
+            "bsp3_follow_1": self.bt_cfg.chan_bsp3_follow_1,
+            "bsp3_peak": self.bt_cfg.chan_bsp3_peak,
+            "strict_bsp3": self.bt_cfg.chan_strict_bsp3,
+            "bsp3a_max_zs_cnt": self.bt_cfg.chan_bsp3a_max_zs_cnt,
             "print_warning": False,
-            "zs_algo": "normal",
+            "zs_algo": self.bt_cfg.chan_zs_algo,
         })
         signals = bt._preload_signals(list(bars.keys()), begin_str, today_str, chan_cfg)
 
