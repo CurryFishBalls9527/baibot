@@ -1,0 +1,654 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=1520">
+<title>baibot — review</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=JetBrains+Mono:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="tokens.css">
+<style>
+  *,*::before,*::after{box-sizing:border-box}
+  html,body{margin:0;background:#06060a;color:var(--text);font-family:var(--mono);-webkit-font-smoothing:antialiased;height:100%}
+  body{display:flex;flex-direction:column;min-width:1480px;height:100vh;overflow:hidden}
+
+  nav.top{flex-shrink:0;display:flex;align-items:stretch;height:52px;background:#0a0a0d;border-bottom:1px solid var(--border);padding:0 18px}
+  nav.top .brand{display:flex;align-items:baseline;gap:10px;margin-right:24px;align-self:center}
+  nav.top .brand .mark{font-family:var(--serif);font-style:italic;font-size:22px;line-height:1}
+  nav.top .brand .rule{width:18px;height:1px;background:var(--amber)}
+  nav.top .brand .label{font-size:9.5px;letter-spacing:0.32em;color:var(--text-muted);font-weight:500}
+  nav.top a{color:var(--text-faint);text-decoration:none;font-size:10.5px;font-weight:600;letter-spacing:0.24em;text-transform:uppercase;padding:0 18px;display:inline-flex;align-items:center;border-bottom:2px solid transparent;margin-bottom:-1px;transition:color 140ms ease}
+  nav.top a:hover{color:var(--text)}
+  nav.top a.active{color:var(--text);border-bottom-color:var(--amber);background:linear-gradient(to bottom,transparent,var(--amber-faint))}
+  nav.top .spacer{flex:1}
+  nav.top .now{align-self:center;font-size:10px;letter-spacing:0.22em;color:var(--text-faint)}
+
+  /* ===== Toolbar ===== */
+  .rv-toolbar{
+    flex-shrink:0;display:flex;align-items:center;gap:18px;
+    background:var(--surface-deep);border-bottom:1px solid var(--border);
+    padding:12px 22px;
+  }
+  .rv-toolbar .lbl{font-size:9.5px;letter-spacing:0.28em;color:var(--text-faint);font-weight:600;text-transform:uppercase}
+  .pill-group{display:inline-flex;border:1px solid var(--border-strong)}
+  .pill-group button{
+    background:transparent;color:var(--text-muted);border:none;
+    font-family:var(--mono);font-size:10px;letter-spacing:0.18em;font-weight:600;
+    padding:6px 12px;cursor:pointer;border-right:1px solid var(--border);
+    text-transform:uppercase;
+  }
+  .pill-group button:last-child{border-right:none}
+  .pill-group button:hover{color:var(--text)}
+  .pill-group button.active{color:var(--amber);background:rgba(245,165,36,0.10)}
+  .nav-btn{
+    background:transparent;color:var(--text-muted);border:1px solid var(--border-strong);
+    font-family:var(--mono);font-size:11px;letter-spacing:0.16em;font-weight:600;
+    width:28px;height:26px;cursor:pointer;
+  }
+  .nav-btn:hover{color:var(--amber);border-color:var(--amber)}
+  .day-display{
+    font-family:var(--serif);font-style:italic;font-size:20px;line-height:1;color:var(--text);
+    padding:0 8px;
+  }
+  .day-display .sub{font-family:var(--mono);font-size:10px;color:var(--text-muted);letter-spacing:0.18em;margin-left:8px;font-style:normal;font-weight:500}
+  .rv-toolbar .right{margin-left:auto;display:flex;align-items:center;gap:14px}
+  .rv-toolbar .right .stat{display:flex;align-items:baseline;gap:6px}
+  .rv-toolbar .right .stat .k{font-size:9px;letter-spacing:0.22em;color:var(--text-faint);font-weight:600;text-transform:uppercase}
+  .rv-toolbar .right .stat .v{font-family:var(--mono);font-size:13px;font-variant-numeric:tabular-nums;color:var(--text)}
+
+  /* ===== Body grid ===== */
+  main{flex:1;min-height:0;display:grid;grid-template-columns:240px 1fr 360px}
+  .calendar{
+    border-right:1px solid var(--border);background:var(--surface-deep);
+    display:flex;flex-direction:column;min-height:0;
+  }
+  .calendar .head{padding:14px 16px 8px;border-bottom:1px solid var(--border);display:flex;align-items:baseline;gap:10px}
+  .calendar .head .mo{font-family:var(--serif);font-style:italic;font-size:18px;color:var(--text)}
+  .calendar .head .yr{font-size:9.5px;letter-spacing:0.24em;color:var(--text-faint);font-weight:600}
+  .calendar .head .navs{margin-left:auto;display:flex;gap:4px}
+  .calendar .dow{
+    display:grid;grid-template-columns:repeat(5,1fr);gap:0;
+    padding:8px 12px 0;font-size:9px;letter-spacing:0.18em;color:var(--text-faint);
+    text-align:center;font-weight:600;
+  }
+  .calendar .grid{display:grid;grid-template-columns:repeat(5,1fr);gap:2px;padding:6px 12px 12px}
+  .calendar .day{
+    aspect-ratio:1;background:rgba(20,20,24,0.4);border:1px solid transparent;
+    display:flex;flex-direction:column;align-items:flex-start;justify-content:space-between;
+    padding:5px 6px;cursor:pointer;font-variant-numeric:tabular-nums;
+    transition:border-color 120ms ease, background 120ms ease;
+  }
+  .calendar .day:hover{border-color:var(--border-strong)}
+  .calendar .day.empty{background:transparent;cursor:default;pointer-events:none}
+  .calendar .day .num{font-size:10px;color:var(--text-muted);font-weight:500}
+  .calendar .day .pill{font-size:8.5px;letter-spacing:0.04em;font-weight:600;font-variant-numeric:tabular-nums}
+  .calendar .day.up   {background:rgba(125,216,127,0.08)}  .calendar .day.up .pill{color:var(--mint)}
+  .calendar .day.dn   {background:rgba(232,90,90,0.10)}    .calendar .day.dn .pill{color:var(--coral)}
+  .calendar .day.flat {background:rgba(255,255,255,0.03)}  .calendar .day.flat .pill{color:var(--text-faint)}
+  .calendar .day.active{border-color:var(--amber);background:rgba(245,165,36,0.10);box-shadow:0 0 0 1px var(--amber)}
+  .calendar .day.active .num{color:var(--amber)}
+  .calendar .day.today{outline:1px dotted var(--amber);outline-offset:-3px}
+  .calendar .legend{
+    border-top:1px solid var(--border);padding:10px 14px;font-size:9.5px;
+    color:var(--text-muted);letter-spacing:0.16em;display:flex;flex-direction:column;gap:5px;
+  }
+  .calendar .legend .row{display:flex;align-items:center;gap:6px}
+  .calendar .legend .swatch{width:8px;height:8px}
+  .calendar .legend .swatch.up{background:rgba(125,216,127,0.3);border:1px solid var(--mint)}
+  .calendar .legend .swatch.dn{background:rgba(232,90,90,0.3);border:1px solid var(--coral)}
+  .calendar .legend .swatch.flat{background:rgba(255,255,255,0.1);border:1px solid var(--text-faint)}
+
+  /* center: timeline + chart */
+  .center-pane{display:flex;flex-direction:column;min-height:0;background:var(--surface)}
+  .rv-summary{
+    display:grid;grid-template-columns:repeat(6,1fr);
+    border-bottom:1px solid var(--border);
+  }
+  .rv-summary > div{padding:14px 18px;border-right:1px solid var(--border)}
+  .rv-summary > div:last-child{border-right:none}
+  .rv-summary .k{font-size:9px;letter-spacing:0.22em;color:var(--text-faint);font-weight:600;text-transform:uppercase}
+  .rv-summary .v{font-family:var(--serif);font-style:italic;font-size:24px;color:var(--text);font-variant-numeric:tabular-nums;margin-top:4px;line-height:1}
+  .rv-summary .v.up{color:var(--mint)} .rv-summary .v.dn{color:var(--coral)}
+  .rv-summary .sub{font-size:10px;color:var(--text-muted);margin-top:3px;font-variant-numeric:tabular-nums;letter-spacing:0.04em}
+
+  .equity-pane{flex:1;min-height:0;display:flex;flex-direction:column;border-bottom:1px solid var(--border)}
+  .equity-head{padding:12px 22px;border-bottom:1px solid var(--border);display:flex;align-items:baseline;gap:14px}
+  .equity-head .eyebrow{font-size:9.5px;letter-spacing:0.28em;color:var(--text-faint);font-weight:600;text-transform:uppercase}
+  .equity-head .legend{margin-left:auto;display:flex;gap:14px;font-size:10.5px}
+  .equity-head .legend .item{display:inline-flex;align-items:center;gap:6px}
+  .equity-head .legend .item .swatch{width:10px;height:2px}
+  .equity-canvas{flex:1;min-height:0;padding:10px 12px}
+  .equity-canvas svg{width:100%;height:100%;display:block}
+
+  /* timeline */
+  .timeline-pane{flex-shrink:0;height:200px;display:flex;flex-direction:column;background:var(--surface-deep)}
+  .timeline-head{padding:10px 22px;border-bottom:1px solid var(--border);display:flex;align-items:baseline;gap:14px;font-size:9.5px;letter-spacing:0.28em;color:var(--text-faint);font-weight:600;text-transform:uppercase}
+  .timeline-head .lanes{margin-left:auto;display:flex;gap:14px;font-size:10px}
+  .timeline-head .lane{display:inline-flex;align-items:center;gap:5px}
+  .timeline-head .lane .dot{width:8px;height:8px;border-radius:50%}
+  .timeline-canvas{flex:1;min-height:0;position:relative;padding:8px 22px 14px}
+  .timeline-canvas svg{width:100%;height:100%;display:block}
+
+  /* right: trade list */
+  .fills-pane{
+    border-left:1px solid var(--border);background:var(--surface);
+    display:flex;flex-direction:column;min-height:0;
+  }
+  .fills-pane .head{
+    padding:12px 18px;border-bottom:1px solid var(--border);
+    display:flex;align-items:baseline;gap:10px;
+  }
+  .fills-pane .head .title{font-family:var(--serif);font-style:italic;font-size:18px;color:var(--text)}
+  .fills-pane .head .count{font-size:9px;letter-spacing:0.22em;color:var(--text-faint);font-weight:600;margin-left:auto}
+  .fills-pane .filterbar{
+    display:flex;gap:6px;padding:10px 18px;border-bottom:1px solid var(--border);background:var(--surface-deep);
+  }
+  .fills-pane .filterbar .chip{
+    font-size:9px;letter-spacing:0.18em;font-weight:600;padding:3px 8px;
+    border:1px solid var(--border-strong);color:var(--text-muted);
+    cursor:pointer;text-transform:uppercase;background:transparent;font-family:var(--mono);
+  }
+  .fills-pane .filterbar .chip:hover{color:var(--text)}
+  .fills-pane .filterbar .chip.on{color:var(--text);border-color:var(--amber);background:rgba(245,165,36,0.06)}
+  .fills-pane .body{flex:1;overflow-y:auto;min-height:0}
+  .fills-pane .body::-webkit-scrollbar{width:6px}
+  .fills-pane .body::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+  .fill{
+    display:grid;grid-template-columns:48px 1fr 80px;
+    padding:11px 16px;border-bottom:1px dotted rgba(255,255,255,0.05);
+    align-items:start;column-gap:10px;font-size:11px;font-variant-numeric:tabular-nums;
+  }
+  .fill:hover{background:rgba(245,165,36,0.04)}
+  .fill .t{font-size:10px;color:var(--text-faint);letter-spacing:0.04em;padding-top:3px}
+  .fill .body{display:flex;flex-direction:column;gap:3px}
+  .fill .top{display:flex;align-items:baseline;gap:6px;flex-wrap:wrap}
+  .fill .sym{font-family:var(--serif);font-style:italic;font-size:15px}
+  .fill .var-tag{display:inline-flex;align-items:center;gap:5px;font-size:8.5px;letter-spacing:0.18em;font-weight:600;color:var(--text-muted);text-transform:uppercase}
+  .fill .var-tag .swatch{width:6px;height:6px}
+  .fill .why{font-size:10px;color:var(--text-muted);letter-spacing:0.02em}
+  .fill .pnl{text-align:right;font-weight:500}
+  .fill .pnl .big{font-size:13px;line-height:1.1}
+  .fill .pnl .px{font-size:9.5px;color:var(--text-faint);margin-top:2px;letter-spacing:0.04em}
+  .fill .pnl.up .big{color:var(--mint)} .fill .pnl.dn .big{color:var(--coral)}
+  .fill.open{background:linear-gradient(to right,rgba(245,165,36,0.06),transparent)}
+  .fill.open .pnl .big{color:var(--amber)}
+  .fill.open .pnl .px{color:var(--amber);opacity:0.6}
+
+  .side-tag{display:inline-block;font-size:8px;letter-spacing:0.18em;font-weight:700;padding:1px 4px;border:1px solid currentColor;line-height:1.3}
+  .side-tag.buy{color:var(--teal)} .side-tag.sell{color:var(--coral)}
+</style>
+</head>
+<body>
+
+<nav class="top">
+  <div class="brand">
+    <span class="mark">baibot</span>
+    <span class="rule"></span>
+    <span class="label">TELEMETRY</span>
+  </div>
+  <a href="floor.html">FLOOR</a>
+  <a href="versus.html">VERSUS</a>
+  <a href="review.html" class="active">REVIEW</a>
+  <span class="spacer"></span>
+  <span class="now" id="rv-topbar-label">REVIEW · loading…</span>
+</nav>
+
+<!-- ===== Toolbar ===== -->
+<div class="rv-toolbar">
+  <span class="lbl">VARIANT</span>
+  <div class="pill-group" id="variant-group"></div>
+
+  <button class="nav-btn" id="prev-day" type="button" title="Previous day">‹</button>
+  <div class="day-display" id="day-display">— <span class="sub">loading</span></div>
+  <button class="nav-btn" id="next-day" type="button" title="Next day">›</button>
+
+  <div class="right">
+    <div class="stat"><span class="k">SESSION P&amp;L</span><span class="v" id="rv-pnl-pct">—</span></div>
+    <div class="stat"><span class="k">USD</span><span class="v" id="rv-pnl-usd">—</span></div>
+    <div class="stat"><span class="k">FILLS</span><span class="v" id="rv-fills">—</span></div>
+    <div class="stat"><span class="k">EQUITY</span><span class="v" id="rv-equity">—</span></div>
+  </div>
+</div>
+
+<!-- ===== Body ===== -->
+<main>
+
+  <!-- ====== Calendar ====== -->
+  <aside class="calendar">
+    <div class="head">
+      <span class="mo" id="cal-mo">—</span>
+      <span class="yr" id="cal-yr">—</span>
+      <div class="navs">
+        <button class="nav-btn" id="cal-prev" type="button">‹</button>
+        <button class="nav-btn" id="cal-next" type="button">›</button>
+      </div>
+    </div>
+    <div class="dow">
+      <span>MON</span><span>TUE</span><span>WED</span><span>THU</span><span>FRI</span>
+    </div>
+    <div class="grid" id="cal-grid">
+      <!-- 30 weekdays (5 weeks) Dec → Jan, populated by JS -->
+    </div>
+    <div class="legend">
+      <div class="row"><span class="swatch up"></span>UP DAY</div>
+      <div class="row"><span class="swatch dn"></span>DOWN DAY</div>
+      <div class="row"><span class="swatch flat"></span>FLAT (&lt; 0.1%)</div>
+    </div>
+  </aside>
+
+  <!-- ====== Center pane: equity + timeline ====== -->
+  <section class="center-pane">
+
+    <div class="rv-summary" id="rv-summary">
+      <div><div class="k">P&amp;L</div><div class="v" id="rvs-pnl-pct">—</div><div class="sub" id="rvs-pnl-usd">—</div></div>
+      <div><div class="k">FILLS</div><div class="v" id="rvs-fills">—</div><div class="sub" id="rvs-fills-detail">—</div></div>
+      <div><div class="k">EQUITY</div><div class="v" id="rvs-equity">—</div><div class="sub" id="rvs-equity-cum">—</div></div>
+      <div><div class="k">CASH</div><div class="v" id="rvs-cash">—</div><div class="sub" id="rvs-cash-pct">—</div></div>
+      <div><div class="k">CONNECTION</div><div class="v" id="rvs-conn" style="font-size:14px;font-family:var(--mono);letter-spacing:0.16em;color:var(--text-muted)">—</div><div class="sub" id="rvs-asof">—</div></div>
+      <div><div class="k">VARIANT</div><div class="v" id="rvs-variant" style="font-size:14px;font-family:var(--mono);letter-spacing:0.16em">—</div><div class="sub" id="rvs-strategy">—</div></div>
+    </div>
+
+    <!-- Equity panel — daily snapshots around the selected day. -->
+    <!-- (intraday minute-cadence equity is task #7 — for now we show -->
+    <!-- the recent 30-day equity curve with the selected day marked.) -->
+    <div class="equity-pane">
+      <div class="equity-head">
+        <span class="eyebrow" id="rv-equity-eyebrow">DAILY EQUITY · 30D</span>
+        <div class="legend">
+          <div class="item"><span class="swatch" style="background:#f5a524"></span><span style="color:var(--text)">EQUITY</span></div>
+          <div class="item"><span class="swatch" style="background:var(--coral)"></span><span style="color:var(--text-muted)">SELECTED</span></div>
+        </div>
+      </div>
+      <div class="equity-canvas">
+        <svg viewBox="0 0 1000 300" preserveAspectRatio="none" id="rv-equity-svg">
+          <defs>
+            <linearGradient id="eqf" x1="0" x2="0" y1="0" y2="1">
+              <stop offset="0%" stop-color="#f5a524" stop-opacity="0.18"/>
+              <stop offset="100%" stop-color="#f5a524" stop-opacity="0"/>
+            </linearGradient>
+          </defs>
+          <line x1="0" x2="1000" y1="60"  y2="60"  stroke="rgba(255,255,255,0.04)"/>
+          <line x1="0" x2="1000" y1="180" y2="180" stroke="rgba(125,216,127,0.15)" stroke-dasharray="3 6"/>
+          <line x1="0" x2="1000" y1="240" y2="240" stroke="rgba(255,255,255,0.04)"/>
+          <g id="rv-eq-axis"></g>
+          <path id="rv-eq-fill" d="" fill="url(#eqf)"/>
+          <path id="rv-eq-line" d="" fill="none" stroke="#f5a524" stroke-width="1.6"/>
+          <g id="rv-eq-markers"></g>
+          <line id="rv-eq-selected" x1="0" x2="0" y1="40" y2="280" stroke="var(--coral)" stroke-width="1.2" stroke-dasharray="3 4" opacity="0"/>
+          <g id="rv-eq-xaxis"></g>
+        </svg>
+      </div>
+    </div>
+
+    <!-- Variant lanes timeline — fills colored by variant on the day. -->
+    <div class="timeline-pane">
+      <div class="timeline-head">
+        <span>VARIANT LANES · FILLS</span>
+        <div class="lanes" id="rv-lane-legend"></div>
+      </div>
+      <div class="timeline-canvas">
+        <svg viewBox="0 0 1000 140" preserveAspectRatio="none" id="rv-timeline-svg">
+          <g id="rv-lane-bands"></g>
+          <g id="rv-lane-labels"></g>
+          <g id="rv-lane-markers"></g>
+
+          <!-- now line -->
+          <line x1="1000" x2="1000" y1="0" y2="140" stroke="var(--amber)" stroke-width="0.6" stroke-dasharray="2 4"/>
+        </svg>
+      </div>
+    </div>
+
+  </section>
+
+  <!-- ====== Fills pane (real fills only) ====== -->
+  <aside class="fills-pane">
+    <div class="head">
+      <span class="title">Fills</span>
+      <span class="count" id="rv-fills-count">— FILLS</span>
+    </div>
+    <div class="filterbar" id="rv-fills-filterbar">
+      <button class="chip on" data-f="all">ALL</button>
+      <button class="chip" data-f="buys">BUYS</button>
+      <button class="chip" data-f="sells">SELLS</button>
+    </div>
+    <div class="body" id="rv-fills-body">
+      <div class="fill" style="color:var(--text-faint)"><span class="t">—</span><div class="body"><div class="top"><span class="sym">…</span></div><div class="why">loading…</div></div><div class="pnl"></div></div>
+    </div>
+  </aside>
+</main>
+
+<script src="client.js"></script>
+<script>
+  const $  = (s, r=document) => r.querySelector(s);
+  const $$ = (s, r=document) => Array.from(r.querySelectorAll(s));
+  const MONTHS = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+
+  let variants = [];
+  let activeVariant = null;
+  let currentMonth = '';        // YYYY-MM
+  let selectedDate = '';        // YYYY-MM-DD
+  let calendarDays = [];        // raw days from /api/v2/calendar
+  let fillsFilter = 'all';      // all | buys | sells
+
+  function isoToday() {
+    const d = new Date();
+    return d.toISOString().slice(0,10);
+  }
+  function isoToDate(iso) { return new Date(iso + 'T12:00:00'); }
+  function fmtMonth(iso) { const d = isoToDate(iso + '-01'); return [MONTHS[d.getMonth()], d.getFullYear()]; }
+  function dayLabel(iso) {
+    const d = isoToDate(iso);
+    const dow = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'][d.getDay()];
+    return `${dow}, ${MONTHS[d.getMonth()].slice(0,3)} ${d.getDate()}`;
+  }
+
+  function buildVariantPicker() {
+    const root = $('#variant-group');
+    root.innerHTML = variants.map(v => {
+      const active = v.name === activeVariant;
+      return `<button class="${active ? 'active' : ''}" data-v="${v.name}" style="--c:${v.color}"><span class="swatch" style="background:${v.color}"></span>${v.display}</button>`;
+    }).join('');
+    root.addEventListener('click', e => {
+      const b = e.target.closest('button[data-v]'); if (!b) return;
+      activeVariant = b.dataset.v;
+      buildVariantPicker();
+      refreshAll();
+    }, { once: false });
+  }
+
+  async function loadCalendar() {
+    if (!activeVariant || !currentMonth) return;
+    try {
+      const data = await bb.fetchCalendar(activeVariant, currentMonth);
+      calendarDays = data.days || [];
+    } catch (e) { console.error('calendar', e); calendarDays = []; }
+    const [moName, year] = fmtMonth(currentMonth);
+    $('#cal-mo').textContent = moName;
+    $('#cal-yr').textContent = String(year);
+    renderCalendar();
+  }
+
+  function renderCalendar() {
+    const grid = $('#cal-grid');
+    const total = Math.ceil(Math.max(calendarDays.length, 5) / 5) * 5;
+    let html = '';
+    for (let i = 0; i < total; i++) {
+      const d = calendarDays[i];
+      if (!d) { html += '<div class="day empty"></div>'; continue; }
+      const cls = ['day'];
+      if (d.pnl_pct == null) cls.push('flat');
+      else if (d.pnl_pct >  0.10) cls.push('up');
+      else if (d.pnl_pct < -0.10) cls.push('dn');
+      else cls.push('flat');
+      if (d.date === selectedDate) cls.push('active');
+      if (d.date === isoToday())  cls.push('today');
+      const num = d.date.slice(8,10).replace(/^0/,'');
+      const pill = d.pnl_pct == null ? '—' : (d.pnl_pct >= 0 ? '+' : '') + d.pnl_pct.toFixed(2);
+      html += `<div class="${cls.join(' ')}" data-day="${d.date}"><span class="num">${num}</span><span class="pill">${pill}</span></div>`;
+    }
+    grid.innerHTML = html;
+  }
+
+  function selectDate(iso) {
+    if (!iso) return;
+    selectedDate = iso;
+    const lbl = $('#day-display');
+    if (lbl) lbl.innerHTML = `${dayLabel(iso)} <span class="sub">${iso}</span>`;
+    renderCalendar();
+    refreshDay();
+  }
+
+  // Equity SVG (daily snapshots — task #7 will add intraday).
+  async function refreshEquity() {
+    const eq = await bb.fetchEquityDaily(activeVariant, '30d');
+    const points = eq.points || [];
+    if (!points.length) {
+      $('#rv-eq-line').setAttribute('d', '');
+      $('#rv-eq-fill').setAttribute('d', '');
+      $('#rv-eq-markers').innerHTML = '';
+      $('#rv-eq-xaxis').innerHTML = '';
+      $('#rv-eq-selected').setAttribute('opacity', 0);
+      $('#rv-equity-eyebrow').textContent = 'DAILY EQUITY · no snapshots';
+      return;
+    }
+    const xs = points.map((_,i) => 20 + (i / Math.max(1, points.length-1)) * 970);
+    const cums = points.map(p => p.cum_pct || 0);
+    const lo = Math.min(0, ...cums), hi = Math.max(0, ...cums);
+    const range = (hi - lo) || 1;
+    const ys = cums.map(v => 280 - ((v - lo)/range) * 220);
+    let dLine = `M${xs[0]},${ys[0].toFixed(1)}`;
+    for (let i=1; i<xs.length; i++) dLine += ` L${xs[i].toFixed(1)},${ys[i].toFixed(1)}`;
+    const dFill = dLine + ` L${xs.at(-1)},300 L${xs[0]},300 Z`;
+    $('#rv-eq-line').setAttribute('d', dLine);
+    $('#rv-eq-fill').setAttribute('d', dFill);
+
+    // Markers — one dot per day, colored by daily pnl sign.
+    $('#rv-eq-markers').innerHTML = points.map((p,i) => {
+      const c = (p.daily_pl_pct ?? 0) >= 0 ? '#7dd87f' : '#e85a5a';
+      return `<circle cx="${xs[i].toFixed(1)}" cy="${ys[i].toFixed(1)}" r="2.5" fill="${c}"/>`;
+    }).join('');
+
+    // Selected-date marker
+    const idx = points.findIndex(p => p.date === selectedDate);
+    if (idx >= 0) {
+      $('#rv-eq-selected').setAttribute('x1', xs[idx]); $('#rv-eq-selected').setAttribute('x2', xs[idx]);
+      $('#rv-eq-selected').setAttribute('opacity', 1);
+    } else {
+      $('#rv-eq-selected').setAttribute('opacity', 0);
+    }
+
+    // X-axis labels (every ~5)
+    let ax = '';
+    const step = Math.max(1, Math.floor(points.length / 5));
+    for (let i=0; i<points.length; i+=step) {
+      ax += `<text x="${xs[i].toFixed(1)}" y="296" fill="var(--text-faint)" font-size="9" letter-spacing="0.16em" font-family="JetBrains Mono">${points[i].date.slice(5).replace('-','/')}</text>`;
+    }
+    $('#rv-eq-xaxis').innerHTML = ax;
+    $('#rv-equity-eyebrow').textContent = `DAILY EQUITY · ${points.length}D · ${activeVariant}`;
+  }
+
+  // Day-detail: load fills for the selected day across all variants for the
+  // lane timeline, plus single-variant numbers for the top stats.
+  async function refreshDay() {
+    if (!selectedDate) return;
+
+    // Top stats from the calendar row (already loaded)
+    const calRow = calendarDays.find(d => d.date === selectedDate);
+    if (calRow) {
+      const pnlPct = calRow.pnl_pct;
+      const pnlUsd = calRow.pnl_usd;
+      const tone = pnlPct == null ? 'var(--text-faint)' : (pnlPct >= 0 ? 'var(--mint)' : 'var(--coral)');
+      const set = (sel, html) => { const e = $(sel); if (e) e.innerHTML = html; };
+      set('#rv-pnl-pct', `<span style="color:${tone}">${bb.fmt.pct(pnlPct)}</span>`);
+      set('#rv-pnl-usd', `<span style="color:${tone}">${bb.fmt.usd(pnlUsd)}</span>`);
+      set('#rv-fills', String(calRow.fills));
+      set('#rvs-pnl-pct', `<span style="color:${tone}">${bb.fmt.pct(pnlPct)}</span>`);
+      set('#rvs-pnl-usd', bb.fmt.usd(pnlUsd));
+      set('#rvs-fills', String(calRow.fills));
+      // Wins/losses populated below from fills
+      set('#rvs-fills-detail', '—');
+    }
+
+    // Cross-variant fills for this day for the timeline + fills pane
+    let crossRows = [];
+    try {
+      const data = await fetch(`/api/v2/fills?day=${selectedDate}&limit=200`).then(r => r.json());
+      crossRows = data.fills || [];
+    } catch (e) { console.error(e); }
+    renderTimeline(crossRows);
+    renderFills(crossRows);
+
+    // Active-variant equity snapshot (most recent ≤ selectedDate)
+    try {
+      const eq = await bb.fetchEquityDaily(activeVariant, '30d');
+      const points = eq.points || [];
+      const onOrBefore = points.filter(p => p.date <= selectedDate);
+      const last = onOrBefore.at(-1);
+      const set = (sel, html) => { const e = $(sel); if (e) e.innerHTML = html; };
+      if (last) {
+        set('#rv-equity', '$' + Math.round(last.equity).toLocaleString());
+        set('#rvs-equity', '$' + Math.round(last.equity).toLocaleString());
+        set('#rvs-equity-cum', `${last.cum_pct >= 0 ? '+' : ''}${last.cum_pct.toFixed(2)}% cum`);
+        set('#rvs-cash', '$' + Math.round(last.cash || 0).toLocaleString());
+        set('#rvs-cash-pct', last.equity ? `${(100*(last.cash||0)/last.equity).toFixed(0)}% of equity` : '—');
+      }
+      const v = variants.find(x => x.name === activeVariant);
+      set('#rvs-variant', v ? `<span style="color:${v.color}">${v.display}</span>` : '—');
+      set('#rvs-strategy', v ? v.sleeve : '—');
+    } catch (e) { console.error(e); }
+  }
+
+  function renderTimeline(crossRows) {
+    // Lane = variant, x = time-of-day. Filter to fills on selectedDate.
+    const dayRows = crossRows.filter(r => (r.timestamp || '').slice(0,10) === selectedDate);
+    const presentVariants = [];
+    const seen = new Set();
+    dayRows.forEach(r => { if (!seen.has(r.variant)) { seen.add(r.variant); presentVariants.push(variants.find(v => v.name === r.variant) || { name: r.variant, color: '#888', display: r.variant }); }});
+    // Always include active variant first
+    const av = variants.find(v => v.name === activeVariant);
+    if (av && !seen.has(av.name)) presentVariants.unshift(av);
+
+    const lanes = presentVariants.slice(0, 4);
+    const laneH = 28;
+    const top = 6;
+    let bands = '', labels = '', markers = '';
+    lanes.forEach((v, i) => {
+      const y = top + i * (laneH + 6);
+      const colorAlpha = v.color + '0a';
+      bands += `<rect x="0" y="${y}" width="1000" height="${laneH}" fill="rgba(255,255,255,0.03)" stroke="${v.color}" stroke-opacity="0.18"/>`;
+      labels += `<text x="6" y="${y + 16}" fill="${v.color}" font-size="9" letter-spacing="0.18em" font-family="JetBrains Mono">${v.display}</text>`;
+      const rows = dayRows.filter(r => r.variant === v.name);
+      rows.forEach(r => {
+        const t = (r.timestamp || '').slice(11,19);
+        const [hh,mm] = t.split(':').map(Number);
+        const minOfDay = (isFinite(hh) && isFinite(mm)) ? (hh*60 + mm) : null;
+        if (minOfDay == null) return;
+        // 9:30 → 16:00 = 390 minutes window (390 = 6.5h * 60)
+        const x = ((minOfDay - 570) / 390) * 1000;
+        const cx = Math.max(0, Math.min(1000, x));
+        const fill = (r.side || '').toLowerCase() === 'sell' ? '#e85a5a' : '#7dd87f';
+        markers += `<circle cx="${cx.toFixed(1)}" cy="${y + laneH/2}" r="3.5" fill="${fill}"><title>${r.symbol} ${r.side} ${r.timestamp}</title></circle>`;
+      });
+    });
+    $('#rv-lane-bands').innerHTML = bands;
+    $('#rv-lane-labels').innerHTML = labels;
+    $('#rv-lane-markers').innerHTML = markers;
+    $('#rv-lane-legend').innerHTML = lanes.map(v => `<span class="lane"><span class="dot" style="background:${v.color}"></span>${v.display}</span>`).join('');
+  }
+
+  function renderFills(crossRows) {
+    const dayRows = crossRows.filter(r => (r.timestamp || '').slice(0,10) === selectedDate);
+    const counts = {
+      all: dayRows.length,
+      buys: dayRows.filter(r => (r.side||'').toLowerCase() === 'buy').length,
+      sells: dayRows.filter(r => (r.side||'').toLowerCase() === 'sell').length,
+    };
+    $('#rv-fills-count').textContent = `${counts.all} FILL${counts.all===1?'':'S'} · ${counts.buys}B · ${counts.sells}S`;
+    const filterBar = $('#rv-fills-filterbar');
+    filterBar.innerHTML =
+      `<button class="chip ${fillsFilter==='all'?'on':''}" data-f="all">ALL · ${counts.all}</button>` +
+      `<button class="chip ${fillsFilter==='buys'?'on':''}" data-f="buys">BUYS · ${counts.buys}</button>` +
+      `<button class="chip ${fillsFilter==='sells'?'on':''}" data-f="sells">SELLS · ${counts.sells}</button>`;
+
+    let rows = dayRows;
+    if (fillsFilter === 'buys') rows = rows.filter(r => (r.side||'').toLowerCase() === 'buy');
+    else if (fillsFilter === 'sells') rows = rows.filter(r => (r.side||'').toLowerCase() === 'sell');
+
+    const body = $('#rv-fills-body');
+    if (!rows.length) {
+      body.innerHTML = `<div class="fill" style="color:var(--text-faint)"><span class="t">—</span><div class="body"><div class="top"><span class="sym">—</span></div><div class="why">no fills</div></div><div class="pnl"></div></div>`;
+      return;
+    }
+    body.innerHTML = rows.map(r => {
+      const t = (r.timestamp||'').slice(11,16);
+      const side = (r.side||'').toLowerCase();
+      const pnlPct = r.pnl_pct;
+      const isExit = side === 'sell';
+      const cls = isExit ? (pnlPct == null ? '' : (pnlPct >= 0 ? 'up' : 'dn')) : '';
+      const pnlBig = isExit && pnlPct != null ? bb.fmt.pct(pnlPct) : '—';
+      const px = r.entry_px != null && r.filled_price != null
+                 ? `${r.entry_px.toFixed(2)} → ${r.filled_price.toFixed(2)}`
+                 : (r.filled_price != null ? `@ ${r.filled_price.toFixed(2)}` : '');
+      const why = (r.why || '').replace(/[<>]/g, '').slice(0, 100);
+      return `<div class="fill ${isExit ? '' : 'open'}">
+        <span class="t">${t}</span>
+        <div class="body">
+          <div class="top"><span class="sym">${r.symbol}</span><span class="side-tag ${side}">${side.toUpperCase()}</span><span class="var-tag"><span class="swatch" style="background:${r.color}"></span>${r.variant_display}</span></div>
+          <div class="why">${why || '—'}</div>
+        </div>
+        <div class="pnl ${cls}"><div class="big">${pnlBig}</div><div class="px">${px}</div></div>
+      </div>`;
+    }).join('');
+  }
+
+  // Calendar click + nav
+  $('#cal-grid').addEventListener('click', e => {
+    const c = e.target.closest('.day'); if (!c || c.classList.contains('empty')) return;
+    selectDate(c.dataset.day);
+  });
+  $('#cal-prev').addEventListener('click', () => navMonth(-1));
+  $('#cal-next').addEventListener('click', () => navMonth(+1));
+  $('#prev-day').addEventListener('click', () => navDay(-1));
+  $('#next-day').addEventListener('click', () => navDay(+1));
+
+  function navMonth(delta) {
+    const [y, m] = currentMonth.split('-').map(Number);
+    const nm = m + delta;
+    const ny = y + Math.floor((nm - 1) / 12);
+    const mm = ((nm - 1) % 12 + 12) % 12 + 1;
+    currentMonth = `${ny}-${String(mm).padStart(2,'0')}`;
+    loadCalendar().then(() => {
+      // Don't auto-shift selectedDate; user picks a new day from the new month.
+    });
+  }
+  function navDay(delta) {
+    const idx = calendarDays.findIndex(d => d.date === selectedDate);
+    if (idx < 0) return;
+    const next = calendarDays[idx + delta];
+    if (next) selectDate(next.date);
+  }
+
+  // Fills filter (delegated)
+  document.addEventListener('click', e => {
+    const b = e.target.closest('#rv-fills-filterbar button[data-f]'); if (!b) return;
+    fillsFilter = b.dataset.f;
+    refreshDay();
+  });
+
+  // Connection indicator
+  bb.on('events.connected',    () => { const e = $('#rvs-conn'); if (e) { e.textContent = 'CONNECTED'; e.style.color = 'var(--mint)'; }});
+  bb.on('events.disconnected', () => { const e = $('#rvs-conn'); if (e) { e.textContent = 'OFFLINE'; e.style.color = 'var(--coral)'; }});
+
+  async function refreshAll() {
+    await loadCalendar();
+    // Pick the most-recent day with data, else today.
+    const withData = calendarDays.filter(d => d.pnl_pct != null);
+    const target = (withData.at(-1)?.date) || calendarDays.findLast(d => d.date <= isoToday())?.date || calendarDays.at(-1)?.date;
+    if (target) selectDate(target);
+    await refreshEquity();
+    $('#rv-topbar-label').textContent = `REVIEW · ${activeVariant} · ${selectedDate || '—'}`;
+    $('#rvs-asof').textContent = bb.asof ? bb.fmt.time(bb.asof) : '—';
+  }
+
+  (async () => {
+    try {
+      await bb.hydrate();
+      variants = bb.state.variants || [];
+      if (!variants.length) {
+        $('#rv-fills-body').innerHTML = `<div class="fill" style="color:var(--coral)"><span class="t">—</span><div class="body"><div class="why">no variants found</div></div></div>`;
+        return;
+      }
+      activeVariant = variants[0].name;
+      currentMonth = isoToday().slice(0, 7);
+      buildVariantPicker();
+      bb.connectEvents();
+      await refreshAll();
+    } catch (err) {
+      console.error(err);
+      $('#rv-fills-body').innerHTML = `<div class="fill" style="color:var(--coral)"><span class="t">—</span><div class="body"><div class="why">error: ${err.message}</div></div></div>`;
+    }
+  })();
+</script>
+</body>
+</html>

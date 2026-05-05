@@ -1,0 +1,133 @@
+/* ============================================================
+ * Shared design tokens — lifted from baibot/static/style.css
+ * so every concept artboard in this canvas reads from the same
+ * Bloomberg-instrument vocabulary. Concepts can layer their own
+ * tweaks on top.
+ * ============================================================ */
+
+:root {
+  /* Surfaces */
+  --bg:            #0a0a0d;
+  --surface:       #111114;
+  --surface-up:    #16161a;
+  --surface-deep:  #050507;
+
+  /* Borders */
+  --border:        #1f1f25;
+  --border-strong: #2a2a32;
+  --border-hot:    #3a3140;
+
+  /* Type */
+  --text:          #e8e6df;
+  --text-muted:    #7a7a82;
+  --text-faint:    #4d4d54;
+  --text-dim:      #61616a;
+
+  /* Semantic */
+  --amber:         #f5a524;
+  --amber-bright:  #ffb84a;
+  --amber-deep:    #a06f17;
+  --amber-glow:    rgba(245, 165, 36, 0.18);
+  --amber-faint:   rgba(245, 165, 36, 0.06);
+
+  --teal:          #5ec5b7;
+  --teal-deep:     #2d8d82;
+  --coral:         #e85a5a;
+  --coral-deep:    #a83434;
+  --mint:          #7dd87f;
+  --mint-faint:    rgba(125, 216, 127, 0.08);
+  --purple:        #c4a8ff;
+  --purple-faint:  rgba(196, 168, 255, 0.08);
+
+  /* Type families */
+  --mono:          'JetBrains Mono', 'IBM Plex Mono', Menlo, Consolas, monospace;
+  --serif:         'Instrument Serif', 'Iowan Old Style', Georgia, serif;
+}
+
+/* Generic block recycled by every concept */
+.tile {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.tile-head {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.55rem 0.85rem 0.5rem;
+  border-bottom: 1px solid var(--border);
+  background: linear-gradient(to bottom, rgba(255,255,255,0.018), transparent 80%);
+}
+.tile-label {
+  font-size: 0.58rem;
+  font-weight: 600;
+  letter-spacing: 0.28em;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  position: relative;
+  padding-left: 0.85rem;
+}
+.tile-label::before {
+  content: '';
+  position: absolute;
+  left: 0; top: 50%;
+  transform: translateY(-50%);
+  width: 6px; height: 6px;
+  background: var(--amber);
+  clip-path: polygon(0 0, 100% 50%, 0 100%);
+}
+.tile-meta {
+  margin-left: auto;
+  font-size: 0.58rem;
+  letter-spacing: 0.18em;
+  color: var(--text-faint);
+  text-transform: lowercase;
+}
+
+.eyebrow {
+  font-size: 0.56rem;
+  letter-spacing: 0.28em;
+  font-weight: 600;
+  color: var(--text-faint);
+  text-transform: uppercase;
+}
+.serif-italic {
+  font-family: var(--serif);
+  font-style: italic;
+  letter-spacing: -0.005em;
+}
+.tnum { font-variant-numeric: tabular-nums; }
+
+/* Mock chart placeholder — striped, not faked */
+.mock-chart {
+  flex: 1;
+  position: relative;
+  background:
+    repeating-linear-gradient(
+      to right,
+      rgba(255,255,255,0.012) 0 1px,
+      transparent 1px 32px),
+    repeating-linear-gradient(
+      to bottom,
+      rgba(255,255,255,0.012) 0 1px,
+      transparent 1px 32px),
+    var(--surface-deep);
+  overflow: hidden;
+}
+.mock-chart-line {
+  position: absolute;
+  left: 0; right: 0;
+  height: 60%;
+  bottom: 12%;
+}
+
+.scrollable-y { overflow-y: auto; }
+.scrollable-y::-webkit-scrollbar { width: 6px; }
+.scrollable-y::-webkit-scrollbar-track { background: transparent; }
+.scrollable-y::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 3px;
+}
+.scrollable-y::-webkit-scrollbar-thumb:hover { background: var(--border-strong); }

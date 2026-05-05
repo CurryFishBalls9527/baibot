@@ -1,0 +1,530 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=1520">
+<title>baibot — versus</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=JetBrains+Mono:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="tokens.css">
+<style>
+  *,*::before,*::after{box-sizing:border-box}
+  html,body{margin:0;background:#06060a;color:var(--text);font-family:var(--mono);-webkit-font-smoothing:antialiased;height:100%}
+  body{display:flex;flex-direction:column;min-width:1480px;height:100vh;overflow:hidden}
+
+  nav.top{flex-shrink:0;display:flex;align-items:stretch;height:52px;background:#0a0a0d;border-bottom:1px solid var(--border);padding:0 18px}
+  nav.top .brand{display:flex;align-items:baseline;gap:10px;margin-right:24px;align-self:center}
+  nav.top .brand .mark{font-family:var(--serif);font-style:italic;font-size:22px;line-height:1}
+  nav.top .brand .rule{width:18px;height:1px;background:var(--amber)}
+  nav.top .brand .label{font-size:9.5px;letter-spacing:0.32em;color:var(--text-muted);font-weight:500}
+  nav.top a{color:var(--text-faint);text-decoration:none;font-size:10.5px;font-weight:600;letter-spacing:0.24em;text-transform:uppercase;padding:0 18px;display:inline-flex;align-items:center;border-bottom:2px solid transparent;margin-bottom:-1px;transition:color 140ms ease}
+  nav.top a:hover{color:var(--text)}
+  nav.top a.active{color:var(--text);border-bottom-color:var(--amber);background:linear-gradient(to bottom,transparent,var(--amber-faint))}
+  nav.top .spacer{flex:1}
+  nav.top .now{align-self:center;font-size:10px;letter-spacing:0.22em;color:var(--text-faint)}
+
+  /* ===== Sub-toolbar: pickers + date range ===== */
+  .vs-toolbar{
+    flex-shrink:0;display:flex;align-items:center;gap:18px;
+    background:var(--surface-deep);border-bottom:1px solid var(--border);
+    padding:14px 22px;
+  }
+  .picker{display:flex;align-items:center;gap:10px}
+  .picker .lbl{font-size:9.5px;letter-spacing:0.28em;color:var(--text-faint);font-weight:600;text-transform:uppercase}
+  .swatch{width:8px;height:8px;flex-shrink:0}
+  .pill-group{display:inline-flex;border:1px solid var(--border-strong)}
+  .pill-group button{
+    background:transparent;color:var(--text-muted);border:none;
+    font-family:var(--mono);font-size:10px;letter-spacing:0.18em;font-weight:600;
+    padding:6px 12px;cursor:pointer;border-right:1px solid var(--border);
+    text-transform:uppercase;display:inline-flex;align-items:center;gap:6px;
+  }
+  .pill-group button:last-child{border-right:none}
+  .pill-group button:hover{color:var(--text)}
+  .pill-group button.active{color:var(--text);background:rgba(245,165,36,0.06)}
+  .pill-group button.active.A{box-shadow:inset 0 -2px 0 #f5a524;color:#f5a524}
+  .pill-group button.active.B{box-shadow:inset 0 -2px 0 #c4a8ff;color:#c4a8ff}
+
+  .range-group{display:inline-flex;border:1px solid var(--border-strong);margin-left:auto}
+  .range-group button{
+    background:transparent;color:var(--text-muted);border:none;
+    font-family:var(--mono);font-size:10px;letter-spacing:0.18em;font-weight:600;
+    padding:6px 11px;cursor:pointer;border-right:1px solid var(--border);
+    text-transform:uppercase;
+  }
+  .range-group button:last-child{border-right:none}
+  .range-group button:hover{color:var(--text)}
+  .range-group button.active{color:var(--amber);background:rgba(245,165,36,0.10)}
+
+  /* ===== Header strip with summary cards ===== */
+  .vs-summary{
+    flex-shrink:0;display:grid;grid-template-columns:1fr 1fr;
+    border-bottom:1px solid var(--border);
+  }
+  .vs-card{
+    padding:22px 26px 24px;border-right:1px solid var(--border);
+    position:relative;
+  }
+  .vs-card:last-child{border-right:none}
+  .vs-card .top{display:flex;align-items:baseline;gap:10px;margin-bottom:8px}
+  .vs-card .top .swatch{width:10px;height:10px}
+  .vs-card .top .name{font-family:var(--serif);font-style:italic;font-size:24px;color:var(--text);line-height:1}
+  .vs-card .top .sleeve{font-size:9.5px;letter-spacing:0.22em;color:var(--text-faint);text-transform:uppercase}
+  .vs-card .pnl{display:flex;align-items:baseline;gap:18px;margin-top:6px}
+  .vs-card .pnl .big{font-family:var(--serif);font-style:italic;font-size:38px;line-height:1;letter-spacing:-0.005em;font-variant-numeric:tabular-nums}
+  .vs-card .pnl .delta{font-size:11px;color:var(--text-muted);font-variant-numeric:tabular-nums;letter-spacing:0.04em}
+  .vs-card .stats{display:grid;grid-template-columns:repeat(4,1fr);gap:18px;margin-top:14px}
+  .vs-card .stats .k{font-size:9px;letter-spacing:0.22em;color:var(--text-faint);text-transform:uppercase;font-weight:600}
+  .vs-card .stats .v{font-size:14px;color:var(--text);font-variant-numeric:tabular-nums;margin-top:3px}
+  .vs-card.A{box-shadow:inset 3px 0 0 #f5a524}
+  .vs-card.B{box-shadow:inset -3px 0 0 #c4a8ff}
+  .vs-card .winner-tag{position:absolute;top:22px;right:26px;font-size:9px;letter-spacing:0.24em;font-weight:700;color:var(--mint);text-transform:uppercase;padding:3px 7px;border:1px solid var(--mint)}
+
+  /* ===== Body: chart + trade table ===== */
+  main.vs-body{flex:1;min-height:0;display:grid;grid-template-columns:1.4fr 1fr}
+  .vs-chart{
+    border-right:1px solid var(--border);background:var(--surface);
+    display:flex;flex-direction:column;min-height:0;
+  }
+  .vs-chart .head{padding:14px 22px 12px;border-bottom:1px solid var(--border);display:flex;align-items:baseline;gap:14px}
+  .vs-chart .head .eyebrow{font-size:9.5px;letter-spacing:0.28em;color:var(--text-faint);text-transform:uppercase;font-weight:600}
+  .vs-chart .head .legend{margin-left:auto;display:flex;gap:14px;font-size:10.5px}
+  .vs-chart .head .legend .item{display:inline-flex;align-items:center;gap:6px}
+  .vs-chart .head .legend .item .swatch{width:10px;height:2px}
+  .vs-chart .head .legend .item .name{font-family:var(--serif);font-style:italic;font-size:13px}
+  .vs-chart .head .legend .item .num{color:var(--text-muted);font-variant-numeric:tabular-nums}
+  .vs-chart .canvas{flex:1;position:relative;min-height:0;padding:18px 12px 12px}
+  .vs-chart .canvas svg{width:100%;height:100%;display:block}
+  .vs-chart .footer{
+    border-top:1px solid var(--border);padding:10px 22px;
+    display:flex;gap:24px;font-size:10px;color:var(--text-muted);
+    font-variant-numeric:tabular-nums;letter-spacing:0.06em;
+  }
+  .vs-chart .footer b{color:var(--text);font-weight:500;margin-left:6px}
+
+  /* head-to-head spread chart */
+  .vs-spread{
+    border-top:1px solid var(--border);height:100px;flex-shrink:0;padding:8px 22px 6px;
+  }
+  .vs-spread .lbl{font-size:9.5px;letter-spacing:0.28em;color:var(--text-faint);text-transform:uppercase;font-weight:600;display:flex;align-items:baseline;gap:10px;margin-bottom:4px}
+  .vs-spread .lbl .v{margin-left:auto;font-size:10.5px;color:var(--mint);font-variant-numeric:tabular-nums;letter-spacing:0.06em}
+  .vs-spread svg{width:100%;height:60px;display:block}
+
+  /* ===== Trade table ===== */
+  .vs-table{display:flex;flex-direction:column;min-height:0;background:var(--surface)}
+  .vs-table .head{
+    display:grid;grid-template-columns:60px 80px 64px 80px 80px 80px 1fr;
+    padding:10px 18px;font-size:9px;letter-spacing:0.22em;font-weight:600;
+    color:var(--text-faint);text-transform:uppercase;border-bottom:1px solid var(--border);
+    background:var(--surface-deep);
+  }
+  .vs-table .head > div:nth-child(7){text-align:right}
+  .vs-table .body{flex:1;overflow-y:auto;min-height:0}
+  .vs-table .body::-webkit-scrollbar{width:6px}
+  .vs-table .body::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+  .vs-table .row{
+    display:grid;grid-template-columns:60px 80px 64px 80px 80px 80px 1fr;
+    padding:9px 18px;font-size:11px;font-variant-numeric:tabular-nums;
+    border-bottom:1px dotted rgba(255,255,255,0.05);align-items:center;cursor:pointer;
+  }
+  .vs-table .row:hover{background:rgba(245,165,36,0.04)}
+  .vs-table .row .var{display:inline-flex;align-items:center;gap:6px;font-size:9.5px;letter-spacing:0.18em;font-weight:600;text-transform:uppercase}
+  .vs-table .row .var .swatch{width:6px;height:6px}
+  .vs-table .row .sym{font-family:var(--serif);font-style:italic;font-size:14px}
+  .vs-table .row .pnl{font-weight:500;text-align:right}
+  .vs-table .row .pnl.up{color:var(--mint)}
+  .vs-table .row .pnl.dn{color:var(--coral)}
+  .vs-table .row .t{color:var(--text-faint)}
+  .vs-table .row .why{color:var(--text-muted);text-align:right;font-size:10px}
+  .vs-table .filterbar{
+    display:flex;gap:10px;padding:10px 18px;border-bottom:1px solid var(--border);
+    background:var(--surface-deep);
+  }
+  .vs-table .filterbar .chip{
+    font-size:9.5px;letter-spacing:0.18em;font-weight:600;padding:4px 9px;
+    border:1px solid var(--border-strong);color:var(--text-muted);
+    cursor:pointer;text-transform:uppercase;background:transparent;font-family:var(--mono);
+  }
+  .vs-table .filterbar .chip:hover{color:var(--text)}
+  .vs-table .filterbar .chip.on{color:var(--text);border-color:var(--amber);background:rgba(245,165,36,0.06)}
+  .vs-table .filterbar .summary{margin-left:auto;font-size:10px;color:var(--text-muted);letter-spacing:0.06em;align-self:center;font-variant-numeric:tabular-nums}
+
+  .side-tag{display:inline-block;font-size:9px;letter-spacing:0.18em;font-weight:700;padding:1px 5px;border:1px solid currentColor;line-height:1.3}
+  .side-tag.buy{color:var(--teal)} .side-tag.sell{color:var(--coral)}
+</style>
+</head>
+<body>
+
+<nav class="top">
+  <div class="brand">
+    <span class="mark">baibot</span>
+    <span class="rule"></span>
+    <span class="label">TELEMETRY</span>
+  </div>
+  <a href="floor.html">FLOOR</a>
+  <a href="versus.html" class="active">VERSUS</a>
+  <a href="review.html">REVIEW</a>
+  <span class="spacer"></span>
+  <span class="now">2 VARIANTS · 30D · 76 TRADES</span>
+</nav>
+
+<!-- ===== Toolbar ===== -->
+<div class="vs-toolbar">
+  <div class="picker">
+    <span class="lbl">A</span>
+    <div class="pill-group" id="pickA"></div>
+  </div>
+  <div class="picker">
+    <span class="lbl">B</span>
+    <div class="pill-group" id="pickB"></div>
+  </div>
+  <div class="range-group">
+    <button>5D</button>
+    <button class="active">30D</button>
+    <button>QTD</button>
+    <button>YTD</button>
+    <button>1Y</button>
+    <button>CUSTOM</button>
+  </div>
+</div>
+
+<!-- ===== Summary cards ===== -->
+<section class="vs-summary">
+  <div class="vs-card A" id="vs-card-a"></div>
+  <div class="vs-card B" id="vs-card-b"></div>
+</section>
+
+<!-- ===== Body ===== -->
+<main class="vs-body">
+
+  <!-- ====== Chart pane ====== -->
+  <div class="vs-chart">
+    <div class="head">
+      <span class="eyebrow" id="vs-chart-eyebrow">CUMULATIVE P&amp;L · 30D</span>
+      <div class="legend" id="vs-legend"></div>
+    </div>
+
+    <div class="canvas">
+      <svg viewBox="0 0 1000 500" preserveAspectRatio="none">
+        <defs>
+          <linearGradient id="vsA-fill" x1="0" x2="0" y1="0" y2="1"><stop offset="0%" stop-color="#f5a524" stop-opacity="0.20"/><stop offset="100%" stop-color="#f5a524" stop-opacity="0"/></linearGradient>
+          <linearGradient id="vsB-fill" x1="0" x2="0" y1="0" y2="1"><stop offset="0%" stop-color="#c4a8ff" stop-opacity="0.20"/><stop offset="100%" stop-color="#c4a8ff" stop-opacity="0"/></linearGradient>
+        </defs>
+
+        <!-- y-axis grid -->
+        <line x1="0" x2="1000" y1="100" y2="100" stroke="rgba(255,255,255,0.04)"/>
+        <line x1="0" x2="1000" y1="200" y2="200" stroke="rgba(255,255,255,0.04)"/>
+        <line x1="0" x2="1000" y1="300" y2="300" stroke="rgba(255,255,255,0.04)"/>
+        <line x1="0" x2="1000" y1="400" y2="400" stroke="rgba(255,255,255,0.04)"/>
+        <line x1="0" x2="1000" y1="350" y2="350" stroke="rgba(125,216,127,0.15)" stroke-dasharray="3 6"/>
+        <text x="6" y="98"  fill="var(--text-faint)" font-size="9" letter-spacing="0.16em" font-family="JetBrains Mono">+24%</text>
+        <text x="6" y="198" fill="var(--text-faint)" font-size="9" letter-spacing="0.16em" font-family="JetBrains Mono">+16%</text>
+        <text x="6" y="298" fill="var(--text-faint)" font-size="9" letter-spacing="0.16em" font-family="JetBrains Mono">+8%</text>
+        <text x="6" y="354" fill="var(--mint)"      font-size="9" letter-spacing="0.16em" font-family="JetBrains Mono">0%</text>
+        <text x="6" y="398" fill="var(--text-faint)" font-size="9" letter-spacing="0.16em" font-family="JetBrains Mono">−4%</text>
+
+        <!-- B curve (rendered first so A draws on top). JS sets ``d`` and stroke. -->
+        <path id="vs-curve-b-fill" d="" fill="url(#vsB-fill)"/>
+        <path id="vs-curve-b-line" d="" fill="none" stroke="#c4a8ff" stroke-width="1.6"/>
+
+        <!-- A curve. -->
+        <path id="vs-curve-a-fill" d="" fill="url(#vsA-fill)"/>
+        <path id="vs-curve-a-line" d="" fill="none" stroke="#f5a524" stroke-width="1.8"/>
+
+        <!-- Per-trade dots — JS-rendered. -->
+        <g id="vs-dots" opacity="0.55"></g>
+
+        <!-- date axis — JS-rendered (one tick per page-quartile of the range). -->
+        <g id="vs-axis"></g>
+      </svg>
+    </div>
+
+    <div class="footer" id="vs-footer">
+      <span>trades A<b id="vs-trades-a">—</b></span>
+      <span>trades B<b id="vs-trades-b">—</b></span>
+      <span>expectancy A<b id="vs-exp-a">—</b></span>
+      <span>expectancy B<b id="vs-exp-b">—</b></span>
+      <span>profit f. A<b id="vs-pf-a">—</b></span>
+      <span>profit f. B<b id="vs-pf-b">—</b></span>
+    </div>
+
+    <!-- A − B spread -->
+    <div class="vs-spread">
+      <div class="lbl">A − B SPREAD <span class="v" id="vs-spread-label">—</span></div>
+      <svg viewBox="0 0 1000 60" preserveAspectRatio="none">
+        <line x1="0" x2="1000" y1="30" y2="30" stroke="rgba(255,255,255,0.06)"/>
+        <path id="vs-spread-fill" d="" fill="rgba(245,165,36,0.18)"/>
+        <path id="vs-spread-line" d="" fill="none" stroke="#f5a524" stroke-width="1.2"/>
+      </svg>
+    </div>
+  </div>
+
+  <!-- ====== Trade table ====== -->
+  <div class="vs-table">
+    <div class="filterbar" id="vs-filterbar"></div>
+    <div class="head">
+      <div>VARIANT</div><div>SYMBOL</div><div>SIDE</div><div>ENTRY</div><div>EXIT</div><div>P&amp;L</div><div>WHY</div>
+    </div>
+    <div class="body" id="vs-trades-body">
+      <div class="row" style="grid-template-columns:1fr"><span class="why" style="color:var(--text-faint)">loading…</span></div>
+    </div>
+  </div>
+</main>
+
+<script src="client.js"></script>
+<script>
+  const $ = (s, root=document) => root.querySelector(s);
+  const $$ = (s, root=document) => Array.from(root.querySelectorAll(s));
+
+  // SVG drawing region (matches viewBox 0 0 1000 500). 0% line is at y=350.
+  const VB_W = 1000, VB_H = 500, VB_ZERO = 350;
+
+  let variants = [];      // populated from /api/v2/state
+  let varA = null, varB = null;
+  let range = '30d';
+  let filter = 'all';     // 'all' | 'a' | 'b' | 'wins' | 'losses'
+  let lastVersus = null;
+
+  function colorFor(name) { const v = variants.find(x => x.name === name); return v?.color || '#888'; }
+  function displayFor(name) { const v = variants.find(x => x.name === name); return v?.display || name; }
+  function sleeveFor(name) { const v = variants.find(x => x.name === name); return v?.sleeve || ''; }
+
+  function buildPickers() {
+    ['pickA','pickB'].forEach(id => {
+      const root = $('#' + id);
+      root.innerHTML = variants.map(v => {
+        const active = (id === 'pickA' && v.name === varA) || (id === 'pickB' && v.name === varB);
+        const cls = 'active ' + (id === 'pickA' ? 'A' : 'B');
+        return `<button class="${active ? cls : ''}" data-v="${v.name}" style="--c:${v.color}"><span class="swatch" style="background:${v.color}"></span>${v.display}</button>`;
+      }).join('');
+    });
+  }
+
+  function bindPicker(rootId) {
+    $('#' + rootId).addEventListener('click', e => {
+      const b = e.target.closest('button[data-v]'); if (!b) return;
+      const v = b.dataset.v;
+      if (rootId === 'pickA') varA = v; else varB = v;
+      if (varA === varB) {
+        // Auto-flip the other side to a different variant.
+        const other = variants.find(x => x.name !== varA);
+        if (other) { if (rootId === 'pickA') varB = other.name; else varA = other.name; }
+      }
+      buildPickers();
+      refresh();
+    });
+  }
+
+  function bindRange() {
+    $('.range-group').addEventListener('click', e => {
+      const b = e.target.closest('button'); if (!b) return;
+      [...b.parentElement.children].forEach(c => c.classList.remove('active'));
+      b.classList.add('active');
+      const txt = b.textContent.trim().toLowerCase();
+      const map = { '5d': '5d', '30d': '30d', 'qtd': 'qtd', 'ytd': 'ytd', '1y': '1y', 'custom': 'all' };
+      range = map[txt] || '30d';
+      refresh();
+    });
+  }
+
+  // Build a piecewise path from {ts, cum_pct} points, sized to the viewBox.
+  function curvePath(points, lo, hi, fill = false) {
+    if (!points.length) return '';
+    const range = (hi - lo) || 1;
+    const dx = VB_W / Math.max(1, points.length - 1);
+    const ys = points.map(p => VB_H - 60 - ((p.cum_pct - lo) / range) * (VB_H - 120));
+    let d = `M0,${ys[0].toFixed(1)}`;
+    for (let i = 1; i < ys.length; i++) d += ` L${(i*dx).toFixed(1)},${ys[i].toFixed(1)}`;
+    if (fill) d += ` L${VB_W},${VB_H} L0,${VB_H} Z`;
+    return d;
+  }
+
+  function dotsHtml(points, color, lo, hi) {
+    if (!points.length) return '';
+    const range = (hi - lo) || 1;
+    const dx = VB_W / Math.max(1, points.length - 1);
+    return points.map((p, i) => {
+      const x = i * dx;
+      const y = VB_H - 60 - ((p.cum_pct - lo) / range) * (VB_H - 120);
+      return `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="2.2" fill="${color}"/>`;
+    }).join('');
+  }
+
+  function statsCard(side, info) {
+    const stats = info.stats || {};
+    const totalPct = stats.expectancy != null && stats.trades ? (stats.expectancy * stats.trades) : 0;
+    const cumPct = (info.curve && info.curve.length) ? info.curve[info.curve.length-1].cum_pct : 0;
+    const winPct = stats.win_rate ?? 0;
+    return `
+      <div class="top"><span class="swatch" style="background:${info.color}"></span><span class="name">${info.display}</span><span class="sleeve">${sleeveFor(info.name).toUpperCase()}</span></div>
+      <div class="pnl">
+        <span class="big" style="color:${cumPct >= 0 ? 'var(--mint)' : 'var(--coral)'}">${bb.fmt.pct(cumPct)}</span>
+        <span class="delta">${stats.trades || 0} trades · ${winPct.toFixed(0)}% win</span>
+      </div>
+      <div class="stats">
+        <div><div class="k">avg win</div><div class="v" style="color:var(--mint)">${bb.fmt.pct(stats.avg_win)}</div></div>
+        <div><div class="k">avg loss</div><div class="v" style="color:var(--coral)">${bb.fmt.pct(stats.avg_loss)}</div></div>
+        <div><div class="k">expectancy</div><div class="v">${bb.fmt.pct(stats.expectancy)}</div></div>
+        <div><div class="k">max DD</div><div class="v" style="color:var(--coral)">${bb.fmt.pct(stats.max_dd)}</div></div>
+        <div><div class="k">profit f.</div><div class="v">${stats.profit_factor == null ? '—' : stats.profit_factor.toFixed(2)}</div></div>
+        <div><div class="k">avg hold</div><div class="v">${(stats.avg_hold||0).toFixed(1)}d</div></div>
+      </div>`;
+  }
+
+  function rangeBounds(curveA, curveB) {
+    const all = [...curveA.map(p=>p.cum_pct), ...curveB.map(p=>p.cum_pct), 0];
+    const lo = Math.min(...all), hi = Math.max(...all);
+    const pad = Math.max(0.5, (hi - lo) * 0.1);
+    return [lo - pad, hi + pad];
+  }
+
+  function spreadCurve(curveA, curveB) {
+    // Naive resample: align by index (both are exit-by-exit so ranges
+    // match in trade-count, not date). Good enough for a relative band.
+    const n = Math.min(curveA.length, curveB.length);
+    const out = [];
+    for (let i = 0; i < n; i++) out.push(curveA[i].cum_pct - curveB[i].cum_pct);
+    return out;
+  }
+
+  function spreadPath(spread, fill = false) {
+    if (!spread.length) return '';
+    const lo = Math.min(0, ...spread), hi = Math.max(0, ...spread);
+    const range = (hi - lo) || 1;
+    const dx = 1000 / Math.max(1, spread.length - 1);
+    const ys = spread.map(v => 50 - ((v - lo) / range) * 40);
+    let d = `M0,${ys[0].toFixed(1)}`;
+    for (let i = 1; i < ys.length; i++) d += ` L${(i*dx).toFixed(1)},${ys[i].toFixed(1)}`;
+    if (fill) d += ` L1000,60 L0,60 Z`;
+    return d;
+  }
+
+  function tradeRow(t) {
+    const isWin = t.pnl_pct >= 0;
+    return `<div class="row">
+      <span class="var"><span class="swatch" style="background:${t.color}"></span>${t.variant_display}</span>
+      <span class="sym">${t.symbol}</span>
+      <span><span class="side-tag ${(t.side||'buy').toLowerCase()}">${(t.side||'BUY').toUpperCase()}</span></span>
+      <span>${Number(t.entry_px).toFixed(2)}</span>
+      <span>${Number(t.exit_px).toFixed(2)}</span>
+      <span class="pnl ${isWin ? 'up' : 'dn'}">${bb.fmt.pct(t.pnl_pct)}</span>
+      <span class="why">${(t.exit_reason || '').replace(/[<>]/g, '').slice(0,80)}</span>
+    </div>`;
+  }
+
+  async function refresh() {
+    if (!varA || !varB) return;
+    const eyebrow = $('#vs-chart-eyebrow');
+    if (eyebrow) eyebrow.textContent = `CUMULATIVE P&L · ${range.toUpperCase()}`;
+    try {
+      const data = await bb.fetchVersus(varA, varB, range);
+      lastVersus = data;
+      // Summary cards
+      $('#vs-card-a').innerHTML = statsCard('A', data.a);
+      $('#vs-card-b').innerHTML = statsCard('B', data.b);
+      // Legend
+      const cumA = data.a.curve.length ? data.a.curve.at(-1).cum_pct : 0;
+      const cumB = data.b.curve.length ? data.b.curve.at(-1).cum_pct : 0;
+      $('#vs-legend').innerHTML =
+        `<div class="item"><span class="swatch" style="background:${data.a.color}"></span><span class="name">${data.a.display}</span><span class="num">${bb.fmt.pct(cumA)}</span></div>` +
+        `<div class="item"><span class="swatch" style="background:${data.b.color}"></span><span class="name">${data.b.display}</span><span class="num">${bb.fmt.pct(cumB)}</span></div>`;
+      // Curves
+      const [lo, hi] = rangeBounds(data.a.curve, data.b.curve);
+      $('#vs-curve-a-fill').setAttribute('d', curvePath(data.a.curve, lo, hi, true));
+      $('#vs-curve-a-line').setAttribute('d', curvePath(data.a.curve, lo, hi, false));
+      $('#vs-curve-a-line').setAttribute('stroke', data.a.color);
+      $('#vs-curve-b-fill').setAttribute('d', curvePath(data.b.curve, lo, hi, true));
+      $('#vs-curve-b-line').setAttribute('d', curvePath(data.b.curve, lo, hi, false));
+      $('#vs-curve-b-line').setAttribute('stroke', data.b.color);
+      $('#vs-dots').innerHTML = dotsHtml(data.a.curve, data.a.color, lo, hi) + dotsHtml(data.b.curve, data.b.color, lo, hi);
+
+      // Spread
+      const sp = spreadCurve(data.a.curve, data.b.curve);
+      $('#vs-spread-fill').setAttribute('d', spreadPath(sp, true));
+      $('#vs-spread-line').setAttribute('d', spreadPath(sp, false));
+      const lastSpread = sp.length ? sp.at(-1) : 0;
+      const widening = sp.length >= 4 && Math.abs(sp.at(-1)) > Math.abs(sp.at(-4));
+      $('#vs-spread-label').textContent = `${bb.fmt.pct(lastSpread)} · ${widening ? 'widening' : 'narrowing'}`;
+      $('#vs-spread-label').style.color = lastSpread >= 0 ? 'var(--mint)' : 'var(--coral)';
+
+      // Footer stats
+      $('#vs-trades-a').textContent = data.a.stats.trades || 0;
+      $('#vs-trades-b').textContent = data.b.stats.trades || 0;
+      $('#vs-exp-a').textContent = bb.fmt.pct(data.a.stats.expectancy);
+      $('#vs-exp-b').textContent = bb.fmt.pct(data.b.stats.expectancy);
+      $('#vs-pf-a').textContent = data.a.stats.profit_factor == null ? '—' : data.a.stats.profit_factor.toFixed(2);
+      $('#vs-pf-b').textContent = data.b.stats.profit_factor == null ? '—' : data.b.stats.profit_factor.toFixed(2);
+
+      // Trade table + filterbar
+      const trades = data.trades || [];
+      const counts = {
+        all: trades.length,
+        a: trades.filter(t => t.variant === varA).length,
+        b: trades.filter(t => t.variant === varB).length,
+        wins: trades.filter(t => t.pnl_pct > 0).length,
+        losses: trades.filter(t => t.pnl_pct <= 0).length,
+      };
+      $('#vs-filterbar').innerHTML =
+        `<button class="chip ${filter==='all'?'on':''}" data-f="all">ALL · ${counts.all}</button>` +
+        `<button class="chip ${filter==='a'?'on':''}" data-f="a">${data.a.display} · ${counts.a}</button>` +
+        `<button class="chip ${filter==='b'?'on':''}" data-f="b">${data.b.display} · ${counts.b}</button>` +
+        `<button class="chip ${filter==='wins'?'on':''}" data-f="wins">WINS · ${counts.wins}</button>` +
+        `<button class="chip ${filter==='losses'?'on':''}" data-f="losses">LOSSES · ${counts.losses}</button>` +
+        `<span class="summary">SORT · TIME ↓</span>`;
+
+      const filtered = trades.filter(t => {
+        if (filter === 'all') return true;
+        if (filter === 'a') return t.variant === varA;
+        if (filter === 'b') return t.variant === varB;
+        if (filter === 'wins') return t.pnl_pct > 0;
+        if (filter === 'losses') return t.pnl_pct <= 0;
+        return true;
+      });
+      const body = $('#vs-trades-body');
+      if (!filtered.length) {
+        body.innerHTML = `<div class="row" style="grid-template-columns:1fr"><span class="why" style="color:var(--text-faint)">no closed round-trips in this window — open positions don't count until they exit</span></div>`;
+      } else {
+        body.innerHTML = filtered.map(tradeRow).join('');
+      }
+
+      // Topbar count
+      const now = $('.now');
+      if (now) now.textContent = `${data.a.display} vs ${data.b.display} · ${range.toUpperCase()} · ${trades.length} TRADES`;
+    } catch (err) {
+      console.error('versus fetch failed', err);
+      $('#vs-trades-body').innerHTML = `<div class="row" style="grid-template-columns:1fr"><span class="why" style="color:var(--coral)">error: ${err.message}</span></div>`;
+    }
+  }
+
+  // Filter clicks (delegated since the bar is rebuilt each refresh)
+  document.addEventListener('click', e => {
+    const b = e.target.closest('#vs-filterbar button[data-f]');
+    if (!b) return;
+    filter = b.dataset.f;
+    refresh();
+  });
+
+  // Boot
+  (async () => {
+    try {
+      await bb.hydrate();
+      variants = bb.state.variants || [];
+      if (variants.length < 2) {
+        $('#vs-trades-body').innerHTML = `<div class="row" style="grid-template-columns:1fr"><span class="why" style="color:var(--text-faint)">need at least 2 variants — found ${variants.length}</span></div>`;
+        return;
+      }
+      varA = variants[0].name;
+      varB = variants[1].name;
+      buildPickers();
+      bindPicker('pickA');
+      bindPicker('pickB');
+      bindRange();
+      refresh();
+    } catch (err) {
+      console.error(err);
+    }
+  })();
+</script>
+</body>
+</html>

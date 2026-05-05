@@ -1,0 +1,1227 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=1520">
+<title>baibot — floor</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=JetBrains+Mono:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+<link rel="stylesheet" href="tokens.css">
+<style>
+  *,*::before,*::after{box-sizing:border-box}
+  html,body{margin:0;background:#06060a;color:var(--text);font-family:var(--mono);-webkit-font-smoothing:antialiased;height:100%}
+  body{display:flex;flex-direction:column;min-width:1480px;height:100vh;overflow:hidden}
+
+  /* ====== Top nav ====== */
+  nav.top{
+    flex-shrink:0;display:flex;align-items:stretch;height:52px;
+    background:#0a0a0d;border-bottom:1px solid var(--border);padding:0 18px;
+  }
+  nav.top .brand{display:flex;align-items:baseline;gap:10px;margin-right:24px;align-self:center}
+  nav.top .brand .mark{font-family:var(--serif);font-style:italic;font-size:22px;line-height:1}
+  nav.top .brand .rule{width:18px;height:1px;background:var(--amber)}
+  nav.top .brand .label{font-size:9.5px;letter-spacing:0.32em;color:var(--text-muted);font-weight:500}
+  nav.top a{color:var(--text-faint);text-decoration:none;font-size:10.5px;font-weight:600;letter-spacing:0.24em;text-transform:uppercase;padding:0 18px;display:inline-flex;align-items:center;border-bottom:2px solid transparent;margin-bottom:-1px;transition:color 140ms ease}
+  nav.top a:hover{color:var(--text)}
+  nav.top a.active{color:var(--text);border-bottom-color:var(--amber);background:linear-gradient(to bottom,transparent,var(--amber-faint))}
+  nav.top .spacer{flex:1}
+  nav.top .now{align-self:center;font-size:10px;letter-spacing:0.22em;color:var(--text-faint);display:inline-flex;align-items:center;gap:8px}
+  nav.top .live-dot{width:7px;height:7px;border-radius:50%;background:var(--mint);box-shadow:0 0 0 2px rgba(125,216,127,0.18),0 0 8px var(--mint)}
+
+  /* ====== Portfolio strip ====== */
+  .pulse{
+    flex-shrink:0;display:grid;grid-template-columns:1.6fr 1fr 1fr 1fr 1.4fr;
+    border-bottom:1px solid var(--border);background:var(--surface-deep);
+  }
+  .pulse > div{padding:14px 22px;border-right:1px solid var(--border)}
+  .pulse > div:last-child{border-right:none}
+  .pulse .eyebrow{font-size:9.5px;letter-spacing:0.28em;color:var(--text-faint);font-weight:600;text-transform:uppercase}
+  .pulse .big{font-family:var(--serif);font-style:italic;font-size:30px;line-height:1.05;margin-top:4px;letter-spacing:-0.005em}
+  .pulse .sub{font-size:10px;color:var(--text-muted);margin-top:6px;letter-spacing:0.1em}
+  .pulse .tnum{font-variant-numeric:tabular-nums}
+  .pulse .stat-row{display:flex;gap:18px;align-items:baseline;font-size:11px;margin-top:4px;color:var(--text-muted);letter-spacing:0.1em}
+  .pulse .stat-row b{color:var(--text);font-weight:500;font-variant-numeric:tabular-nums}
+  .pulse .meter{height:4px;background:rgba(255,255,255,0.06);position:relative;overflow:hidden;margin-top:8px}
+  .pulse .meter > div{position:absolute;inset:0 auto 0 0;background:var(--amber)}
+
+  /* ====== Floor body ====== */
+  main.floor{
+    flex:1;min-height:0;display:grid;
+    grid-template-columns:repeat(2,minmax(120px,0.5fr)) repeat(4,1fr);
+    grid-template-rows:1fr 132px;
+  }
+  /* Quiet lanes go in cols 1-2 (narrow). Active lanes 3-6. */
+  .lane{
+    display:flex;flex-direction:column;min-height:0;
+    border-right:1px solid var(--border);
+    background:var(--surface);
+    grid-row:1;
+  }
+  .lane:nth-child(6){border-right:none}
+  .lane.quiet{background:var(--surface-deep)}
+  .lane.firing{background:linear-gradient(to bottom,rgba(245,165,36,0.05),transparent 220px),var(--surface)}
+
+  .lane-head{padding:12px 14px 10px;border-bottom:1px solid var(--border);position:relative}
+  .lane.firing .lane-head{background:rgba(245,165,36,0.04)}
+  .lane-title{display:flex;align-items:center;gap:6px;margin-bottom:8px}
+  .lane-swatch{width:8px;height:8px;flex-shrink:0}
+  .lane.firing .lane-swatch{box-shadow:0 0 8px currentColor}
+  .lane-name{font-size:10.5px;letter-spacing:0.22em;font-weight:600}
+  .lane-sleeve{margin-left:auto;font-size:8.5px;letter-spacing:0.18em;color:var(--text-faint);text-transform:uppercase}
+  .lane-spark{display:block;width:100%;height:26px;margin-bottom:8px}
+  .lane-pnl{display:flex;justify-content:space-between;align-items:baseline;font-size:10px;font-variant-numeric:tabular-nums}
+  .lane-pnl b{font-weight:600;font-size:14px}
+  .lane-pos{font-size:9px;letter-spacing:0.18em;color:var(--text-faint);text-transform:uppercase;margin-top:2px}
+  .lane.firing .lane-head::after{
+    content:'';position:absolute;left:0;top:0;bottom:0;width:2px;background:var(--amber);
+    box-shadow:0 0 12px var(--amber);
+  }
+
+  .lane-body{flex:1;padding:8px;display:flex;flex-direction:column;gap:6px;overflow-y:auto;min-height:0}
+  .lane-body::-webkit-scrollbar{width:5px}
+  .lane-body::-webkit-scrollbar-track{background:transparent}
+  .lane-body::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+  .lane.quiet .lane-body{align-items:center;justify-content:center;color:var(--text-faint);font-size:9.5px;letter-spacing:0.22em;text-transform:uppercase}
+
+  /* tickets */
+  .ticket{
+    background:var(--surface-up);border:1px solid var(--border);
+    padding:8px 10px 9px;cursor:pointer;
+    transition:border-color 140ms ease,background 140ms ease,transform 140ms ease;
+    user-select:none;
+  }
+  .ticket:hover{border-color:var(--amber);background:rgba(245,165,36,0.04);transform:translateY(-1px)}
+  .ticket.firing{background:rgba(245,165,36,0.10);border-color:#f5a524}
+  .ticket.firing:hover{background:rgba(245,165,36,0.16)}
+  .ticket.closed{opacity:0.62}
+  .ticket-row{display:flex;align-items:baseline;gap:6px;margin-bottom:4px}
+  .ticket-sym{font-family:var(--serif);font-style:italic;font-size:16px;color:var(--text)}
+  .ticket-time{margin-left:auto;font-size:9px;color:var(--text-faint);font-variant-numeric:tabular-nums}
+  .ticket-pos{display:flex;justify-content:space-between;font-size:10px;color:var(--text-muted);font-variant-numeric:tabular-nums}
+  .ticket .conf{margin-top:6px}
+  .ticket .conf .bar{width:100%;height:3px;background:rgba(255,255,255,0.06);position:relative;overflow:hidden}
+  .ticket .conf .bar > .fill{position:absolute;inset:0 auto 0 0;background:var(--amber)}
+  .ticket .conf .bar > .tick{position:absolute;left:70%;top:-2px;bottom:-2px;width:1px;background:rgba(255,255,255,0.22)}
+  .ticket .conf .row{display:flex;justify-content:space-between;align-items:center;gap:8px;font-size:9.5px;color:var(--text-muted);font-variant-numeric:tabular-nums;margin-top:3px;letter-spacing:0.04em}
+  .ticket-pill-row{margin-top:5px;display:flex;align-items:center;gap:6px}
+
+  .side-tag{display:inline-block;font-size:9px;letter-spacing:0.18em;font-weight:700;padding:1px 5px;border:1px solid currentColor;line-height:1.3}
+  .side-tag.buy{color:var(--teal)} .side-tag.sell{color:var(--coral)}
+  .state-pill{display:inline-flex;align-items:center;gap:4px;font-size:9px;letter-spacing:0.2em;font-weight:700;padding:2px 6px;line-height:1}
+  .state-pill.firing{color:var(--amber);background:rgba(245,165,36,0.12)}
+  .state-pill.live{color:var(--mint);background:rgba(125,216,127,0.10)}
+  .state-pill.closed{color:var(--text-muted);background:rgba(255,255,255,0.04)}
+  .firing-dot{width:5px;height:5px;border-radius:50%;background:var(--amber);box-shadow:0 0 6px var(--amber);animation:firing-pulse 1s ease-in-out infinite}
+  @keyframes firing-pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:0.4;transform:scale(0.8)}}
+
+  /* eventlog */
+  .eventlog{
+    grid-column:1 / -1;grid-row:2;
+    border-top:1px solid var(--border);background:var(--surface-deep);
+    display:grid;grid-template-columns:1.4fr 1fr 1fr;min-height:0;
+  }
+  .eventlog > section{padding:12px 18px 14px;border-right:1px solid var(--border);min-height:0;display:flex;flex-direction:column}
+  .eventlog > section:last-child{border-right:none}
+  .eventlog .eyebrow{font-size:9.5px;letter-spacing:0.28em;color:var(--text-faint);font-weight:600;text-transform:uppercase;margin-bottom:8px}
+  .eventlog .feed{flex:1;overflow-y:auto;font-size:11px;line-height:1.55;color:var(--text-muted);font-variant-numeric:tabular-nums}
+  .eventlog .feed::-webkit-scrollbar{width:4px}
+  .eventlog .feed::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px}
+  .eventlog .feed > div{display:grid;grid-template-columns:60px 50px 1fr;gap:10px;padding:3px 0;border-bottom:1px dotted rgba(255,255,255,0.04)}
+  .eventlog .feed > div:last-child{border-bottom:none}
+  .eventlog .feed .t{color:var(--text-faint)}
+  .eventlog .feed .k{font-size:9.5px;letter-spacing:0.16em;font-weight:700}
+  .eventlog .feed .k.fire{color:var(--amber)}
+  .eventlog .feed .k.fill{color:var(--mint)}
+  .eventlog .feed .k.veto{color:var(--coral)}
+  .eventlog .feed .k.eval{color:var(--text-muted)}
+  .eventlog .feed .body{color:var(--text)}
+  .eventlog .feed .body em{color:var(--text-muted);font-style:normal;letter-spacing:0.06em;font-size:10px}
+
+  .upnext-row{display:flex;align-items:baseline;gap:8px}
+  .upnext-row .sym{font-family:var(--serif);font-style:italic;font-size:22px}
+  .upnext-row .when{font-size:10px;letter-spacing:0.18em;color:var(--amber);margin-left:auto}
+  .upnext .gates{font-size:10px;color:var(--text-muted);margin-top:6px;line-height:1.5}
+  .upnext .meter{margin-top:8px;height:3px;background:rgba(255,255,255,0.06);position:relative;overflow:hidden}
+  .upnext .meter > div{position:absolute;inset:0 auto 0 0;background:var(--amber)}
+
+  .scan-row{display:flex;justify-content:space-between;font-size:10.5px;color:var(--text-muted);letter-spacing:0.06em;padding:3px 0;border-bottom:1px dotted rgba(255,255,255,0.04)}
+  .scan-row:last-child{border-bottom:none}
+  .scan-row b{color:var(--text);font-weight:500}
+  .scan-row .tnum{font-variant-numeric:tabular-nums}
+
+  /* ====== Spotlight overlay ====== */
+  #spotlight{
+    position:fixed;inset:0;z-index:200;
+    background:rgba(4,4,8,0.78);backdrop-filter:blur(6px);
+    display:none;align-items:center;justify-content:center;
+    animation:spot-fade 200ms ease-out;
+  }
+  #spotlight.open{display:flex}
+  @keyframes spot-fade{from{opacity:0}to{opacity:1}}
+  #spotlight .frame{
+    width:1480px;height:920px;
+    background:#06060a;border:1px solid var(--border-strong);
+    box-shadow:0 32px 80px -32px #000;
+    position:relative;overflow:hidden;
+    animation:spot-rise 240ms cubic-bezier(0.2,0.8,0.2,1);
+  }
+  @keyframes spot-rise{from{transform:translateY(12px) scale(0.99);opacity:0}to{transform:none;opacity:1}}
+  #spotlight .close{
+    position:absolute;top:12px;right:14px;z-index:30;
+    background:transparent;color:var(--text-muted);border:1px solid var(--border-strong);
+    font-family:var(--mono);font-size:9.5px;letter-spacing:0.22em;font-weight:600;
+    padding:6px 10px;cursor:pointer;text-transform:uppercase;
+  }
+  #spotlight .close:hover{color:var(--text);border-color:var(--amber)}
+
+  .spot-topbar{
+    position:absolute;top:0;left:0;right:0;height:48px;display:flex;align-items:center;gap:16px;padding:0 22px;z-index:10;
+    background:linear-gradient(to bottom,rgba(8,8,12,0.92),transparent);
+  }
+  .spot-topbar .mark{font-family:var(--serif);font-style:italic;font-size:22px;line-height:1}
+  .spot-topbar .rule{width:18px;height:1px;background:var(--amber)}
+  .spot-topbar .label{font-size:9.5px;letter-spacing:0.32em;color:var(--text-muted);font-weight:500}
+  .spot-topbar .meta{margin-left:auto;font-size:10px;letter-spacing:0.24em;color:var(--text-faint)}
+
+  .spot-canvas{
+    position:absolute;inset:48px 0 36px 280px;padding-top:30px;
+  }
+  .spot-chartwrap{position:absolute;top:60px;left:280px;right:0;bottom:36px}
+  .spot-chartwrap > svg{position:absolute;inset:0;width:100%;height:100%;display:block}
+  .spot-grid{
+    position:absolute;inset:0;
+    background-image:linear-gradient(to right,rgba(255,255,255,0.022) 1px,transparent 1px),linear-gradient(to bottom,rgba(255,255,255,0.022) 1px,transparent 1px);
+    background-size:40px 40px;
+  }
+  .spot-canvas > svg{position:absolute;top:30px;left:0;right:0;bottom:0;width:100%;height:calc(100% - 30px)}
+
+  /* ====== Indicator overlay system ====== */
+  .layer{transition:opacity 180ms ease}
+  .layer.off{opacity:0;pointer-events:none}
+
+  /* CHAN: zhongshu boxes + pivots + segment */
+  .layer-chan-zs rect{fill:rgba(245,165,36,0.07);stroke:rgba(245,165,36,0.55);stroke-width:0.6;stroke-dasharray:3 3}
+  .layer-chan-zs text{fill:#f5a524;font-size:9px;letter-spacing:0.16em;font-family:JetBrains Mono;font-weight:600}
+  .layer-chan-segments path{fill:none;stroke:rgba(245,165,36,0.45);stroke-width:0.7;stroke-dasharray:2 4}
+  .layer-chan-pivots circle{fill:#06060a;stroke-width:1.4}
+  .layer-chan-pivots circle.bsp{stroke:#7dd87f}
+  .layer-chan-pivots circle.ssp{stroke:#e85a5a}
+  .layer-chan-pivots text{font-size:9px;letter-spacing:0.18em;font-family:JetBrains Mono;font-weight:600}
+
+  /* MINERVINI: stage band + RS line + base count */
+  .layer-min-stage rect{fill:rgba(196,168,255,0.12);stroke:rgba(196,168,255,0.55);stroke-width:0.7;stroke-dasharray:2 6}
+  .layer-min-stage text{fill:#c4a8ff;font-size:9px;letter-spacing:0.18em;font-family:JetBrains Mono;font-weight:600}
+  .layer-min-rs path{fill:none;stroke:#c4a8ff;stroke-width:1.1;stroke-dasharray:0}
+  .layer-min-rs text{fill:#c4a8ff;font-size:9px;letter-spacing:0.18em;font-family:JetBrains Mono;font-weight:600}
+  .layer-min-pivot line{stroke:#c4a8ff;stroke-width:0.8;stroke-dasharray:5 4}
+  .layer-min-pivot text{fill:#c4a8ff;font-size:9px;letter-spacing:0.18em;font-family:JetBrains Mono;font-weight:600}
+
+  /* BREAKOUT: pivot line + vol×N highlight + cup/handle */
+  .layer-bk-cup path{fill:none;stroke:rgba(255,184,74,0.55);stroke-width:0.8;stroke-dasharray:3 4}
+  .layer-bk-cup text{fill:#ffb84a;font-size:9px;letter-spacing:0.18em;font-family:JetBrains Mono;font-weight:600}
+  .layer-bk-pivot line{stroke:#ffb84a;stroke-width:0.9;stroke-dasharray:5 4}
+  .layer-bk-pivot text{fill:#ffb84a;font-size:9px;letter-spacing:0.18em;font-family:JetBrains Mono;font-weight:600}
+  .layer-bk-vol rect{fill:rgba(255,184,74,0.16);stroke:rgba(255,184,74,0.5);stroke-width:0.5}
+  .layer-bk-vol text{fill:#ffb84a;font-size:9px;letter-spacing:0.18em;font-family:JetBrains Mono;font-weight:600}
+
+  /* Generic */
+  .layer-ma path{fill:none;stroke-width:0.9;opacity:0.85}
+  .layer-ma path.ma20{stroke:#9bb4ff}
+  .layer-ma path.ma50{stroke:#5ec5b7}
+  .layer-ma path.ma200{stroke:#e85a5a}
+  .layer-ma text{font-size:9px;letter-spacing:0.18em;font-family:JetBrains Mono;font-weight:600}
+  /* VWAP: cyan — distinct from amber chan and orange breakout */
+  .layer-vwap path{fill:none;stroke:#6dd4d4;stroke-width:1.0;stroke-dasharray:1 3}
+  .layer-vwap text{fill:#6dd4d4;font-size:9px;letter-spacing:0.18em;font-family:JetBrains Mono;font-weight:600}
+
+  /* Price line — neutral soft-white so any indicator overlay stands
+     out. Was amber, which collided with chan-zs / chan-seg. Trade
+     entry pin remains amber-ish so it pops against this neutral. */
+  #spot-price-line{stroke:#e8e6df !important;stroke-width:1.4 !important}
+  #spot-price-fill{fill:url(#spot-fill-neutral) !important}
+
+  /* ====== Chart toolbar (timeframe + layer chips + ⚙) ====== */
+  .spot-toolbar{
+    position:absolute;top:54px;left:300px;right:30px;height:30px;z-index:7;
+    display:flex;align-items:center;gap:14px;
+    border-bottom:1px solid var(--border);
+  }
+  .tf-group{display:inline-flex;border:1px solid var(--border-strong)}
+  .tf-group button{
+    background:transparent;color:var(--text-muted);border:none;
+    font-family:var(--mono);font-size:10px;letter-spacing:0.18em;font-weight:600;
+    padding:5px 10px;cursor:pointer;border-right:1px solid var(--border);
+    text-transform:uppercase;
+  }
+  .tf-group button:last-child{border-right:none}
+  .tf-group button:hover{color:var(--text)}
+  .tf-group button.active{color:var(--amber);background:rgba(245,165,36,0.10)}
+
+  .chip-row{display:flex;gap:6px;flex:1;overflow-x:auto;padding-right:8px}
+  .chip-row::-webkit-scrollbar{height:0}
+  .layer-chip{
+    display:inline-flex;align-items:center;gap:5px;
+    background:transparent;border:1px solid var(--border-strong);
+    color:var(--text-muted);font-family:var(--mono);
+    font-size:9.5px;letter-spacing:0.18em;font-weight:600;text-transform:uppercase;
+    padding:4px 8px 4px 6px;cursor:pointer;white-space:nowrap;
+  }
+  .layer-chip .swatch{width:7px;height:7px;flex-shrink:0;background:currentColor;opacity:0.4}
+  .layer-chip:hover{color:var(--text)}
+  .layer-chip.on{color:var(--text);border-color:currentColor;background:rgba(255,255,255,0.02)}
+  .layer-chip.on .swatch{opacity:1;box-shadow:0 0 6px currentColor}
+
+  .gear-btn{
+    background:transparent;border:1px solid var(--border-strong);
+    color:var(--text-muted);font-family:var(--mono);font-size:11px;
+    width:26px;height:24px;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;
+    flex-shrink:0;
+  }
+  .gear-btn:hover{color:var(--amber);border-color:var(--amber)}
+  .gear-btn.open{color:var(--amber);border-color:var(--amber);background:rgba(245,165,36,0.08)}
+
+  /* ====== Settings menu (⚙) ====== */
+  .gear-menu{
+    position:absolute;top:30px;right:0;width:340px;z-index:30;
+    background:rgba(10,10,14,0.96);backdrop-filter:blur(8px);
+    border:1px solid var(--border-strong);
+    box-shadow:0 16px 32px -16px #000;
+    padding:14px 16px 16px;display:none;
+  }
+  .gear-menu.open{display:block;animation:gear-rise 160ms ease-out}
+  @keyframes gear-rise{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:none}}
+  .gear-menu .eyebrow{font-size:9.5px;letter-spacing:0.28em;font-weight:600;color:var(--text-faint);text-transform:uppercase;margin-bottom:10px}
+  .gear-menu h4{font-family:var(--serif);font-style:italic;font-size:14px;font-weight:400;margin:0 0 4px;color:var(--text)}
+  .gear-menu .layer-row{
+    display:grid;grid-template-columns:14px 1fr 80px 30px;align-items:center;gap:8px;
+    padding:6px 0;border-bottom:1px dotted rgba(255,255,255,0.05);
+    font-size:11px;
+  }
+  .gear-menu .layer-row:last-child{border-bottom:none}
+  .gear-menu .layer-row .swatch{width:8px;height:8px}
+  .gear-menu .layer-row .name{color:var(--text)}
+  .gear-menu .layer-row .name b{font-weight:500}
+  .gear-menu .layer-row .opacity{display:flex;align-items:center;gap:4px}
+  .gear-menu .layer-row input[type=range]{width:60px;accent-color:var(--amber)}
+  .gear-menu .layer-row .opacity .num{font-size:9.5px;color:var(--text-faint);font-variant-numeric:tabular-nums;min-width:22px;text-align:right}
+  .gear-menu .layer-row .toggle{
+    width:26px;height:14px;border:1px solid var(--border-strong);background:transparent;
+    position:relative;cursor:pointer;
+  }
+  .gear-menu .layer-row .toggle::after{
+    content:'';position:absolute;top:1px;left:1px;width:10px;height:10px;background:var(--text-muted);transition:left 140ms ease, background 140ms ease;
+  }
+  .gear-menu .layer-row .toggle.on{border-color:var(--amber);background:rgba(245,165,36,0.10)}
+  .gear-menu .layer-row .toggle.on::after{left:13px;background:var(--amber);box-shadow:0 0 6px var(--amber)}
+  .gear-menu .reset{
+    margin-top:10px;width:100%;padding:6px 10px;
+    background:transparent;border:1px solid var(--border-strong);color:var(--text-muted);
+    font-family:var(--mono);font-size:9.5px;letter-spacing:0.22em;font-weight:600;text-transform:uppercase;
+    cursor:pointer;
+  }
+  .gear-menu .reset:hover{color:var(--amber);border-color:var(--amber)}
+  .gear-menu .section-head{display:flex;align-items:center;gap:8px;margin:12px 0 4px}
+  .gear-menu .section-head .rule{flex:1;height:1px;background:var(--border)}
+  .gear-menu .section-head span{font-size:9px;letter-spacing:0.24em;color:var(--text-faint);text-transform:uppercase;font-weight:600}
+  .spot-corner{position:absolute;width:14px;height:14px}
+  .spot-corner.tl{top:90px;left:280px;border-top:1px solid var(--amber);border-left:1px solid var(--amber)}
+  .spot-corner.tr{top:90px;right:20px;border-top:1px solid var(--amber);border-right:1px solid var(--amber)}
+  .spot-corner.bl{bottom:50px;left:280px;border-bottom:1px solid var(--amber);border-left:1px solid var(--amber)}
+  .spot-corner.br{bottom:50px;right:20px;border-bottom:1px solid var(--amber);border-right:1px solid var(--amber)}
+
+  .spot-subject{position:absolute;top:96px;right:36px;z-index:5;text-align:right}
+  .spot-subject .eyebrow{font-size:9.5px;letter-spacing:0.28em;font-weight:600;color:#f5a524;text-transform:uppercase}
+  .spot-subject .sym{font-family:var(--serif);font-style:italic;font-size:88px;line-height:1;color:var(--text);margin-top:4px;text-shadow:0 0 30px rgba(245,165,36,0.2)}
+  .spot-subject .sub{font-size:12px;color:var(--text-muted);margin-top:6px;letter-spacing:0.06em;font-variant-numeric:tabular-nums}
+
+  .spot-card{
+    background:rgba(17,17,20,0.78);backdrop-filter:blur(8px);
+    border:1px solid var(--border-strong);padding:14px 16px 16px;z-index:5;position:absolute
+  }
+  .spot-card .eyebrow{font-size:9.5px;letter-spacing:0.28em;font-weight:600;color:var(--text-faint);text-transform:uppercase}
+
+  .spot-thesis{bottom:50px;right:36px;width:380px}
+  .spot-thesis .body{font-size:11.5px;line-height:1.6;color:var(--text);text-wrap:pretty;margin-top:8px}
+  .spot-thesis .metrics{margin-top:10px;padding-top:10px;border-top:1px dashed var(--border-strong);display:grid;grid-template-columns:1fr 1fr;row-gap:4px;column-gap:14px;font-size:10.5px}
+  .spot-thesis .metrics > div{display:flex;justify-content:space-between}
+  .spot-thesis .metrics .k{color:var(--text-muted)}
+  .spot-thesis .metrics .v{font-variant-numeric:tabular-nums}
+
+  .spot-criteria{bottom:50px;left:300px;width:280px}
+  .spot-criteria ul{list-style:none;margin:8px 0 0;padding:0;display:flex;flex-direction:column;gap:5px}
+  .spot-criteria li{display:flex;align-items:baseline;gap:8px;font-size:10.5px}
+  .spot-criteria li .mark{width:10px;font-weight:700}
+  .spot-criteria li .mark.y{color:var(--mint)}
+  .spot-criteria li .mark.n{color:var(--coral)}
+  .spot-criteria li .label{flex:1}
+  .spot-criteria li .v{font-size:9.5px;color:var(--text-faint)}
+  .spot-criteria li.fail{color:var(--text-muted)}
+  .spot-criteria li.fail .v{color:var(--coral)}
+
+  .spot-queue{
+    position:absolute;top:60px;bottom:60px;left:0;width:270px;padding:8px 14px 8px 22px;z-index:6;
+    display:flex;flex-direction:column;gap:6px;border-right:1px solid var(--border);
+    background:linear-gradient(to right,rgba(8,8,12,0.95),rgba(8,8,12,0.7) 70%,transparent);
+  }
+  .spot-queue .eyebrow{font-size:9.5px;letter-spacing:0.28em;font-weight:600;color:var(--text-faint);text-transform:uppercase;padding-top:4px;margin-bottom:4px}
+  .spot-queue .item{
+    background:rgba(17,17,20,0.6);border:1px solid var(--border);
+    padding:7px 10px 8px;cursor:pointer;
+  }
+  .spot-queue .item.active{background:rgba(245,165,36,0.10);border-color:#f5a524}
+  .spot-queue .item .top{display:flex;align-items:baseline;gap:6px}
+  .spot-queue .item .top .sym{font-family:var(--serif);font-style:italic;font-size:15px}
+  .spot-queue .item .top .t{margin-left:auto;font-size:9px;color:var(--text-faint);font-variant-numeric:tabular-nums}
+  .spot-queue .item .v{font-size:9px;letter-spacing:0.18em;color:var(--text-faint);text-transform:uppercase;margin-top:2px}
+  .spot-queue .item .conf-row{display:flex;align-items:center;gap:6px;margin-top:5px}
+  .spot-queue .item .conf-row .bar{height:3px;flex:1;background:rgba(255,255,255,0.06);position:relative;overflow:hidden}
+  .spot-queue .item .conf-row .bar > .fill{position:absolute;inset:0 auto 0 0;background:var(--amber)}
+  .spot-queue .item .conf-row .num{font-size:9.5px;color:var(--text-muted);font-variant-numeric:tabular-nums;min-width:26px;text-align:right}
+  .spot-queue .help{margin-top:auto;padding-top:10px;border-top:1px solid var(--border);font-size:9.5px;color:var(--text-muted);letter-spacing:0.18em;text-transform:uppercase}
+
+  .spot-ticker{
+    position:absolute;bottom:0;left:0;right:0;height:36px;border-top:1px solid var(--border);
+    background:rgba(8,8,12,0.92);display:flex;align-items:center;z-index:8;overflow:hidden;
+  }
+  .spot-ticker .label{padding:0 14px;font-size:9.5px;letter-spacing:0.24em;color:var(--amber);font-weight:600;border-right:1px solid var(--border);height:100%;display:inline-flex;align-items:center}
+  .spot-ticker .feed{flex:1;overflow:hidden;white-space:nowrap;font-size:10.5px;letter-spacing:0.08em;color:var(--text-muted);padding:0 14px}
+  .spot-ticker .feed .t{color:var(--text-faint);font-variant-numeric:tabular-nums;margin-right:10px}
+  .spot-ticker .feed .k{margin-right:8px;font-weight:700;letter-spacing:0.2em}
+  .spot-ticker .feed .k.fire{color:var(--amber)} .spot-ticker .feed .k.fill{color:var(--mint)} .spot-ticker .feed .k.veto{color:var(--coral)}
+  .spot-ticker .feed .sep{color:var(--text-faint);margin:0 14px}
+</style>
+</head>
+<body>
+
+<nav class="top">
+  <div class="brand">
+    <span class="mark">baibot</span>
+    <span class="rule"></span>
+    <span class="label">TELEMETRY</span>
+  </div>
+  <a href="floor.html" class="active">FLOOR</a>
+  <a href="versus.html">VERSUS</a>
+  <a href="review.html">REVIEW</a>
+  <a href="settings.html">SETTINGS</a>
+  <a href="explorations.html">EXPLORATIONS</a>
+  <span class="spacer"></span>
+  <span class="now"><span class="live-dot"></span>LIVE · 14:32:08 · 11 OPEN · 2 FIRING</span>
+</nav>
+
+<!-- ===== Portfolio pulse strip ===== -->
+<section class="pulse">
+  <div>
+    <div class="eyebrow">DAY P&amp;L · REALIZED</div>
+    <div class="big" data-pulse="day_pnl_usd_realized" style="color:var(--mint)">—</div>
+    <div class="stat-row"><span data-pulse="open_total"><b>—</b> open</span><span data-pulse="today_fills_total"><b>—</b> fills today</span></div>
+  </div>
+  <div>
+    <div class="eyebrow">VARIANTS LIVE</div>
+    <div class="big tnum" data-pulse="variants_live">—</div>
+    <div class="stat-row" data-pulse="variants_live_breakdown"><span>—</span></div>
+  </div>
+  <div>
+    <div class="eyebrow">BEST DAY P&amp;L</div>
+    <div class="big tnum" data-pulse="best_pnl">—</div>
+    <div class="stat-row" data-pulse="best_pnl_name"><span>—</span></div>
+  </div>
+  <div>
+    <div class="eyebrow">WORST DAY P&amp;L</div>
+    <div class="big tnum" data-pulse="worst_pnl">—</div>
+    <div class="stat-row" data-pulse="worst_pnl_name"><span>—</span></div>
+  </div>
+  <div>
+    <div class="eyebrow">CONNECTION</div>
+    <div class="stat-row" style="margin-top:8px"><span data-conn="events">events <b>connecting…</b></span></div>
+    <div class="stat-row"><span data-conn="streams">streams <b>—</b></span></div>
+    <div class="stat-row"><span data-conn="asof">asof <b>—</b></span></div>
+  </div>
+</section>
+
+<!-- ===== Floor (lanes) ===== -->
+<main class="floor">
+
+  <!-- Lanes injected from /api/v2/state.variants. Each lane is
+       <div class="lane[ firing| quiet]"> matching the mock CSS. -->
+  <div class="lane-pack" id="lane-pack" style="display:contents"></div>
+
+  <!-- ===== Eventlog row ===== -->
+  <div class="eventlog">
+    <section>
+      <div class="eyebrow">EVENT LOG · LIVE</div>
+      <div class="feed" id="event-feed">
+        <div style="color:var(--text-faint)"><span class="t">—</span><span class="k eval">WAIT</span><span class="body">connecting to /events/stream…</span></div>
+      </div>
+    </section>
+    <section>
+      <div class="eyebrow">SCAN BY VARIANT · TODAY</div>
+      <div id="scan-list" style="display:flex;flex-direction:column;gap:6px"></div>
+    </section>
+    <section>
+      <div class="eyebrow">RECENT FILLS</div>
+      <div class="feed" id="recent-fills">
+        <div style="color:var(--text-faint)"><span class="t">—</span><span class="k eval">…</span><span class="body">loading…</span></div>
+      </div>
+    </section>
+  </div>
+</main>
+
+<!-- ===== Spotlight overlay ===== -->
+<div id="spotlight" role="dialog" aria-modal="true" aria-label="Spotlight">
+  <div class="frame" id="spot-frame">
+    <button class="close" id="spot-close" type="button">ESC · CLOSE</button>
+    <!-- topbar -->
+    <div class="spot-topbar">
+      <span class="mark">baibot</span><span class="rule"></span><span class="label">SPOTLIGHT</span>
+      <span class="meta" id="spot-meta">CHAN-V2 · BUY · 14:32:08</span>
+    </div>
+    <!-- chart -->
+    <div class="spot-canvas">
+      <div class="spot-grid"></div>
+      <!-- Lightweight-charts canvas. Built lazily in fillSubject() once
+           the user opens the spotlight; persists across opens to avoid
+           re-instantiating the chart. ``inset:30px 0 0 0`` matches the
+           SVG positioning so the chart sits flush with the toolbar. -->
+      <div id="spot-chart-canvas" style="position:absolute;top:30px;left:0;right:0;bottom:0;z-index:2"></div>
+      <!-- Loading / empty / error overlay (above the chart) -->
+      <div id="spot-chart-msg" style="position:absolute;top:30px;left:0;right:0;bottom:0;z-index:3;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:8px;pointer-events:none">
+        <div id="spot-chart-msg-title" style="font-family:var(--mono);font-size:12px;letter-spacing:0.32em;color:var(--text-faint);font-weight:600">— SELECT A TICKET —</div>
+        <div id="spot-chart-msg-sub"   style="font-family:var(--mono);font-size:9px;letter-spacing:0.22em;color:var(--text-dim)">price chart loads when a position is opened</div>
+      </div>
+      <!-- Legacy SVG canvas — fully hidden now that lightweight-charts
+           owns the chart. Kept in the DOM only because some references
+           (#spot-svg, layer toggles) might wake up if we re-enable the
+           gear menu later. ``display: none`` ensures it never bleeds
+           through the transparent chart background. -->
+      <svg width="100%" height="100%" preserveAspectRatio="none" viewBox="0 0 1200 920" style="display:none" id="spot-svg">
+        <defs>
+          <!-- Neutral price gradient (under the soft-white price line) so
+               colored indicator overlays stay legible against it. The
+               amber gradient is kept around for any future use but the
+               #spot-price-fill rule above forces neutral. -->
+          <linearGradient id="spot-fill-neutral" x1="0" x2="0" y1="0" y2="1">
+            <stop offset="0%" stop-color="#e8e6df" stop-opacity="0.10"/>
+            <stop offset="100%" stop-color="#e8e6df" stop-opacity="0"/>
+          </linearGradient>
+          <linearGradient id="spot-fill" x1="0" x2="0" y1="0" y2="1">
+            <stop offset="0%" stop-color="#f5a524" stop-opacity="0.18"/>
+            <stop offset="100%" stop-color="#f5a524" stop-opacity="0"/>
+          </linearGradient>
+        </defs>
+
+        <!-- ====== Trade-level visualization ====================
+             Bars + indicator overlays aren't wired yet. Until the
+             /api/trade/{variant}/{trade_id}/chart payload is piped in
+             here, this canvas shows only the data we KNOW from the
+             signal/position rows: entry price, stop rail, target rail.
+             That's it. Indicator placeholder geometry was removed
+             because it had no relationship to real data and read as
+             noise. See task #10 for the bars-wiring follow-up. -->
+
+        <!-- Center band reference line (visual midpoint at viewBox y=460) -->
+        <line x1="0" x2="1200" y1="460" y2="460" stroke="rgba(255,255,255,0.05)" stroke-width="0.5"/>
+
+        <!-- Target rail — JS positions y based on % distance from entry -->
+        <line   id="spot-target-line"  x1="0" x2="1200" y1="200" y2="200" stroke="var(--mint)" stroke-width="1" stroke-dasharray="4 6" opacity="0"/>
+        <text   id="spot-target-label" x="20" y="194" fill="var(--mint)" font-size="11" letter-spacing="0.2em" font-family="JetBrains Mono" font-weight="600" opacity="0"></text>
+
+        <!-- Entry rail (horizontal at exact entry price y=460) -->
+        <line   id="spot-entry-line"   x1="0" x2="1200" y1="460" y2="460" stroke="var(--amber)" stroke-width="1.4" opacity="0"/>
+        <text   id="spot-entry-label"  x="20" y="454" fill="var(--amber)" font-size="11" letter-spacing="0.2em" font-family="JetBrains Mono" font-weight="600" opacity="0"></text>
+
+        <!-- Stop rail — JS positions y based on % distance from entry -->
+        <line   id="spot-stop-line"    x1="0" x2="1200" y1="720" y2="720" stroke="var(--coral)" stroke-width="1" stroke-dasharray="4 6" opacity="0"/>
+        <text   id="spot-stop-label"   x="20" y="714" fill="var(--coral)" font-size="11" letter-spacing="0.2em" font-family="JetBrains Mono" font-weight="600" opacity="0"></text>
+
+        <!-- Empty-state placeholder (centered). JS toggles ``display``
+             attribute. The headline + subtitle are JS-mutable so we
+             can swap to "no entry data" or "loading…" or error text. -->
+        <g id="spot-empty">
+          <text id="spot-empty-title" x="600" y="450" fill="var(--text-faint)" font-size="13" letter-spacing="0.32em" font-family="JetBrains Mono" font-weight="600" text-anchor="middle">— SELECT A TICKET —</text>
+          <text id="spot-empty-sub"   x="600" y="480" fill="var(--text-dim)" font-size="9" letter-spacing="0.22em" font-family="JetBrains Mono" text-anchor="middle">price chart loads when a position is opened</text>
+        </g>
+
+        <!-- "Bars not yet wired" footer note (only shown when a ticket is selected) -->
+        <text id="spot-bars-note" x="600" y="900" fill="var(--text-faint)" font-size="9" letter-spacing="0.22em" font-family="JetBrains Mono" text-anchor="middle" display="none">PRICE BARS NOT YET WIRED · ENTRY · STOP · TARGET ONLY</text>
+      </svg>
+      <div class="spot-corner tl"></div><div class="spot-corner tr"></div><div class="spot-corner bl"></div><div class="spot-corner br"></div>
+    </div>
+
+    <!-- chart toolbar: hidden until bars are wired (task #10).
+         Timeframe / layer chips / gear menu only make sense once the
+         chart shows real bars. Element is kept in the DOM (not deleted)
+         so the wiring task can flip ``display: none`` off. -->
+    <div class="spot-toolbar" style="display:none">
+      <div class="tf-group" id="tf-group">
+        <button data-tf="1m">1m</button>
+        <button data-tf="5m">5m</button>
+        <button data-tf="30m" class="active">30m</button>
+        <button data-tf="1d">1d</button>
+      </div>
+      <div class="chip-row" id="chip-row"></div>
+      <button class="gear-btn" id="gear-btn" type="button" title="Layer settings">⚙</button>
+      <div class="gear-menu" id="gear-menu">
+        <div class="eyebrow">Layers · <span id="gear-variant-name" style="color:var(--text)">—</span> defaults</div>
+        <div id="gear-list"></div>
+        <button class="reset" id="gear-reset" type="button">↺ Reset to variant default</button>
+      </div>
+    </div>
+    <!-- subject -->
+    <div class="spot-subject">
+      <div class="eyebrow" id="spot-variant">—</div>
+      <div class="sym" id="spot-sym">—</div>
+      <div class="sub" id="spot-sub">—</div>
+    </div>
+    <!-- thesis (signal.reasoning) + computed trade metrics -->
+    <div class="spot-card spot-thesis">
+      <div style="display:flex;align-items:center;gap:8px"><span class="eyebrow">THESIS</span><span id="spot-conf-pill" style="margin-left:auto;font-size:9px;letter-spacing:0.2em;color:var(--text-faint)"></span></div>
+      <div class="body" id="spot-thesis-body" style="color:var(--text-faint)">— select a ticket —</div>
+      <div class="metrics" id="spot-metrics">
+        <!-- Populated by JS from spotlight.signal/position. Fields not
+             present in the underlying signal are simply omitted, so a
+             PEAD spotlight won't show a fake ATR risk pct. -->
+      </div>
+    </div>
+    <!-- queue: open positions across the active variant. JS-rendered. -->
+    <div class="spot-queue">
+      <div class="eyebrow">QUEUE · OPEN POSITIONS</div>
+      <div id="spot-queue-list"></div>
+      <div class="help">↑ ↓ to step · ESC close</div>
+    </div>
+    <!-- ticker: tail of /events/stream — populated by SSE handler -->
+    <div class="spot-ticker">
+      <span class="label">◀ EVENTS</span>
+      <div class="feed" id="spot-ticker-feed"><span style="color:var(--text-faint)">connecting…</span></div>
+    </div>
+  </div>
+</div>
+
+<script src="client.js"></script>
+<script>
+  const $ = (s, root=document) => root.querySelector(s);
+  function $$(sel, root=document){ return Array.from(root.querySelectorAll(sel)); }
+  const overlay = $('#spotlight');
+  const closeBtn = $('#spot-close');
+
+  // ---- Variant → default layer set ----
+  // Each layer: id, name, swatch (color), defaultOpacity (0..1)
+  const ALL_LAYERS = {
+    'chan-zs':      { name:'Zhongshu',         color:'#f5a524', opacity:1.00 },
+    'chan-seg':     { name:'Segments',         color:'#f5a524', opacity:0.85 },
+    'chan-pivots':  { name:'BSP / SSP pivots', color:'#f5a524', opacity:1.00 },
+    'min-stage':    { name:'Stage band',       color:'#c4a8ff', opacity:0.80 },
+    'min-rs':       { name:'RS line',          color:'#c4a8ff', opacity:1.00 },
+    'min-pivot':    { name:'Pivot · base',     color:'#c4a8ff', opacity:1.00 },
+    'bk-cup':       { name:'Cup / handle',     color:'#ffb84a', opacity:0.85 },
+    'bk-pivot':     { name:'Pivot',            color:'#ffb84a', opacity:1.00 },
+    'bk-vol':       { name:'Volume × N',       color:'#ffb84a', opacity:0.80 },
+    'ma':           { name:'MA 20·50·200',     color:'#9bb4ff', opacity:0.85 },
+    'vwap':         { name:'VWAP',             color:'#6dd4d4', opacity:0.90 },
+  };
+  // (VARIANT_DEFAULTS removed — layer set comes from /api/v2/spotlight.layers,
+  //  authoritative on the server in v2.py:DISPLAY_MAP.)
+
+  // (SUBJECTS_CHART removed — entry/target/stop now populated from the
+  //  spotlight response.)
+  /* SUBJECTS_CHART_REMOVED = {
+    NVDA: { entry:884.42, target:'912.40 · +3.2%', stop:'871.80 · -1.4%' },
+    PLTR: { entry: 24.18, target:' 25.40 · +5.0%', stop:' 23.40 · -3.2%' },
+    COHR: { entry: 76.55, target:' 73.20 · +4.4%', stop:' 78.10 · -2.0%' },
+    TSLA: { entry:248.80, target:'258.20 · +3.8%', stop:'240.20 · -3.5%' },
+    AMZN: { entry:188.32, target:'195.00 · +3.5%', stop:'184.80 · -1.9%' },
+    GOOGL:{ entry:152.30, target:'158.00 · +3.7%', stop:'149.50 · -1.8%' },
+    BA:   { entry:198.74, target:'192.00 · +3.4%', stop:'199.40 · -0.3%' },
+    INTC: { entry: 41.05, target:' 43.50 · +6.0%', stop:' 40.10 · -2.3%' },
+    XOM:  { entry:119.20, target:'124.20 · +4.2%', stop:'116.40 · -2.4%' },
+    WMT:  { entry: 68.12, target:' 71.50 · +5.0%', stop:' 66.40 · -2.5%' },
+    AAPL: { entry:186.40, target:'182.10 · +2.3%', stop:'187.20 · -0.4%' },
+  }; */
+
+  // ---- Layer state ----
+  // ``activeVariant`` is the display name (e.g. "MINERVINI", "PEAD")
+  // and ``activeAllowedLayers`` is the set of layer ids the server says
+  // apply to that variant. Updated by fillSubject() on every spotlight
+  // open. The gear menu's "reset" button restores layerState from this
+  // set, not from any client-side hardcoded mapping — so a Minervini
+  // chart never resets to chan defaults.
+  let activeVariant = '—';
+  let activeAllowedLayers = new Set();
+  let layerState = {}; // {id: {on:bool, opacity:0..1}}
+
+  function resetToDefaults() {
+    layerState = {};
+    Object.keys(ALL_LAYERS).forEach(id => {
+      layerState[id] = { on: activeAllowedLayers.has(id), opacity: ALL_LAYERS[id].opacity };
+    });
+  }
+  function applyLayers() {
+    Object.entries(layerState).forEach(([id, st]) => {
+      const g = $('[data-layer="'+id+'"]', $('#spot-svg'));
+      if (!g) return;
+      g.classList.toggle('off', !st.on);
+      g.style.opacity = st.on ? String(st.opacity) : '0';
+    });
+    renderChips();
+    renderGearList();
+  }
+
+  function renderChips() {
+    const row = $('#chip-row'); row.innerHTML = '';
+    Object.entries(layerState).forEach(([id, st]) => {
+      const meta = ALL_LAYERS[id];
+      // Show chips only for layers applicable to this variant OR
+      // currently toggled on (so user-enabled extras stay visible).
+      if (!activeAllowedLayers.has(id) && !st.on) return;
+      const b = document.createElement('button');
+      b.className = 'layer-chip' + (st.on ? ' on' : '');
+      b.style.color = meta.color;
+      b.dataset.chip = id;
+      b.innerHTML = '<span class="swatch"></span>' + meta.name;
+      b.addEventListener('click', () => { st.on = !st.on; applyLayers(); });
+      row.appendChild(b);
+    });
+  }
+
+  function renderGearList() {
+    const list = $('#gear-list'); list.innerHTML = '';
+    $('#gear-variant-name').textContent = activeVariant;
+    const allowedIds = Array.from(activeAllowedLayers);
+    const otherIds = Object.keys(ALL_LAYERS).filter(id => !activeAllowedLayers.has(id));
+    const groups = [
+      { label: activeVariant + ' overlays', ids: allowedIds },
+      { label: 'Other (not used by this strategy)', ids: otherIds },
+    ];
+    groups.forEach((g, gi) => {
+      if (!g.ids.length) return;
+      if (gi > 0) {
+        const sh = document.createElement('div'); sh.className = 'section-head';
+        sh.innerHTML = '<span>'+g.label+'</span><span class="rule"></span>';
+        list.appendChild(sh);
+      }
+      g.ids.forEach(id => {
+        const meta = ALL_LAYERS[id]; const st = layerState[id];
+        const row = document.createElement('div'); row.className = 'layer-row';
+        row.innerHTML =
+          '<span class="swatch" style="background:'+meta.color+';box-shadow:'+(st.on?'0 0 6px '+meta.color:'none')+'"></span>'+
+          '<span class="name">'+meta.name+'</span>'+
+          '<span class="opacity"><input type="range" min="0" max="100" value="'+Math.round(st.opacity*100)+'" data-opacity="'+id+'"><span class="num">'+Math.round(st.opacity*100)+'</span></span>'+
+          '<button class="toggle '+(st.on?'on':'')+'" data-toggle="'+id+'" type="button" aria-pressed="'+st.on+'"></button>';
+        list.appendChild(row);
+      });
+    });
+  }
+
+  // gear menu interactions
+  $('#gear-list').addEventListener('input', e => {
+    const id = e.target.dataset && e.target.dataset.opacity;
+    if (!id) return;
+    layerState[id].opacity = (+e.target.value) / 100;
+    applyLayers();
+  });
+  $('#gear-list').addEventListener('click', e => {
+    const id = e.target.dataset && e.target.dataset.toggle;
+    if (!id) return;
+    layerState[id].on = !layerState[id].on;
+    applyLayers();
+  });
+  $('#gear-btn').addEventListener('click', () => {
+    $('#gear-menu').classList.toggle('open');
+    $('#gear-btn').classList.toggle('open');
+  });
+  $('#gear-reset').addEventListener('click', () => { resetToDefaults(); applyLayers(); });
+
+  // timeframe (mock — just toggles active state)
+  $('#tf-group').addEventListener('click', e => {
+    const b = e.target.closest('button[data-tf]'); if (!b) return;
+    $$('#tf-group button').forEach(x => x.classList.toggle('active', x === b));
+  });
+
+  // ---- Spotlight subject (real data via /api/v2/spotlight) ----
+  let activeSpot = null;  // { variant, symbol }
+
+  // ---- Lightweight-charts singleton ----
+  // Built lazily on first spotlight open; reused on subsequent opens
+  // (setData replaces the bars). Series instances are kept around so
+  // we don't churn the chart's price scale on every click.
+  const _chartState = {
+    chart: null, candles: null, fills: null,
+    entryLine: null, stopLine: null, targetLine: null,
+  };
+
+  function ensureChart() {
+    if (_chartState.chart) return _chartState;
+    const el = $('#spot-chart-canvas');
+    if (!el || !window.LightweightCharts) return null;
+    const chart = LightweightCharts.createChart(el, {
+      layout:    { background: { color: 'transparent' }, textColor: '#7a7a82', fontFamily: 'JetBrains Mono, monospace' },
+      grid:      { vertLines: { color: 'rgba(255,255,255,0.04)' }, horzLines: { color: 'rgba(255,255,255,0.04)' } },
+      crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+      rightPriceScale: { borderColor: 'rgba(255,255,255,0.08)' },
+      timeScale: { borderColor: 'rgba(255,255,255,0.08)', timeVisible: true, secondsVisible: false },
+      autoSize:  true,
+    });
+    const candles = chart.addCandlestickSeries({
+      upColor:        '#7dd87f', downColor:    '#e85a5a',
+      borderUpColor:  '#7dd87f', borderDownColor:'#e85a5a',
+      wickUpColor:    '#7dd87f', wickDownColor: '#e85a5a',
+    });
+    _chartState.chart = chart;
+    _chartState.candles = candles;
+    return _chartState;
+  }
+
+  function setChartMessage(title, sub) {
+    const m = $('#spot-chart-msg');
+    if (!m) return;
+    if (title) {
+      m.style.display = 'flex';
+      $('#spot-chart-msg-title').textContent = title;
+      $('#spot-chart-msg-sub').textContent = sub || '';
+    } else {
+      m.style.display = 'none';
+    }
+  }
+
+  async function fillSubject(variant, symbol){
+    activeSpot = { variant, symbol };
+    setChartMessage(`— ${symbol} · LOADING —`, 'fetching bars + overlays');
+    try {
+      const data = await bb.fetchSpotlight(variant, symbol);
+      const sig = data.signal || {};
+      const pos = data.position || {};
+      const entryTrade = data.entry_trade || {};
+      const lastTrade  = data.last_trade  || {};
+      const action = (sig.action || 'BUY').toUpperCase();
+      const px = entryTrade.filled_price ?? pos.entry_price;
+      const qty = entryTrade.filled_qty;
+      const ts = entryTrade.timestamp || pos.entry_date || sig.timestamp;
+      const sub = (qty != null && px != null) ? `${qty} @ ${Number(px).toFixed(2)} · ${bb.fmt.time(ts)}` : (px != null ? `@ ${Number(px).toFixed(2)}` : '');
+
+      $('#spot-variant').textContent = `${data.display} · ${action}`;
+      $('#spot-sym').textContent = symbol;
+      $('#spot-sub').textContent = sub;
+      $('#spot-meta').textContent = `${data.display} · ${action} · ${bb.fmt.time(ts)}`;
+      $('#spot-thesis-body').textContent = (sig.reasoning || '— no signal reasoning recorded —');
+      $('#spot-thesis-body').style.color = sig.reasoning ? 'var(--text)' : 'var(--text-faint)';
+
+      // Confidence pill
+      const confPill = $('#spot-conf-pill');
+      if (sig.confidence != null) {
+        confPill.textContent = `CONF · ${Number(sig.confidence).toFixed(2)}`;
+        confPill.style.color = (sig.confidence >= 0.5 ? 'var(--mint)' : 'var(--text-muted)');
+      } else {
+        confPill.textContent = '';
+      }
+
+      const stopPctRaw   = sig.stop_loss;
+      const targetPctRaw = sig.take_profit;
+      const hasEntry  = px != null;
+      const hasStop   = stopPctRaw   != null && hasEntry;
+      const hasTarget = targetPctRaw != null && hasEntry;
+      const stopPx   = hasStop   ? px * (1 - Math.abs(stopPctRaw))   : null;
+      const targetPx = hasTarget ? px * (1 + Math.abs(targetPctRaw)) : null;
+
+      // ---- Wire real bars via the existing /api/trade endpoint ----
+      // We need a trade_id; prefer the entry BUY, fall back to last_trade.
+      const tradeId = entryTrade.id ?? lastTrade.id ?? null;
+      if (!tradeId) {
+        setChartMessage(`— ${symbol} · NO TRADE —`, 'no fill recorded; chart needs an entry trade_id');
+      } else {
+        try {
+          const url = `/api/trade/${encodeURIComponent(variant)}/${encodeURIComponent(tradeId)}/chart`;
+          const r = await fetch(url, { cache: 'no-store' });
+          if (!r.ok) throw new Error(`chart ${r.status}`);
+          const payload = await r.json();
+          renderChart(payload, { entryPx: px, stopPx, targetPx });
+          setChartMessage(null);
+        } catch (cerr) {
+          console.error('chart fetch failed:', cerr);
+          setChartMessage(`— ${symbol} · CHART ERROR —`, cerr.message);
+        }
+      }
+
+      // Trade-detail metrics (only emit fields we actually have)
+      const metrics = [];
+      if (px != null)            metrics.push({ k:'entry',    v:Number(px).toFixed(2) });
+      if (hasStop)               metrics.push({ k:'stop',     v:stopPx.toFixed(2) });
+      if (hasTarget)             metrics.push({ k:'target',   v:targetPx.toFixed(2) });
+      if (hasStop && hasTarget)  metrics.push({ k:'r:r',      v:`${(Math.abs(targetPctRaw)/Math.abs(stopPctRaw)).toFixed(2)}×` });
+      if (pos.bars_held != null) metrics.push({ k:'bars held',v:String(pos.bars_held) });
+      if (pos.rs_at_entry != null)    metrics.push({ k:'RS',  v:Number(pos.rs_at_entry).toFixed(0) });
+      if (pos.stage_at_entry != null) metrics.push({ k:'stage', v:Number(pos.stage_at_entry).toFixed(0) });
+      if (pos.base_pattern)      metrics.push({ k:'pattern', v:pos.base_pattern });
+      $('#spot-metrics').innerHTML = metrics.length
+        ? metrics.map(m => `<div><span class="k">${m.k}</span><span class="v">${m.v}</span></div>`).join('')
+        : '<div style="color:var(--text-faint);font-size:10px">— no metrics in signal/position —</div>';
+
+      // Queue panel: open positions on the same variant (excluding this
+      // symbol). Hydrated from bb.state, falls back to empty.
+      const v = (bb.state?.variants || []).find(x => x.name === variant);
+      const queue = (v?.tickets || []).filter(t => t.symbol !== symbol).slice(0, 8);
+      const queueEl = $('#spot-queue-list');
+      queueEl.innerHTML = queue.length
+        ? queue.map(t => {
+            const sd = (t.side || 'buy').toLowerCase();
+            const tColor = v?.color || '#888';
+            return `<div class="item" data-spot-variant="${variant}" data-spot="${t.symbol}">
+              <div class="top"><span class="sym">${t.symbol}</span><span class="side-tag ${sd}">${sd.toUpperCase()}</span><span class="t">${bb.fmt.time(t.ts)}</span></div>
+              <div class="v" style="color:${tColor}">${v?.display || variant}</div>
+              <div class="conf-row"><span class="num" style="color:var(--text-muted)">${t.kind === 'open' ? 'open' : t.state || ''}</span></div>
+            </div>`;
+          }).join('')
+        : '<div style="color:var(--text-faint);font-size:10px;padding:8px">— no other open positions on this variant —</div>';
+
+      // Indicator overlays are unwired (task #10). The server still
+      // returns ``layers`` per variant — kept here so we can rebind to
+      // the chart toolbar once bars land — but nothing renders yet.
+      activeVariant = data.display;
+      activeAllowedLayers = new Set(data.layers || []);
+    } catch (err) {
+      console.error('spotlight failed:', err);
+      $('#spot-thesis-body').textContent = `Error loading spotlight: ${err.message}`;
+      $('#spot-thesis-body').style.color = 'var(--coral)';
+      setChartMessage(`— ${symbol} · ERROR —`, err.message.slice(0, 120));
+    }
+  }
+
+  // ---- Render bars + price lines on the lightweight-charts canvas ----
+  function renderChart(payload, rails) {
+    const cs = ensureChart();
+    if (!cs) return;
+    const bars = (payload.bars || []).map(b => ({
+      time: b.time, open: b.open, high: b.high, low: b.low, close: b.close,
+    }));
+    cs.candles.setData(bars);
+
+    // Tear down old price lines so re-opens don't accumulate.
+    if (cs.entryLine)  { cs.candles.removePriceLine(cs.entryLine);  cs.entryLine = null; }
+    if (cs.stopLine)   { cs.candles.removePriceLine(cs.stopLine);   cs.stopLine = null; }
+    if (cs.targetLine) { cs.candles.removePriceLine(cs.targetLine); cs.targetLine = null; }
+
+    // Price lines — short single-letter titles. The price itself is
+    // already shown via axisLabelVisible (the colored badge on the
+    // right axis). Long titles like "ENTRY · 64.27" caused the three
+    // labels to stack into an unreadable column.
+    if (rails.entryPx != null) {
+      cs.entryLine = cs.candles.createPriceLine({
+        price: rails.entryPx, color: '#f5a524',
+        lineWidth: 1, lineStyle: 0, axisLabelVisible: true,
+        title: 'E',
+      });
+    }
+    if (rails.stopPx != null) {
+      cs.stopLine = cs.candles.createPriceLine({
+        price: rails.stopPx, color: '#e85a5a',
+        lineWidth: 1, lineStyle: 2, axisLabelVisible: true,
+        title: 'S',
+      });
+    }
+    if (rails.targetPx != null) {
+      cs.targetLine = cs.candles.createPriceLine({
+        price: rails.targetPx, color: '#7dd87f',
+        lineWidth: 1, lineStyle: 2, axisLabelVisible: true,
+        title: 'T',
+      });
+    }
+
+    // Fill markers — shape only, no text. The metrics tile in the
+    // thesis card already shows fill price + qty; cramming "BUY 51@
+    // 202.91" on the chart was redundant noise.
+    const markers = (payload.fills || []).map(f => ({
+      time:     f.time,
+      position: f.side === 'sell' ? 'aboveBar' : 'belowBar',
+      color:    f.side === 'sell' ? '#e85a5a' : '#7dd87f',
+      shape:    f.side === 'sell' ? 'arrowDown' : 'arrowUp',
+    }));
+    cs.candles.setMarkers(markers);
+
+    cs.chart.timeScale().fitContent();
+  }
+  function openSpot(variant, symbol){
+    fillSubject(variant, symbol);
+    overlay.classList.add('open');
+    document.body.style.overflow='hidden';
+  }
+  function closeSpot(){ overlay.classList.remove('open'); document.body.style.overflow=''; $('#gear-menu').classList.remove('open'); $('#gear-btn').classList.remove('open'); }
+
+  // initial — start with no layers visible; fillSubject populates on first open.
+  resetToDefaults();
+  applyLayers();
+
+  document.addEventListener('click', e => {
+    const t = e.target.closest('[data-ticket]');
+    if (t) { openSpot(t.dataset.variant, t.dataset.ticket); return; }
+    const q = e.target.closest('[data-spot]');
+    if (q) { fillSubject(q.dataset.spotVariant, q.dataset.spot); return; }
+    if (overlay.classList.contains('open') && !e.target.closest('#gear-menu') && !e.target.closest('#gear-btn')) {
+      $('#gear-menu').classList.remove('open');
+      $('#gear-btn').classList.remove('open');
+    }
+    if (e.target === overlay) closeSpot();
+  });
+  closeBtn.addEventListener('click', closeSpot);
+  document.addEventListener('keydown', e => {
+    if (!overlay.classList.contains('open')) return;
+    if (e.key === 'Escape') closeSpot();
+  });
+
+  // ===== Render: lanes / pulse / scan =====
+
+  function sparkPath(spark, w=100, h=24) {
+    if (!spark || spark.length < 2) return '';
+    const lo = Math.min(...spark), hi = Math.max(...spark);
+    const range = (hi - lo) || 1;
+    const dx = w / (spark.length - 1);
+    return spark.map((v,i) => {
+      const x = i*dx;
+      const y = h - ((v - lo) / range) * h;
+      return (i === 0 ? 'M' : 'L') + x.toFixed(1) + ',' + y.toFixed(1);
+    }).join(' ');
+  }
+
+  function ticketCard(t, color) {
+    const sym = t.symbol;
+    const side = (t.side || 'buy').toLowerCase();
+    const sideTag = `<span class="side-tag ${side}">${side.toUpperCase()}</span>`;
+    const px = t.px != null ? Number(t.px).toFixed(2) : '—';
+    const qty = t.qty != null ? Math.round(t.qty) : '';
+    const pos = qty ? `${qty} @ ${px}` : `@ ${px}`;
+    const closed = t.state === 'closed';
+    const live = t.state === 'live';
+    const time = bb.fmt.time(t.ts);
+    const why = (t.reasoning || '').replace(/[<>]/g, '');
+    const stateClass = closed ? ' closed' : '';
+    const pill = live ? '<div class="ticket-pill-row"><span class="state-pill live">LIVE</span></div>' :
+                 closed ? '<div class="ticket-pill-row"><span class="state-pill closed">CLOSED</span></div>' : '';
+    return `<div class="ticket${stateClass}" data-ticket="${sym}" data-variant="${t._variant}">
+      <div class="ticket-row"><span class="ticket-sym">${sym}</span>${sideTag}<span class="ticket-time">${time}</span></div>
+      <div class="ticket-pos"><span>${pos}</span></div>
+      ${why ? `<div class="conf"><div class="row"><span style="color:var(--text-muted)">${why.slice(0,80)}</span></div></div>` : ''}
+      ${pill}
+    </div>`;
+  }
+
+  function renderLanes(state) {
+    const pack = $('#lane-pack');
+    if (!pack) return;
+    const variants = state.variants || [];
+    const html = variants.map(v => {
+      const isQuiet = (v.tickets || []).length === 0;
+      const isFiring = (v.day_pnl_pct ?? 0) > 0.5;
+      const cls = 'lane' + (isFiring ? ' firing' : (isQuiet ? ' quiet' : ''));
+      const path = sparkPath(v.spark || []);
+      const pnlPct = v.day_pnl_pct;
+      const pnlColor = pnlPct == null ? 'var(--text-faint)' : (pnlPct >= 0 ? 'var(--mint)' : 'var(--coral)');
+      const pnlText = pnlPct == null ? '—' : bb.fmt.pct(pnlPct);
+      const tickets = (v.tickets || []).map(t => ticketCard({ ...t, _variant: v.name }, v.color)).join('') ||
+                      '<div style="color:var(--text-faint);font-size:9.5px;letter-spacing:0.22em;text-transform:uppercase;display:flex;align-items:center;justify-content:center;height:100%">— flat —</div>';
+      return `<div class="${cls}" data-variant="${v.name}">
+        <div class="lane-head">
+          <div class="lane-title"><span class="lane-swatch" style="background:${v.color};color:${v.color}"></span><span class="lane-name">${v.display}</span><span class="lane-sleeve">${v.sleeve}</span></div>
+          ${path ? `<svg class="lane-spark" viewBox="0 0 100 24" preserveAspectRatio="none"><path d="${path}" fill="none" stroke="${v.color}" stroke-width="1.2"/></svg>` : '<div class="lane-spark"></div>'}
+          <div class="lane-pnl"><b style="color:${pnlColor}">${pnlText}</b><span style="color:var(--text-faint)">${v.open_count}/${v.today_count}</span></div>
+          <div class="lane-pos">${v.open_count} pos · ${v.today_count} today</div>
+        </div>
+        <div class="lane-body">${tickets}</div>
+      </div>`;
+    }).join('');
+    pack.innerHTML = html;
+  }
+
+  function renderPulse(state) {
+    const p = state.pulse || {};
+    const variants = state.variants || [];
+    const live = variants.length;
+    const sorted = variants.filter(v => v.day_pnl_pct != null).sort((a,b) => b.day_pnl_pct - a.day_pnl_pct);
+    const best = sorted[0];
+    const worst = sorted[sorted.length-1];
+
+    const fmt = (el, html) => { const e = $(`[data-pulse="${el}"]`); if (e) e.innerHTML = html; };
+    const realizedColor = (p.day_pnl_usd_realized ?? 0) >= 0 ? 'var(--mint)' : 'var(--coral)';
+    fmt('day_pnl_usd_realized', `<span style="color:${realizedColor}">${bb.fmt.usd(p.day_pnl_usd_realized)}</span>`);
+    fmt('open_total', `<b>${p.open_total ?? 0}</b> open`);
+    fmt('today_fills_total', `<b>${p.today_fills_total ?? 0}</b> fills today`);
+    fmt('variants_live', String(live));
+    fmt('variants_live_breakdown', variants.map(v => `<span style="color:${v.color}">${v.display}</span>`).join(' · ') || '<span>—</span>');
+    if (best) {
+      fmt('best_pnl', `<span style="color:var(--mint)">${bb.fmt.pct(best.day_pnl_pct)}</span>`);
+      fmt('best_pnl_name', `<span style="color:${best.color}">${best.display}</span>`);
+    }
+    if (worst) {
+      fmt('worst_pnl', `<span style="color:${worst.day_pnl_pct < 0 ? 'var(--coral)' : 'var(--text-muted)'}">${bb.fmt.pct(worst.day_pnl_pct)}</span>`);
+      fmt('worst_pnl_name', `<span style="color:${worst.color}">${worst.display}</span>`);
+    }
+    const asof = $('[data-conn="asof"]');
+    if (asof) asof.innerHTML = `asof <b>${bb.fmt.time(state.asof)}</b>`;
+
+    const scan = $('#scan-list');
+    if (scan) {
+      scan.innerHTML = variants.map(v => {
+        const pct = v.day_pnl_pct == null ? '—' : bb.fmt.pct(v.day_pnl_pct);
+        const col = (v.day_pnl_pct ?? 0) >= 0 ? 'var(--mint)' : 'var(--coral)';
+        return `<div style="display:flex;justify-content:space-between;align-items:baseline;font-size:11px"><span><span style="display:inline-block;width:8px;height:8px;background:${v.color};margin-right:6px;vertical-align:middle"></span><b>${v.display}</b></span><span style="color:${col};font-variant-numeric:tabular-nums">${pct} · ${v.open_count} open</span></div>`;
+      }).join('');
+    }
+
+    // Recent fills section: collect today fills across variants, newest first.
+    const fills = [];
+    variants.forEach(v => {
+      (v.tickets || []).filter(t => t.kind === 'fill').forEach(t => {
+        fills.push({ ...t, variant: v.name, display: v.display, color: v.color });
+      });
+    });
+    fills.sort((a,b) => String(b.ts).localeCompare(String(a.ts)));
+    const rf = $('#recent-fills');
+    if (rf) {
+      rf.innerHTML = fills.slice(0, 10).map(t => {
+        const k = (t.side === 'sell') ? 'fire' : 'fill';
+        const px = t.px != null ? Number(t.px).toFixed(2) : '—';
+        return `<div><span class="t">${bb.fmt.time(t.ts)}</span><span class="k ${k}">${(t.side||'').toUpperCase()}</span><span class="body">${t.symbol} · <span style="color:${t.color}">${t.display}</span> · ${Math.round(t.qty||0)} @ ${px}</span></div>`;
+      }).join('') || '<div style="color:var(--text-faint)"><span class="t">—</span><span class="k eval">…</span><span class="body">no fills today</span></div>';
+    }
+  }
+
+  // ===== SSE handlers =====
+
+  function appendEvent(ev) {
+    const feed = $('#event-feed');
+    if (!feed) return;
+    const cat = (ev.category || ev.type || 'eval').toLowerCase();
+    const klass = cat.includes('fire') ? 'fire' :
+                  (cat.includes('fill') || cat.includes('order')) ? 'fill' :
+                  (cat.includes('veto') || cat.includes('reject')) ? 'veto' : 'eval';
+    const ts = ev.ts || ev.timestamp || new Date().toISOString();
+    const body = (ev.message || ev.text || JSON.stringify(ev)).slice(0, 240).replace(/[<>]/g, '');
+    const row = document.createElement('div');
+    row.innerHTML = `<span class="t">${bb.fmt.time(ts)}</span><span class="k ${klass}">${cat.toUpperCase().slice(0,4)}</span><span class="body">${body}</span>`;
+    feed.insertBefore(row, feed.firstChild);
+    // cap to 60 rows so the DOM doesn't grow unbounded
+    while (feed.children.length > 60) feed.removeChild(feed.lastChild);
+  }
+
+  bb.on('event', e => appendEvent(e.event));
+  bb.on('event', e => mirrorEventToSpotTicker(e.event));
+
+  function mirrorEventToSpotTicker(ev) {
+    const feed = $('#spot-ticker-feed');
+    if (!feed) return;
+    const cat = (ev.category || ev.type || 'eval').toLowerCase();
+    const klass = cat.includes('fire') ? 'fire' :
+                  (cat.includes('fill') || cat.includes('order')) ? 'fill' :
+                  (cat.includes('veto') || cat.includes('reject')) ? 'veto' : 'eval';
+    const ts = ev.ts || ev.timestamp || new Date().toISOString();
+    const body = (ev.message || ev.text || '').slice(0, 120).replace(/[<>]/g, '');
+    if (!body) return;
+    // Build the "T · KIND · body" inline triple, plus a sep for the next.
+    const wasEmpty = !feed.dataset.populated;
+    if (wasEmpty) { feed.innerHTML = ''; feed.dataset.populated = '1'; }
+    if (feed.children.length) feed.insertAdjacentHTML('afterbegin', '<span class="sep">·</span>');
+    feed.insertAdjacentHTML('afterbegin',
+      `<span class="t">${bb.fmt.time(ts)}</span><span class="k ${klass}">${cat.toUpperCase().slice(0,4)}</span>${body}`);
+    // Cap to ~60 nodes so the inline ticker doesn't grow unbounded.
+    while (feed.children.length > 60) feed.removeChild(feed.lastChild);
+  }
+  bb.on('events.connected',    () => { const e = $('[data-conn="events"]'); if (e) e.innerHTML = 'events <b style="color:var(--mint)">connected</b>'; });
+  bb.on('events.disconnected', () => { const e = $('[data-conn="events"]'); if (e) e.innerHTML = 'events <b style="color:var(--coral)">disconnected</b>'; });
+
+  // Periodic state refresh (every 60s). We previously opened a per-
+  // variant SSE stream to push trade.new events, but with N variants
+  // that adds N persistent HTTP/1.1 connections — combined with the
+  // global /events/stream, that hits the browser's 6-connection-per-
+  // origin cap and queues every other fetch (incl. /api/v2/spotlight,
+  // which is what the spotlight modal needs). Polling /state every
+  // minute is plenty for a "what changed?" view; the live equity tick
+  // already runs on its own 60s interval, and the event log is still
+  // push-driven via the global events stream.
+  async function rehydrateLanes() {
+    try {
+      await bb.hydrate();
+      renderLanes(bb.state);
+      renderPulse(bb.state);
+    } catch (e) { console.error('rehydrate failed', e); }
+  }
+  setInterval(rehydrateLanes, 60_000);
+
+  // ===== Live equity overlay (poll /api/v2/equity/live every 60s) =====
+  // The state hydrate gives us last-daily-snapshot pnl. The live endpoint
+  // returns minute-cadence broker equity so the pulse strip stays current
+  // through the session. Falls back gracefully if the endpoint is empty.
+
+  let lastLiveTs = null;
+  async function refreshLive() {
+    try {
+      const live = await bb.fetchLive();
+      const variants = live.variants || {};
+      let realized = 0;
+      let bestPct = null, bestName = null;
+      let worstPct = null, worstName = null;
+      let asof = null;
+      let liveCount = 0;
+      Object.entries(variants).forEach(([name, tick]) => {
+        if (!tick) return;
+        liveCount++;
+        if (tick.day_pnl_usd != null) realized += tick.day_pnl_usd;
+        if (tick.day_pnl_pct != null) {
+          if (bestPct == null || tick.day_pnl_pct > bestPct) { bestPct = tick.day_pnl_pct; bestName = name; }
+          if (worstPct == null || tick.day_pnl_pct < worstPct) { worstPct = tick.day_pnl_pct; worstName = name; }
+        }
+        if (!asof || tick.ts > asof) asof = tick.ts;
+        // Update lane PnL with the live number
+        const laneEl = document.querySelector(`.lane[data-variant="${name}"] .lane-pnl b`);
+        if (laneEl && tick.day_pnl_pct != null) {
+          laneEl.textContent = bb.fmt.pct(tick.day_pnl_pct);
+          laneEl.style.color = tick.day_pnl_pct >= 0 ? 'var(--mint)' : 'var(--coral)';
+        }
+      });
+      const fmt = (el, html) => { const e = $(`[data-pulse="${el}"]`); if (e) e.innerHTML = html; };
+      if (liveCount) {
+        const realizedColor = realized >= 0 ? 'var(--mint)' : 'var(--coral)';
+        fmt('day_pnl_usd_realized', `<span style="color:${realizedColor}">${bb.fmt.usd(realized)}</span>`);
+        if (bestPct != null) {
+          const bv = (bb.state.variants || []).find(v => v.name === bestName);
+          fmt('best_pnl', `<span style="color:var(--mint)">${bb.fmt.pct(bestPct)}</span>`);
+          if (bv) fmt('best_pnl_name', `<span style="color:${bv.color}">${bv.display}</span>`);
+        }
+        if (worstPct != null) {
+          const wv = (bb.state.variants || []).find(v => v.name === worstName);
+          fmt('worst_pnl', `<span style="color:${worstPct < 0 ? 'var(--coral)' : 'var(--text-muted)'}">${bb.fmt.pct(worstPct)}</span>`);
+          if (wv) fmt('worst_pnl_name', `<span style="color:${wv.color}">${wv.display}</span>`);
+        }
+      }
+      if (asof) {
+        lastLiveTs = asof;
+        const el = $('[data-conn="asof"]');
+        if (el) el.innerHTML = `asof <b>${bb.fmt.time(asof)}</b>`;
+      }
+    } catch (err) {
+      console.warn('live refresh failed', err);
+    }
+  }
+
+  // ===== Boot =====
+
+  (async () => {
+    try {
+      await bb.hydrate();
+      renderLanes(bb.state);
+      renderPulse(bb.state);
+      bb.connectEvents();
+      // Per-variant SSE streams disabled — they exceed the browser's
+      // HTTP/1.1 6-connection cap and starve every other fetch. State
+      // refreshes every 60s instead (see rehydrateLanes above).
+      const e = $('[data-conn="streams"]');
+      if (e) e.innerHTML = `streams <b>poll · 60s</b>`;
+      // Live equity pulse: first call now, then every 60s.
+      refreshLive();
+      setInterval(refreshLive, 60_000);
+    } catch (err) {
+      console.error('hydrate failed', err);
+      const feed = $('#event-feed');
+      if (feed) feed.innerHTML = `<div style="color:var(--coral)"><span class="t">—</span><span class="k veto">ERR</span><span class="body">${err.message}</span></div>`;
+    }
+  })();
+</script>
+</body>
+</html>

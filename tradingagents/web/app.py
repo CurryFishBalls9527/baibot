@@ -1339,6 +1339,24 @@ def log_tail(n: int = 200) -> dict:
 
 app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
 
+# v2 redesign — served alongside the existing single-page UI during
+# development. Reachable at /v2/floor, /v2/versus, /v2/review.
+_V2_DIR = _STATIC_DIR / "v2"
+if _V2_DIR.exists():
+    from . import v2 as _v2_module
+    app.include_router(_v2_module.router)
+    app.mount("/v2", StaticFiles(directory=_V2_DIR, html=True), name="v2")
+
+    @app.on_event("startup")
+    async def _start_v2_intraday_loop() -> None:
+        # Best-effort. If Alpaca creds are missing the loop just skips
+        # all variants — no exception escapes.
+        try:
+            _v2_module.start_intraday_loop()
+        except Exception as exc:  # pragma: no cover
+            import logging
+            logging.getLogger(__name__).warning("v2 intraday loop failed to start: %s", exc)
+
 
 @app.get("/")
 def index() -> FileResponse:
